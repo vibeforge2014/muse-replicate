@@ -208,6 +208,35 @@ export interface SkillVersionRow {
   sha256: string;
   created_at: Generated<Date>;
 }
+export interface DeploymentRow {
+  id: string;
+  workspace_id: string;
+  agent_id: string;
+  agent_version: number;
+  environment_id: string;
+  schedule: string | null;
+  timezone: Generated<string>;
+  input: Generated<Record<string, unknown>>;
+  status: Generated<string>;
+  last_scheduled_at: Date | null;
+  archived_at: Date | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+export interface DeploymentRunRow {
+  id: string;
+  workspace_id: string;
+  deployment_id: string;
+  session_id: string | null;
+  trigger_type: string;
+  trigger_context: Generated<Record<string, unknown>>;
+  status: string;
+  error: Record<string, unknown> | null;
+  scheduled_for: Date | null;
+  started_at: Date | null;
+  finished_at: Date | null;
+  created_at: Generated<Date>;
+}
 export interface IdempotencyKeyRow {
   workspace_id: string;
   key: string;
@@ -263,6 +292,8 @@ export interface Database {
   memory_versions: MemoryVersionRow;
   skills: SkillRow;
   skill_versions: SkillVersionRow;
+  deployments: DeploymentRow;
+  deployment_runs: DeploymentRunRow;
   idempotency_keys: IdempotencyKeyRow;
   session_internal_events: SessionInternalEventRow;
   workspace_checkpoints: WorkspaceCheckpointRow;

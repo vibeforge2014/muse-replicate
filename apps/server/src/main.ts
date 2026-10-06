@@ -1,4 +1,4 @@
-import { bootstrap, createDb, runMigrations } from "@mas/db";
+import { bootstrap, createDb, runMigrations, startDeploymentScheduler } from "@mas/db";
 import { buildApp } from "./app.js";
 
 async function main() {
@@ -14,6 +14,7 @@ async function main() {
   const host = process.env.HOST ?? "127.0.0.1";
   await app.listen({ port, host });
   console.log(`[mas] api listening on http://${host}:${port}`);
+  startDeploymentScheduler(db.db); // Deployments 调度（单进程 MVP）
 }
 
 main().catch((e) => {

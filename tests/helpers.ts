@@ -38,6 +38,8 @@ export async function setupEnv(): Promise<TestEnv> {
     "memory_versions",
     "skill_versions",
     "skills",
+    "deployment_runs",
+    "deployments",
     "memories",
     "memory_stores",
     "credentials",

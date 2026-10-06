@@ -14,7 +14,7 @@ import {
   type AgentRecord,
 } from "@mas/core";
 import type { Database } from "@mas/db";
-import { archiveAgent, createAgent, getAgent, listAgentVersions, updateAgent } from "@mas/db";
+import { archiveAgent, archiveDeploymentsOfAgent, createAgent, getAgent, listAgentVersions, updateAgent } from "@mas/db";
 import { withIdempotency } from "../plugins/idempotent-route.js";
 
 export interface RouteCtx {
@@ -152,6 +152,9 @@ export function registerAgentRoutes(app: FastifyInstance, ctx: RouteCtx): void {
 
   app.post("/v1/agents/:id/archive", async (req) => {
     const { id } = req.params as { id: string };
-    return archiveAgent(ctx.db, req.mas.auth!.workspaceId, id);
+    const result = await archiveAgent(ctx.db, req.mas.auth!.workspaceId, id);
+    // DEP-09：归档 agent 时联动归档其 deployments
+    await archiveDeploymentsOfAgent(ctx.db, req.mas.auth!.workspaceId, id);
+    return result;
   });
 }

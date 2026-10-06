@@ -315,4 +315,39 @@ ALTER TABLE session_resources
   ADD COLUMN IF NOT EXISTS skill_version int;
 `,
   },
+  {
+    name: "0010_deployments",
+    sql: `
+CREATE TABLE IF NOT EXISTS deployments (
+  id text PRIMARY KEY,
+  workspace_id text NOT NULL REFERENCES workspaces(id),
+  agent_id text NOT NULL,
+  agent_version int NOT NULL,
+  environment_id text NOT NULL,
+  schedule text,
+  timezone text NOT NULL DEFAULT 'Asia/Shanghai',
+  input jsonb NOT NULL DEFAULT '{}',
+  status text NOT NULL DEFAULT 'active',
+  last_scheduled_at timestamptz,
+  archived_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS deployment_runs (
+  id text PRIMARY KEY,
+  workspace_id text NOT NULL,
+  deployment_id text NOT NULL REFERENCES deployments(id),
+  session_id text,
+  trigger_type text NOT NULL,
+  trigger_context jsonb NOT NULL DEFAULT '{}',
+  status text NOT NULL DEFAULT 'pending',
+  error jsonb,
+  scheduled_for timestamptz,
+  started_at timestamptz,
+  finished_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS deployment_runs_dep_ix ON deployment_runs (deployment_id, created_at DESC);
+`,
+  },
 ];

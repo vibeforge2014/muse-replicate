@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -43,6 +43,12 @@ export interface SandboxProvider {
   readonly kind: string;
   capabilities(): Promise<ProviderCapabilities>;
   create(spec: SandboxSpec): Promise<SandboxHandle>;
+  /**
+   * 迟绑定（spec §9.3 二期 warm pool）：把预建的"空沙箱"绑定到具体会话。
+   * 真实 provider 在此挂载会话卷（codexHome/outputs/mounts）；未实现时
+   * WarmPoolProvider 拒绝包装该 provider（fail closed，不虚报能力）。
+   */
+  attach?(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle>;
   pause(sandboxId: string): Promise<void>;
   resume(sandboxId: string): Promise<void>;
   destroy(sandboxId: string): Promise<void>;
@@ -72,10 +78,19 @@ export class FakeSandboxProvider implements SandboxProvider {
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
+    const sandboxId = `sbx_fake_${randomUUID().slice(0, 12)}`;
+    return this.materialize(sandboxId, spec);
+  }
+
+  /** warm pool 迟绑定：复用预发的 sandboxId，按真实 spec 重新物化目录约定。 */
+  async attach(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> {
+    return this.materialize(sandboxId, spec);
+  }
+
+  private materialize(sandboxId: string, spec: SandboxSpec): SandboxHandle {
     const home = spec.codexHome;
     mkdirSync(join(home, "outputs"), { recursive: true });
     mkdirSync(join(home, "uploads"), { recursive: true });
-    const sandboxId = `sbx_fake_${randomUUID().slice(0, 12)}`;
     writeFileSync(
       join(home, ".sandbox"),
       JSON.stringify({ sandboxId, sessionId: spec.sessionId, generation: spec.generation, kind: this.kind }),
@@ -97,6 +112,160 @@ export class FakeSandboxProvider implements SandboxProvider {
   }
   async destroy(sandboxId: string): Promise<void> {
     this.state.delete(sandboxId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WarmPoolProvider（spec §9.3 二期：按 Environment 预建 N 个空沙箱）
+// ---------------------------------------------------------------------------
+
+/** 预热池统计（/internal/metrics 与测试观察用）。 */
+export interface WarmPoolStats {
+  /** 目标保温数量。 */
+  min: number;
+  /** 当前池内空沙箱数。 */
+  warm: number;
+  /** 命中预热的 create 次数。 */
+  warmHits: number;
+  /** 池空直落的冷创建次数。 */
+  coldCreates: number;
+  /** 后台补池执行次数 / 失败次数。 */
+  refills: number;
+  refillErrors: number;
+}
+
+export interface WarmPoolOptions {
+  /** 保温数量（≤0 视为禁用，全部直落）。 */
+  min: number;
+  /** 预热沙箱临时宿主目录（缺省 OS tmp）。 */
+  warmRoot?: string;
+}
+
+interface WarmEntry {
+  sandboxId: string;
+}
+
+/**
+ * 装饰器：包住支持 attach 的 provider，维持 min 个预建空沙箱。
+ * - create(spec)：快路径弹出预热沙箱并迟绑定（inner.attach）；池空则直落 inner.create；
+ * - 每次出池后后台补池（串行，避免预热风暴）；
+ * - pause/resume/destroy 透传（针对已交付的活沙箱；池内沙箱由 drain 统一销毁）。
+ * 构造即启动后台预热；进程退出前应调用 drain() 清理池内沙箱。
+ */
+export class WarmPoolProvider implements SandboxProvider {
+  readonly kind: string;
+  private readonly inner: SandboxProvider & { attach(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle> };
+  private readonly min: number;
+  private readonly warmRoot: string;
+  private pool: WarmEntry[] = [];
+  /** 补池串行队列：构造期预热 / 出池补池 / prewarm 全部排同一链，防过填。 */
+  private fillChain: Promise<void> = Promise.resolve();
+  private fillPending = false;
+  private stats: WarmPoolStats;
+
+  constructor(inner: SandboxProvider, opts: WarmPoolOptions) {
+    if (typeof inner.attach !== "function") {
+      throw new Error(`WarmPoolProvider: provider ${inner.kind} does not support attach (late binding)`);
+    }
+    this.inner = inner as WarmPoolProvider["inner"];
+    this.kind = `warmpool(${inner.kind})`;
+    this.min = Math.max(0, Math.floor(opts.min));
+    this.warmRoot = opts.warmRoot ?? tmpdir();
+    this.stats = { min: this.min, warm: 0, warmHits: 0, coldCreates: 0, refills: 0, refillErrors: 0 };
+    this.scheduleRefill();
+  }
+
+  async capabilities(): Promise<ProviderCapabilities> {
+    return this.inner.capabilities();
+  }
+
+  /** 等待池填满（测试/启动钩子用；与后台补池共用串行队列）。 */
+  async prewarm(): Promise<void> {
+    this.scheduleRefill();
+    await this.fillChain;
+  }
+
+  async create(spec: SandboxSpec): Promise<SandboxHandle> {
+    const entry = this.pool.shift();
+    this.stats.warm = this.pool.length;
+    if (entry) {
+      try {
+        const handle = await this.inner.attach(entry.sandboxId, spec);
+        this.stats.warmHits++;
+        this.scheduleRefill();
+        return handle;
+      } catch {
+        // 迟绑定失败：销毁该预热沙箱（尽力而为），直落冷创建
+        await this.inner.destroy(entry.sandboxId).catch(() => undefined);
+        this.stats.refillErrors++;
+      }
+    }
+    this.stats.coldCreates++;
+    const handle = await this.inner.create(spec);
+    this.scheduleRefill();
+    return handle;
+  }
+
+  async pause(sandboxId: string): Promise<void> {
+    await this.inner.pause(sandboxId);
+  }
+  async resume(sandboxId: string): Promise<void> {
+    await this.inner.resume(sandboxId);
+  }
+  async destroy(sandboxId: string): Promise<void> {
+    await this.inner.destroy(sandboxId);
+  }
+
+  /** 销毁池内全部空沙箱（关停/测试用；已交付沙箱不在此列）。 */
+  async drain(): Promise<void> {
+    const entries = this.pool.splice(0);
+    this.stats.warm = 0;
+    for (const e of entries) {
+      await this.inner.destroy(e.sandboxId).catch(() => undefined);
+    }
+  }
+
+  getStats(): Readonly<WarmPoolStats> {
+    return { ...this.stats, warm: this.pool.length };
+  }
+
+  /** 预热沙箱的占位 spec：临时宿主目录，无挂载无会话语义。 */
+  private warmSpec(): SandboxSpec {
+    const home = mkdtempSync(join(this.warmRoot, "mas-warm-"));
+    return {
+      sessionId: "warmup",
+      generation: 0,
+      mounts: [],
+      codexHome: home,
+      outputsDir: join(home, "warm-outputs"),
+    };
+  }
+
+  private async fill(): Promise<void> {
+    while (this.pool.length < this.min) {
+      const handle = await this.inner.create(this.warmSpec());
+      this.pool.push({ sandboxId: handle.sandboxId });
+      this.stats.warm = this.pool.length;
+    }
+  }
+
+  /**
+   * 后台补池：排入串行队列（防预热风暴与过填）；已有补池在途或池已满时跳过。
+   * 链尾发现仍未满（fill 期间又有人出池）则再排一轮。
+   */
+  private scheduleRefill(): void {
+    if (this.fillPending || this.pool.length >= this.min) return;
+    this.fillPending = true;
+    this.stats.refills++;
+    this.fillChain = this.fillChain
+      .then(() => this.fill())
+      .catch(() => {
+        this.stats.refillErrors++;
+      })
+      .finally(() => {
+        this.fillPending = false;
+        if (this.pool.length < this.min) this.scheduleRefill();
+      });
   }
 }
 

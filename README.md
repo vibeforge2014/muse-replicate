@@ -42,8 +42,10 @@
 | Deployments（M6 W12） | ✅ | 5 字段 cron（自研引擎：≥5min 间隔、必须有未来触发点、时区固定 Asia/Shanghai）+ manual-only；agent 版本创建时固定；手动 run 202 → 调度器建会话投首轮 → 跟随 session 收尾；pause 不拦手动 run、归档幂等且拒 run；环境归档 → run 失败带 error；归档 agent 联动归档其 deployments；runs 过滤（deployment_id/has_error/trigger_type/created_at，limit 50）（DEP-01~09） |
 | Webhooks（M6 W13） | ✅ | 订阅会话事件 → outbox（webhook_deliveries）→ Standard Webhooks 签名投递（webhook-id/timestamp/signature v1 HMAC-SHA256）；非 2xx 指数退避重试（2^n 秒，6 次后 failed）；events 订阅过滤；secret（whsec_）仅创建时回显；投递状态 API 可观察 |
 | Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试；`out <text>` 模拟沙箱产出 |
+| OpenAPI 3.1 规范 + TS SDK（plan 5.7） | ✅ | [docs/openapi.yaml](docs/openapi.yaml)：74 条 /v1 路由（与 fastify 注册表零漂移，双向断言）、BigModel 方言 headers（zai-version/zai-beta）、Bearer/x-api-key 双鉴权、统一错误信封；`pnpm gen:sdk` 生成类型 + `@mas/sdk` MasClient（错误信封→MasApiError、幂等键、multipart、SSE/二进制下载） |
+| Warm pool（M6 W13 最小实现） | ✅ | `WarmPoolProvider` 装饰器：预建 N 个空沙箱，create 快路径迟绑定（`attach`）+ 池空直落冷创建 + 串行后台补池（防过填/风暴）；worker `MAS_WARM_POOL_MIN` 开关；Fake provider 的 attach = §9.2 目录重物化（真实 provider 需挂会话卷，K8s CRD 二期） |
 
-未实现（按 plan 后续里程碑）：egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、OTel 链路 / Grafana 看板 / k6 性能压测（M5 5.2/5.3 的重型件，需专门基础设施）、warm pool / K8s agent-sandbox CRD / multiagent lanes / custom tools / outcomes（M6 后续与二期）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
+未实现（按 plan 后续里程碑）：egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、OTel 链路 / Grafana 看板 / k6 性能压测（M5 5.2/5.3 的重型件，需专门基础设施）、K8s agent-sandbox CRD（provider 侧）/ multiagent lanes / custom tools / outcomes（M6 后续与二期）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
 
 ## 快速开始
 
@@ -73,7 +75,8 @@ API_KEY=<启动时打印的 mas_sk_...> npx tsx scripts/smoke.ts
 测试（需要本地 PG，默认 `postgres://mas@localhost:5433/mas_test`，用 `DATABASE_URL` 覆盖；测试会清空该库）：
 
 ```bash
-pnpm test        # 139 个集成用例：AUTH/AGT/ENV/SES/EVT/EVT-R/TOOL/ORD/REC/FILE/RES/VLT/EGRESS/M5/GATEWAY/MEM/SKL/DEP/WEBHOOK
+pnpm test        # 149 个集成用例：AUTH/AGT/ENV/SES/EVT/EVT-R/TOOL/ORD/REC/FILE/RES/VLT/EGRESS/M5/GATEWAY/MEM/SKL/DEP/WEBHOOK/OAS+WARM
+pnpm gen:sdk      # 由 docs/openapi.yaml 重新生成 @mas/sdk 类型（tests/openapi.test.ts 守护提交物同步）
 pnpm test:chaos 200   # 确定性混沌门禁：200 个种子全绿（spec §17.2）
 ```
 
@@ -106,7 +109,8 @@ curl -N $BASE/v1/sessions/sesn_xxx/events/stream -H "authorization: Bearer $KEY"
 packages/core        # ID/ULID、MasError（方言错误信封）、分页游标、Zod schema（Agent/Env/Session/Event/Memory）、AES-256-GCM 信封加密、5 字段 cron 引擎
 packages/db          # Kysely + pg：前向迁移（11 组）、repos（准入/定序/claim/renew/settle/reap/历史）、checkpoint/output/vault/memory/skills/deployments/webhooks
 packages/runtime     # AgentRuntimeDriver 接口 + FakeCodexDriver（JSON-RPC stdio 假 app-server）
-packages/sandbox     # SandboxProvider 抽象（capabilities/create/pause/resume/destroy）+ Fake/Docker provider + orphan 登记
+packages/sandbox     # SandboxProvider 抽象（capabilities/create/attach/pause/resume/destroy）+ Fake/Docker provider + WarmPoolProvider 预热池 + orphan 登记
+packages/sdk         # @mas/sdk：openapi-typescript 生成的类型 + MasClient（fetch 封装，错误信封→MasApiError）
 packages/egress      # 出站 token（maseg_v1）签发/验签、主机策略/黑名单匹配
 apps/server          # Fastify：鉴权、request-id、方言、限流、幂等、Agent/Env/Session/Events/Vault/File/Memory/Skill/Deployment/Webhook 路由 + SSE + 指标/调试 + 部署态常驻调度器（deployment/webhook）
 apps/worker          # session-worker：NOTIFY + 扫描驱动，SessionRunner 持租约执行（checkpoint/输出/恢复/接管）
@@ -132,6 +136,8 @@ scripts/smoke.ts     # 端到端冒烟；scripts/chaos.ts 混沌门禁
 - **egress-proxy**（§10.2/§10.4）：沙箱 `http_proxy` 指向本服务，`proxy-authorization` 携带出站 token（HMAC 签名，claims 绑定 workspace/session/execution/generation/sandbox，签发走 `POST /internal/bindings` + 管理密钥）。每请求：token 验签/时效 → fence 时效（generation 数值比较，4s 缓存）→ 黑名单（元数据服务/RFC1918）→ 凭据命中（先按会话 `vault_ids` 缩小候选再按 host 匹配，剥离 `authorization`/`x-api-key` 后注入真实值，占位符 `mas_ph_*` 永不出代理）→ env networking（limited 按 allowed_hosts 通配、unrestricted 仅 80/443）；拒绝带 `x-mas-denied-host`，`session.error{egress_denied}` 同 host 每分钟至多一条。
 - **水位线恢复**（§14.2.1）：接管方 acquire runtime 时判定 —— `active_workspace_checkpoint.completed_execution_watermark === sessions.last_completed_execution_id` 且 `codex_version_digest` 一致 → **Level 1**（restoreCheckpoint 还原文件 + `thread/resume` 原生续聊）；否则（checkpoint 缺失/落后/损坏）→ **Level 0** 语义恢复：从事件日志重放 `user.message`/`agent.message` 文本（绝不重放工具输入），写内部事件 `runtime.recovered{mode, reason}`；checkpoint 校验失败额外写 `session.error{checkpoint_corrupt}`。
 - **model-gateway**（§10.3）：`POST /v1/responses`（Responses API 兼容，流式 SSE 透传）。会话侧只持 `masmt_v1` 短期 token（claims：ws/sesn/exp/jti，`POST /internal/tokens` 凭管理密钥签发）；网关验签后剥离会话凭证、注入上游真实 API key 转发；从响应（非流式 JSON 或流式 `response.completed` 帧）提取 usage，以 API 身份回写 `span.model_request_start/end{model_usage, is_error}` 与累计 `session.usage`（物化 `sessions.usage`）；`GET /internal/metrics` 暴露 `mas_model_tokens_total{model,kind}`。
+- **OpenAPI 规范即契约**（plan 5.7）：手写 docs/openapi.yaml + `app.addHook("onRoute")` 登记路由表，tests/openapi.test.ts 双向断言零漂移（fastify 有而规范无 = 失败；规范有而 fastify 无 = 失败）；生成物 schema.d.ts 与规范的同步性同样有测试守护（改规范忘 gen:sdk 即红）。
+- **Warm pool 迟绑定**（§9.3 二期）：预热沙箱以占位 spec（sessionId=warmup、临时宿主目录）预建；acquire 时 `attach(sandboxId, realSpec)` 绑定会话目录——Fake provider 下即目录约定重物化，真实 provider（Docker/OpenSandbox/K8s）应挂会话卷；补池走串行 promise 链（构造预热/出池补池/prewarm 同队列），杜绝并发过填。
 - **确定性混沌车道**（§5.20 / M3 3.9）：mulberry32 种子化随机驱动 3 个 owner 并发执行真实 db 函数（claim/renew/append/checkpoint/output/settle），动作含重复收集（幂等）、租约强过期（重写 `lease_expires_at` 模拟时钟推进）、陈旧 fence 写入（必须被 409 拒绝）；每步后断言六不变量：陈旧 fence 写拒、seq 连续、active checkpoint 可校验、输出无重复、接管语义、settle 后可恢复。`pnpm test:chaos [N=200]` 为发布门禁（§17.2），种子固定可复现。
 - **Memory Store**（plan M6 W11 / §19）：store（name→slug，workspace 内唯一）→ memory（`(store, path)` 唯一）→ memory_versions（每次写入追加，`head_version` 指针）。precondition 更新按 head `content_sha256`（不一致 409），条件删除同理；redact 只允许历史版本（head 409），redact 后 path/content/sha 置 null；list 支持 `path_prefix`/`depth`（深层折叠为 `memory_prefix` 元素）/`view=full`（limit ≤20）。会话以资源形态挂载（上限 8 个）：worker 每轮把 head 版本物化到 `<home>/mnt/memory/<slug>`（read_only 挂载 chmod 555/444，agent 写入 EACCES；read_write 挂载轮末 diff 回写新版本，并发以 precondition 乐观锁让位）。
 - **Skills**（plan M6 W12 / §19）：上传 zip → `normalizeSkillZip`（剔绝对路径/`..` 段、剥公共根目录、path 排序后 200 文件截断、根必须有 SKILL.md）→ 重打包内容寻址存储 `skills/{id}/v{n}.zip`。`(workspace, directory)` 唯一（409 `skill_directory_conflict`）；`agent.skills` 引用随版本快照固化，删除 skill 前查全部 `agent_versions.config->skills`（历史版本保留引用即拒绝）；会话资源挂载（可 pin 版本）由 worker 物化到 `<home>/workspace/skills/<dir>/` 并 chmod 只读；bootstrap 幂等播种 `source=zai` 内置。
@@ -157,4 +163,4 @@ scripts/smoke.ts     # 端到端冒烟；scripts/chaos.ts 混沌门禁
 
 ## 后续路线（按 plan.md）
 
-M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 139/139 绿）→ M6 W11-W13 已完成：Memory Store、Skills、Deployments、Webhooks → 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、warm pool / K8s CRD / multiagent lanes / outcomes。
+M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 139/139 绿）→ M6 W11-W13 已完成：Memory Store、Skills、Deployments、Webhooks → plan 5.7 已完成：OpenAPI 3.1 规范 + @mas/sdk（74 路由零漂移）、warm pool 最小实现（FakeSandboxProvider 预热池 + attach 迟绑定，MAS_WARM_POOL_MIN 开关）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、K8s CRD provider / multiagent lanes / outcomes。

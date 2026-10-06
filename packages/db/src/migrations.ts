@@ -239,4 +239,48 @@ CREATE TABLE IF NOT EXISTS sandbox_orphans (
 );
 `,
   },
+  {
+    name: "0008_memory",
+    sql: `
+CREATE TABLE IF NOT EXISTS memory_stores (
+  id text PRIMARY KEY,
+  workspace_id text NOT NULL REFERENCES workspaces(id),
+  name text NOT NULL,
+  slug text NOT NULL,
+  description text,
+  archived_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, slug)
+);
+CREATE TABLE IF NOT EXISTS memories (
+  id text PRIMARY KEY,
+  store_id text NOT NULL REFERENCES memory_stores(id),
+  workspace_id text NOT NULL,
+  path text NOT NULL,
+  head_version int NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (store_id, path)
+);
+CREATE TABLE IF NOT EXISTS memory_versions (
+  id text PRIMARY KEY,
+  memory_id text NOT NULL REFERENCES memories(id),
+  workspace_id text NOT NULL,
+  version_no int NOT NULL,
+  path text,
+  content text,
+  content_sha256 text,
+  size_bytes bigint NOT NULL,
+  redacted_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (memory_id, version_no)
+);
+CREATE INDEX IF NOT EXISTS memory_versions_memory_ix ON memory_versions (memory_id, version_no DESC);
+ALTER TABLE session_resources
+  ALTER COLUMN file_id DROP NOT NULL,
+  ADD COLUMN IF NOT EXISTS memory_store_id text,
+  ADD COLUMN IF NOT EXISTS read_only boolean NOT NULL DEFAULT true;
+`,
+  },
 ];

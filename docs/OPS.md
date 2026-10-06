@@ -33,7 +33,7 @@ docker compose：`docker compose -f deploy/compose/docker-compose.yml up --build
 
 ## 2. 备份与恢复
 
-- **PG**：`pg_dump`（逻辑备份即可；事件日志是唯一事实来源）。恢复后 worker 自动从
+- **PG**：`pg_dump`（逻辑备份即可；事件日志是唯一事实来源；Memory Store 内容也存 PG，一并覆盖）。恢复后 worker 自动从
   `session_executions` 恢复：过期租约被接管（REC-01 语义），checkpoint/output 指针来自
   `sessions.active_workspace_checkpoint` / `active_output_manifest`。
 - **对象目录**：冷备 `MAS_SNAPSHOT_DIR` 与 `MAS_FILES_DIR`。checkpoint 归档带 sha256，

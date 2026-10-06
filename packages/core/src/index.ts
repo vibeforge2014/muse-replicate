@@ -8,3 +8,4 @@ export * from "./schemas/agent.js";
 export * from "./schemas/environment.js";
 export * from "./schemas/event.js";
 export * from "./schemas/session.js";
+export * from "./schemas/memory.js";

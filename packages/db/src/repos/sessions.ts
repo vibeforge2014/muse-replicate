@@ -21,7 +21,10 @@ export interface SessionJson {
   environment_id: string;
   title: string | null;
   metadata: Record<string, string>;
-  resources: { type: string; file_id: string; mount_path: string; id?: string }[];
+  resources: (
+    | { type: string; file_id: string; mount_path: string; id?: string }
+    | { type: string; memory_store_id?: string | null; read_only?: boolean; mount_path: string; id?: string }
+  )[];
   vault_ids: string[];
   usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number };
   created_at: string;
@@ -31,7 +34,7 @@ export interface SessionJson {
 
 export function sessionRowToJson(
   s: Selectable<SessionRow>,
-  resources: { id: string; type: string; file_id: string; mount_path: string }[],
+  resources: SessionResourceView[],
 ): SessionJson {
   return {
     id: s.id,
@@ -42,7 +45,11 @@ export function sessionRowToJson(
     environment_id: s.environment_id,
     title: s.title,
     metadata: s.metadata,
-    resources: resources.map((r) => ({ type: r.type, file_id: r.file_id, mount_path: r.mount_path })),
+    resources: resources.map((r) => ({
+      type: r.type,
+      ...(r.type === "file" ? { file_id: r.file_id } : { memory_store_id: r.memory_store_id, read_only: r.read_only }),
+      mount_path: r.mount_path,
+    })),
     vault_ids: s.vault_ids,
     usage: s.usage,
     created_at: iso(s.created_at),
@@ -66,17 +73,32 @@ export async function getSessionRow(
   return row;
 }
 
+export interface SessionResourceView {
+  id: string;
+  type: string;
+  file_id: string | null;
+  memory_store_id?: string | null;
+  read_only?: boolean;
+  mount_path: string;
+}
+
 export async function listSessionResources(
   db: Kysely<Database>,
   sessionId: string,
-): Promise<{ id: string; type: string; file_id: string; mount_path: string }[]> {
+): Promise<SessionResourceView[]> {
   const rows = await db
     .selectFrom("session_resources")
-    .select(["id", "type", "file_id", "mount_path"])
+    .select(["id", "type", "file_id", "memory_store_id", "read_only", "mount_path"])
     .where("session_id", "=", sessionId)
     .orderBy("created_at asc")
     .execute();
-  return rows;
+  return rows.map((r) => ({
+    id: r.id,
+    type: r.type,
+    file_id: r.file_id,
+    ...(r.type === "memory_store" ? { memory_store_id: r.memory_store_id, read_only: r.read_only } : {}),
+    mount_path: r.mount_path,
+  }));
 }
 
 // ---------------------------------------------------------------------------

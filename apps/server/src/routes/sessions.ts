@@ -105,9 +105,33 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
       })
       .execute();
 
-    // 挂载资源（RES-01）：校验文件存在与路径重叠
+    // 挂载资源（RES-01 / MEM-08 / SES-10）：校验文件与 memory store 存在、路径重叠与重复挂载
     const mounted = new Set<string>();
     for (const r of parsed.resources ?? []) {
+      if (r.type === "memory_store") {
+        const store = await ctx.db
+          .selectFrom("memory_stores")
+          .select(["id", "slug", "archived_at"])
+          .where("id", "=", r.memory_store_id)
+          .where("workspace_id", "=", ws)
+          .executeTakeFirst();
+        if (!store) throw errNotFound(`memory store ${r.memory_store_id} not found`);
+        if (store.archived_at) throw errConflict(`memory store ${r.memory_store_id} is archived`);
+        await ctx.db
+          .insertInto("session_resources")
+          .values({
+            id: newId("sesrsc"),
+            session_id: sessionId,
+            type: "memory_store",
+            file_id: null,
+            memory_store_id: r.memory_store_id,
+            read_only: r.read_only ?? true,
+            // 挂载点由平台固定（spec §19）：/mnt/memory/<slug>
+            mount_path: `/mnt/memory/${store.slug}`,
+          })
+          .execute();
+        continue;
+      }
       const file = await ctx.db
         .selectFrom("files")
         .select(["id"])
@@ -246,14 +270,64 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
     return { id, type: "session_deleted" as const };
   });
 
-  // 运行中挂载资源（RES-02）
+  // 运行中挂载资源（RES-02 / MEM-08）
   app.post("/v1/sessions/:id/resources", async (req) => {
     const { id } = req.params as { id: string };
-    const body = req.body as { type?: string; file_id?: string; mount_path?: string };
+    const body = req.body as {
+      type?: string;
+      file_id?: string;
+      mount_path?: string;
+      memory_store_id?: string;
+      read_only?: boolean;
+    };
     const row = await getSessionRow(ctx.db, req.mas.auth!.workspaceId, id);
     if (row.archived_at) throw errConflict("session is archived");
+
+    if (body.type === "memory_store") {
+      if (!body.memory_store_id) throw errInvalid("memory_store resources require memory_store_id");
+      if (body.read_only !== undefined && typeof body.read_only !== "boolean") {
+        throw errInvalid("read_only must be a boolean");
+      }
+      const ws = req.mas.auth!.workspaceId;
+      const store = await ctx.db
+        .selectFrom("memory_stores")
+        .select(["id", "slug", "archived_at"])
+        .where("id", "=", body.memory_store_id)
+        .where("workspace_id", "=", ws)
+        .executeTakeFirst();
+      if (!store) throw errNotFound(`memory store ${body.memory_store_id} not found`);
+      if (store.archived_at) throw errConflict(`memory store ${body.memory_store_id} is archived`);
+      const existing = await listSessionResources(ctx.db, id);
+      const memCount = existing.filter((e) => e.type === "memory_store").length;
+      if (memCount >= 8) throw errInvalid("at most 8 memory_store resources per session");
+      for (const e of existing) {
+        if (e.memory_store_id === body.memory_store_id) {
+          throw errConflict(`memory store ${body.memory_store_id} is already mounted`);
+        }
+      }
+      const rid = newId("sesrsc");
+      const readOnly = body.read_only ?? true;
+      await ctx.db
+        .insertInto("session_resources")
+        .values({
+          id: rid,
+          session_id: id,
+          type: "memory_store",
+          file_id: null,
+          memory_store_id: body.memory_store_id,
+          read_only: readOnly,
+          mount_path: `/mnt/memory/${store.slug}`,
+        })
+        .execute();
+      return { id: rid, type: "memory_store", memory_store_id: body.memory_store_id, read_only: readOnly, mount_path: `/mnt/memory/${store.slug}` };
+    }
+
     if (!body.file_id || !body.mount_path || body.type !== "file") {
-      throw errInvalid("resources require type=file, file_id and mount_path");
+      throw errInvalid("resources require type=file (file_id, mount_path) or type=memory_store (memory_store_id)");
+    }
+    const existing = await listSessionResources(ctx.db, id);
+    if (existing.filter((e) => e.type === "file").length >= 500) {
+      throw errInvalid("at most 500 file resources per session");
     }
     const file = await ctx.db
       .selectFrom("files")
@@ -263,8 +337,7 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
       .executeTakeFirst();
     if (!file) throw errNotFound(`file ${body.file_id} not found`);
     const norm = normalizeMountPath(body.mount_path);
-    const existing = await listSessionResources(ctx.db, id);
-    for (const e of existing) {
+    for (const e of existing.filter((r) => r.type === "file")) {
       const en = normalizeMountPath(e.mount_path);
       if (en === norm || en.startsWith(`${norm}/`) || norm.startsWith(`${en}/`)) {
         throw errInvalid(`mount_path ${body.mount_path} overlaps with ${e.mount_path}`);

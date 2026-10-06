@@ -10,7 +10,10 @@ export type IdPrefix =
   | "vlt"
   | "vcrd"
   | "req"
-  | "exe";
+  | "exe"
+  | "mstr"
+  | "mem"
+  | "memv";
 
 const PREFIXES: IdPrefix[] = [
   "agent",
@@ -23,6 +26,9 @@ const PREFIXES: IdPrefix[] = [
   "vcrd",
   "req",
   "exe",
+  "mstr",
+  "mem",
+  "memv",
 ];
 
 export function newId(prefix: IdPrefix): string {

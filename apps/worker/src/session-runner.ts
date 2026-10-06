@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { sql, type Kysely } from "kysely";
-import { newId, type SessionEventJson } from "@mas/core";
+import { newId, memoryPathError, type SessionEventJson } from "@mas/core";
 import type { Database } from "@mas/db";
 import {
   appendEvent,
@@ -23,6 +23,8 @@ import {
   renewExecution,
   settleExecution,
   claimNextExecution,
+  upsertMemory,
+  PreconditionFailedError,
   type CheckpointManifest,
   type SnapshotStore,
 } from "@mas/db";
@@ -272,6 +274,8 @@ export class SessionRunner {
             await this.checkpointTurn(sessionId, executionId, generation, attemptId);
             // 轮末产出收集：outputs → manifest → File 登记（spec §5.5 / REC-08）
             await this.collectOutputsTurn(sessionId, executionId, generation, attemptId, append);
+            // 轮末 memory 回写：read_write 挂载下的沙箱写 → 新版本（MEM-08）
+            await this.syncMemoryWrites(sessionId);
           }
           return true;
         }
@@ -604,24 +608,138 @@ export class SessionRunner {
     });
   }
 
-  /** 把 session_resources 指向的 File 内容放到 <home>/uploads/<mount_path>（spec §9.2）。 */
+  /**
+   * 把 session_resources 指向的 File 内容放到 <home>/uploads/<mount_path>（spec §9.2），
+   * 把 memory_store 挂载的 head 版本物化到 <home>/mnt/memory/<slug>（spec §19 / MEM-08）：
+   * - read_only：写完后 chmod 目录 555 / 文件 444，agent 写入失败；
+   * - read_write：保持可写，轮末由 syncMemoryWrites 回写为新版本；
+   * - 每轮重建（先恢复可写权限再删除），卸载即消失。
+   */
   private async materializeResources(sessionId: string): Promise<void> {
-    const rows = await this.db
+    const fileRows = await this.db
       .selectFrom("session_resources")
       .innerJoin("files", (join) => join.onRef("files.id", "=", "session_resources.file_id"))
       .select(["mount_path", "object_key"])
       .where("session_resources.session_id", "=", sessionId)
+      .where("session_resources.type", "=", "file")
       .execute();
-    const uploads = join(fakeCodexHome(sessionId), "uploads");
+    const memRows = await this.db
+      .selectFrom("session_resources")
+      .innerJoin("memory_stores", (join) => join.onRef("memory_stores.id", "=", "session_resources.memory_store_id"))
+      .select(["session_resources.memory_store_id", "session_resources.read_only", "memory_stores.slug"])
+      .where("session_resources.session_id", "=", sessionId)
+      .where("session_resources.type", "=", "memory_store")
+      .execute();
+
+    const home = fakeCodexHome(sessionId);
+    const uploads = join(home, "uploads");
+    chmodRecursiveWritable(uploads);
     rmSync(uploads, { recursive: true, force: true });
-    if (rows.length === 0) return;
-    mkdirSync(uploads, { recursive: true });
-    for (const r of rows) {
-      const content = await this.filesStore.get(r.object_key).catch(() => null);
-      if (!content) continue;
-      const target = join(uploads, r.mount_path);
-      mkdirSync(dirname(target), { recursive: true });
-      writeFileSync(target, content);
+    if (fileRows.length > 0) {
+      mkdirSync(uploads, { recursive: true });
+      for (const r of fileRows) {
+        const content = await this.filesStore.get(r.object_key).catch(() => null);
+        if (!content) continue;
+        const target = join(uploads, r.mount_path);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, content);
+      }
+    }
+
+    const mntRoot = join(home, "mnt", "memory");
+    chmodRecursiveWritable(mntRoot);
+    rmSync(mntRoot, { recursive: true, force: true });
+    if (memRows.length === 0) return;
+    for (const m of memRows) {
+      if (!m.memory_store_id) continue;
+      const storeDir = join(mntRoot, m.slug);
+      const entries = await this.db
+        .selectFrom("memories")
+        .innerJoin(
+          "memory_versions",
+          (join) =>
+            join.onRef("memory_versions.memory_id", "=", "memories.id").on(
+              "memory_versions.version_no",
+              "=",
+              sql`memories.head_version`,
+            ),
+        )
+        .select(["memories.path", "memory_versions.content"])
+        .where("memories.store_id", "=", m.memory_store_id)
+        .execute();
+      for (const e of entries) {
+        if (e.content === null) continue;
+        const target = join(storeDir, e.path);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, e.content);
+      }
+      if (m.read_only) {
+        // 只读挂载：目录 555 / 文件 444（owner 无写位 → 同 uid 进程写入 EACCES）
+        chmodRecursiveReadOnly(storeDir);
+      }
+    }
+  }
+
+  /**
+   * 轮末回写 read_write 挂载下的 memory 写入（MEM-08）：
+   * 对比 <home>/mnt/memory/<slug> 与各 path 的 head 版本 sha，新增/变更的写为新版本；
+   * precondition 用回写前读到的 head sha——并发写者抢先时 upsert 抛冲突，跳过即可。
+   */
+  private async syncMemoryWrites(sessionId: string): Promise<void> {
+    const mounts = await this.db
+      .selectFrom("session_resources")
+      .innerJoin("memory_stores", (join) => join.onRef("memory_stores.id", "=", "session_resources.memory_store_id"))
+      .select(["session_resources.memory_store_id", "memory_stores.slug", "memory_stores.workspace_id"])
+      .where("session_resources.session_id", "=", sessionId)
+      .where("session_resources.type", "=", "memory_store")
+      .where("session_resources.read_only", "=", false)
+      .execute();
+    if (mounts.length === 0) return;
+    const root = join(fakeCodexHome(sessionId), "mnt", "memory");
+    if (!existsSync(root)) return;
+
+    for (const mount of mounts) {
+      if (!mount.memory_store_id) continue;
+      const storeDir = join(root, mount.slug);
+      if (!existsSync(storeDir)) continue;
+      for (const rel of walkFiles(storeDir)) {
+        if (memoryPathError(rel) !== null) continue; // 非法路径（套接字/越界符号等）不回写
+        let content: string;
+        try {
+          content = readFileSync(join(storeDir, rel), "utf8");
+        } catch {
+          continue;
+        }
+        const head = await this.db
+          .selectFrom("memories")
+          .innerJoin(
+            "memory_versions",
+            (join) =>
+              join.onRef("memory_versions.memory_id", "=", "memories.id").on(
+                "memory_versions.version_no",
+                "=",
+                sql`memories.head_version`,
+              ),
+          )
+          .select(["memories.id", "memory_versions.content_sha256"])
+          .where("memories.store_id", "=", mount.memory_store_id)
+          .where("memories.path", "=", rel)
+          .executeTakeFirst();
+        const sha = createHash("sha256").update(Buffer.from(content, "utf8")).digest("hex");
+        if (head && head.content_sha256 === sha) continue;
+        try {
+          await upsertMemory(this.db, {
+            workspaceId: mount.workspace_id,
+            storeId: mount.memory_store_id,
+            path: rel,
+            content,
+            preconditionSha: head?.content_sha256 ?? undefined,
+          });
+        } catch (e) {
+          if (e instanceof PreconditionFailedError) continue;
+          throw e;
+        }
+      }
     }
   }
 
@@ -677,4 +795,37 @@ export class SessionRunner {
     // 定序后的用户事件在 SSE 上出现（spec §7.3 第 5 条：SSE 在定序时推送）
     await sql`SELECT pg_notify('session:' || ${sessionId}, 'seq')`.execute(this.db);
   }
+}
+
+/** 递归恢复写权限（read_only 挂载在上一轮被 chmod 后，rm 前需要）。 */
+function chmodRecursiveWritable(root: string): void {
+  if (!existsSync(root)) return;
+  chmodSync(root, 0o755);
+  for (const name of readdirSync(root)) {
+    const p = join(root, name);
+    if (statSync(p).isDirectory()) chmodRecursiveWritable(p);
+    else chmodSync(p, 0o644);
+  }
+}
+
+/** read_only memory 挂载：目录 555 / 文件 444。 */
+function chmodRecursiveReadOnly(root: string): void {
+  if (!existsSync(root)) return;
+  chmodSync(root, 0o555);
+  for (const name of readdirSync(root)) {
+    const p = join(root, name);
+    if (statSync(p).isDirectory()) chmodRecursiveReadOnly(p);
+    else chmodSync(p, 0o444);
+  }
+}
+
+/** 列出 root 下所有文件的相对路径（POSIX 分隔符）。 */
+function walkFiles(root: string, prefix = ""): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(join(root, prefix))) {
+    const rel = prefix ? `${prefix}/${name}` : name;
+    if (statSync(join(root, rel)).isDirectory()) out.push(...walkFiles(root, rel));
+    else out.push(rel);
+  }
+  return out;
 }

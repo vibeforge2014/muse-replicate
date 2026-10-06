@@ -37,9 +37,10 @@
 | 运维手册（M5） | ✅ | [docs/OPS.md](docs/OPS.md)：部署形态、备份恢复、runtime 升级、故障排查表、告警建议 |
 | model-gateway（§10.3） | ✅ | Responses API 兼容 `POST /v1/responses`（流式 SSE 透传）；会话 token（`masmt_v1`，HMAC）鉴权后转发上游并注入真实 API key；从非流式/流式 `response.completed` 提取 usage 回写 `span.model_request_start/end{model_usage}` + 累计 `session.usage`；`mas_model_tokens_total{model,kind}` 指标 |
 | 确定性混沌车道（M3 3.9） | ✅ | 种子化（mulberry32）3 owner 并发真实 db 函数（claim/renew/append/checkpoint/output/settle + 双收/租约强过期/陈旧 fence 写）；六不变量逐步断言；`pnpm test:chaos [N]` 发布门禁（spec §17.2），种子固定可复现 |
+| Memory Store（M6 W11） | ✅ | 版本化键值树：store/memory/version 三表、precondition（content_sha256）更新、历史版本 redact、path_prefix/depth/view=full 列表（memory_prefix 元素）；会话挂载物化到 `/mnt/memory/<slug>`——read_only chmod 只读、read_write 轮末 diff 回写新版本（MEM-01~08 / SES-10） |
 | Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试；`out <text>` 模拟沙箱产出 |
 
-未实现（按 plan 后续里程碑）：egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、OTel 链路 / Grafana 看板 / k6 性能压测（M5 5.2/5.3 的重型件，需专门基础设施）、Memory Stores / Skills / Deployments（M6 二期）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
+未实现（按 plan 后续里程碑）：egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、OTel 链路 / Grafana 看板 / k6 性能压测（M5 5.2/5.3 的重型件，需专门基础设施）、Skills / Deployments / Webhooks / warm pool（M6 W12-W13 二期）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
 
 ## 快速开始
 
@@ -69,7 +70,7 @@ API_KEY=<启动时打印的 mas_sk_...> npx tsx scripts/smoke.ts
 测试（需要本地 PG，默认 `postgres://mas@localhost:5433/mas_test`，用 `DATABASE_URL` 覆盖；测试会清空该库）：
 
 ```bash
-pnpm test        # 105 个集成用例：AUTH/AGT/ENV/SES/EVT/EVT-R/TOOL/ORD/REC/FILE/RES/VLT/EGRESS/M5/GATEWAY
+pnpm test        # 118 个集成用例：AUTH/AGT/ENV/SES/EVT/EVT-R/TOOL/ORD/REC/FILE/RES/VLT/EGRESS/M5/GATEWAY/MEM
 pnpm test:chaos 200   # 确定性混沌门禁：200 个种子全绿（spec §17.2）
 ```
 
@@ -129,6 +130,7 @@ scripts/smoke.ts     # 端到端冒烟；scripts/chaos.ts 混沌门禁
 - **水位线恢复**（§14.2.1）：接管方 acquire runtime 时判定 —— `active_workspace_checkpoint.completed_execution_watermark === sessions.last_completed_execution_id` 且 `codex_version_digest` 一致 → **Level 1**（restoreCheckpoint 还原文件 + `thread/resume` 原生续聊）；否则（checkpoint 缺失/落后/损坏）→ **Level 0** 语义恢复：从事件日志重放 `user.message`/`agent.message` 文本（绝不重放工具输入），写内部事件 `runtime.recovered{mode, reason}`；checkpoint 校验失败额外写 `session.error{checkpoint_corrupt}`。
 - **model-gateway**（§10.3）：`POST /v1/responses`（Responses API 兼容，流式 SSE 透传）。会话侧只持 `masmt_v1` 短期 token（claims：ws/sesn/exp/jti，`POST /internal/tokens` 凭管理密钥签发）；网关验签后剥离会话凭证、注入上游真实 API key 转发；从响应（非流式 JSON 或流式 `response.completed` 帧）提取 usage，以 API 身份回写 `span.model_request_start/end{model_usage, is_error}` 与累计 `session.usage`（物化 `sessions.usage`）；`GET /internal/metrics` 暴露 `mas_model_tokens_total{model,kind}`。
 - **确定性混沌车道**（§5.20 / M3 3.9）：mulberry32 种子化随机驱动 3 个 owner 并发执行真实 db 函数（claim/renew/append/checkpoint/output/settle），动作含重复收集（幂等）、租约强过期（重写 `lease_expires_at` 模拟时钟推进）、陈旧 fence 写入（必须被 409 拒绝）；每步后断言六不变量：陈旧 fence 写拒、seq 连续、active checkpoint 可校验、输出无重复、接管语义、settle 后可恢复。`pnpm test:chaos [N=200]` 为发布门禁（§17.2），种子固定可复现。
+- **Memory Store**（plan M6 W11 / §19）：store（name→slug，workspace 内唯一）→ memory（`(store, path)` 唯一）→ memory_versions（每次写入追加，`head_version` 指针）。precondition 更新按 head `content_sha256`（不一致 409），条件删除同理；redact 只允许历史版本（head 409），redact 后 path/content/sha 置 null；list 支持 `path_prefix`/`depth`（深层折叠为 `memory_prefix` 元素）/`view=full`（limit ≤20）。会话以资源形态挂载（上限 8 个）：worker 每轮把 head 版本物化到 `<home>/mnt/memory/<slug>`（read_only 挂载 chmod 555/444，agent 写入 EACCES；read_write 挂载轮末 diff 回写新版本，并发以 precondition 乐观锁让位）。
 
 ## 与规格的已知偏差（务实取舍）
 
@@ -143,7 +145,8 @@ scripts/smoke.ts     # 端到端冒烟；scripts/chaos.ts 混沌门禁
 9. agent 事件 `span.model_request_*`/`session.usage` 经 model-gateway 落账（§10.3：网关在响应完成时以 API 身份回写 span 与累计 usage，并物化 `sessions.usage`）；FakeCodexDriver 不调用模型，计量验收用例直接驱动 gateway。指标端点为单进程聚合，多实例部署需加 Prometheus 联邦或 pushgateway。
 10. 文件上传（multipart）暂未接 Idempotency-Key（请求体哈希需累积原始流，随 M6 补）。
 11. 混沌车道中的“租约过期”通过重写 `lease_expires_at` 模拟（SQL 时钟无法虚拟化），其余动作全部走真实 db 函数。
+12. Memory Store 内容存 PG（单条 ≤100 KiB，符合验收上限），未拆对象存储；read_write 挂载的回写是轮末 diff——worker 在 agent 写入与回写之间崩溃会丢该轮记忆写入（真实部署用沙箱内 watcher 实时上报）；agent 删除文件不产生版本 tombstone。read_only 的强只读靠 chmod（555/444），root 进程可绕过（真沙箱内由 gvisor/rootfs 保证）。
 
 ## 后续路线（按 plan.md）
 
-M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 105/105 绿）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、M6 二期 API。
+M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 118/118 绿）→ M6 W11 Memory Store 已完成（API + 版本化 + `/mnt/memory/<slug>` 挂载）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、M6 W12-W13（Skills/Deployments/Webhooks）。

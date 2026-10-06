@@ -13,7 +13,7 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import readline from "node:readline";
 
 const home = process.env.FAKE_CODEX_HOME ?? "/tmp/fake-codex-home";
@@ -180,6 +180,28 @@ async function runTurn(params) {
       notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: "tool was denied" });
       history.push({ role: "agent", text: "tool was denied" });
     }
+    persist();
+    notify("turn/completed", { reason: "completed" });
+    return;
+  }
+  if (text.startsWith("memwrite ")) {
+    // 模拟 agent 写 Memory Store 挂载目录（MEM-08）：<home>/mnt/<relpath>
+    // read_only 挂载被 worker chmod 只读 → 写失败以 agent.message 报告
+    const rest = text.slice("memwrite ".length);
+    const sp = rest.indexOf(" ");
+    const rel = sp === -1 ? rest : rest.slice(0, sp);
+    const payload = sp === -1 ? "" : rest.slice(sp + 1);
+    let outcome;
+    try {
+      const target = join(home, "mnt", rel);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, payload);
+      outcome = `memwrite ok: ${rel} (${payload.length} bytes)`;
+    } catch (e) {
+      outcome = `memwrite failed: ${rel}: ${e?.code ?? e?.message ?? e}`;
+    }
+    notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: outcome });
+    history.push({ role: "user", text }, { role: "agent", text: outcome });
     persist();
     notify("turn/completed", { reason: "completed" });
     return;

@@ -35,6 +35,9 @@ export async function setupEnv(): Promise<TestEnv> {
   // 干净的测试库
   const tables = [
     "session_internal_events",
+    "memory_versions",
+    "memories",
+    "memory_stores",
     "credentials",
     "vaults",
     "sandbox_orphans",

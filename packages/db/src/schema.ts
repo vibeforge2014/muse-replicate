@@ -147,8 +147,41 @@ export interface SessionResourceRow {
   id: string;
   session_id: string;
   type: string;
-  file_id: string;
+  file_id: string | null;
+  memory_store_id: string | null;
+  read_only: Generated<boolean>;
   mount_path: string;
+  created_at: Generated<Date>;
+}
+export interface MemoryStoreRow {
+  id: string;
+  workspace_id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  archived_at: Date | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+export interface MemoryRow {
+  id: string;
+  store_id: string;
+  workspace_id: string;
+  path: string;
+  head_version: Generated<number>;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+export interface MemoryVersionRow {
+  id: string;
+  memory_id: string;
+  workspace_id: string;
+  version_no: number;
+  path: string | null;
+  content: string | null;
+  content_sha256: string | null;
+  size_bytes: number;
+  redacted_at: Date | null;
   created_at: Generated<Date>;
 }
 export interface IdempotencyKeyRow {
@@ -201,6 +234,9 @@ export interface Database {
   vaults: VaultRow;
   credentials: CredentialRow;
   session_resources: SessionResourceRow;
+  memory_stores: MemoryStoreRow;
+  memories: MemoryRow;
+  memory_versions: MemoryVersionRow;
   idempotency_keys: IdempotencyKeyRow;
   session_internal_events: SessionInternalEventRow;
   workspace_checkpoints: WorkspaceCheckpointRow;

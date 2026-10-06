@@ -40,6 +40,8 @@ export async function setupEnv(): Promise<TestEnv> {
     "skills",
     "deployment_runs",
     "deployments",
+    "webhook_deliveries",
+    "webhooks",
     "memories",
     "memory_stores",
     "credentials",

@@ -10,6 +10,8 @@
 | worker | `pnpm dev:worker` / compose `worker` | – | SessionRunner drain 循环（NOTIFY + 1s 轮询兜底） |
 | egress-proxy | `pnpm --filter @mas/egress-proxy start` | 8081（`MAS_EGRESS_PORT`） | 沙箱出网强制点 |
 | model-gateway | `pnpm --filter @mas/model-gateway start` | 8082（`MAS_GATEWAY_PORT`） | Responses API 网关：会话 token 鉴权 + 上游 key 注入 + 计量落账（§10.3） |
+
+> api 进程内含两个常驻调度器（单实例假设）：Deployments 调度（`MAS_DEPLOYMENT_TICK_MS`，默认 1s）与 Webhook outbox 分发（`MAS_WEBHOOK_TICK_MS`，默认 1s）。多实例部署需选主或拆独立 scheduler。
 | PostgreSQL | compose `postgres` | 5432 | 事件日志 / 队列 / 元数据 |
 | 对象存储 | 本地目录（`/tmp/mas-snapshots`、`/tmp/mas-files`） | – | checkpoint 归档与 File 内容；接 MinIO 时换 `SnapshotStore` 的 S3 实现 |
 
@@ -56,6 +58,8 @@ docker compose：`docker compose -f deploy/compose/docker-compose.yml up --build
 | `capability_unsatisfied` | 环境 `config.isolation` 高于 provider 实际等级——按 §9.0 这是 fail closed，不允许静默降级；要么升级宿主要么显式放宽环境 |
 | SSE 无输出 | 先 `GET events` 确认事件已定序（有 seq）；SSE 默认只推实时 |
 | 响应 409 `idempotency_conflict` | 同一 Idempotency-Key 配了不同 body |
+| deployment run 一直 pending | api 进程调度器未起（`MAS_DEPLOYMENT_TICK_MS`）或环境被归档（看 run 的 `error.type=start_failed`） |
+| webhook 投递 failed | `GET /v1/webhooks/{id}/deliveries` 看 `attempts`/`last_status_code`；6 次退避（2^n 秒）后转 failed，接收端需 2xx；secret 仅创建时可见，丢失需重建 webhook |
 
 ## 5. 指标与告警建议
 

@@ -237,6 +237,32 @@ export interface DeploymentRunRow {
   finished_at: Date | null;
   created_at: Generated<Date>;
 }
+export interface WebhookRow {
+  id: string;
+  workspace_id: string;
+  url: string;
+  events: Generated<unknown[]>;
+  secret: string;
+  description: string | null;
+  archived_at: Date | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+export interface WebhookDeliveryRow {
+  id: string;
+  workspace_id: string;
+  webhook_id: string;
+  event_id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  status: Generated<string>;
+  attempts: Generated<number>;
+  next_attempt_at: Generated<Date>;
+  last_status_code: number | null;
+  last_error: string | null;
+  delivered_at: Date | null;
+  created_at: Generated<Date>;
+}
 export interface IdempotencyKeyRow {
   workspace_id: string;
   key: string;
@@ -294,6 +320,8 @@ export interface Database {
   skill_versions: SkillVersionRow;
   deployments: DeploymentRow;
   deployment_runs: DeploymentRunRow;
+  webhooks: WebhookRow;
+  webhook_deliveries: WebhookDeliveryRow;
   idempotency_keys: IdempotencyKeyRow;
   session_internal_events: SessionInternalEventRow;
   workspace_checkpoints: WorkspaceCheckpointRow;

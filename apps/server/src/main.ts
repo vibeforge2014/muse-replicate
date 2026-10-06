@@ -1,4 +1,4 @@
-import { bootstrap, createDb, runMigrations, startDeploymentScheduler } from "@mas/db";
+import { bootstrap, createDb, runMigrations, startDeploymentScheduler, startWebhookScheduler } from "@mas/db";
 import { buildApp } from "./app.js";
 
 async function main() {
@@ -15,6 +15,7 @@ async function main() {
   await app.listen({ port, host });
   console.log(`[mas] api listening on http://${host}:${port}`);
   startDeploymentScheduler(db.db); // Deployments 调度（单进程 MVP）
+  startWebhookScheduler(db.db); // Webhook outbox 分发（单进程 MVP）
 }
 
 main().catch((e) => {

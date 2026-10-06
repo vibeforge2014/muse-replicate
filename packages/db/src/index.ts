@@ -9,5 +9,6 @@ export * from "./repos/sessions.js";
 export * from "./repos/memory.js";
 export * from "./skills.js";
 export * from "./repos/deployments.js";
+export * from "./repos/webhooks.js";
 export * from "./checkpoint.js";
 export * from "./output.js";

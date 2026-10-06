@@ -4,6 +4,7 @@ import type { Kysely } from "kysely";
 import { errConflict, errNotFound, type SessionEventJson } from "@mas/core";
 import type { Selectable } from "kysely";
 import type { Database, ExecutionRow, SessionRow } from "../schema.js";
+import { enqueueWebhookDeliveries } from "./webhooks.js";
 
 const iso = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
 const nowIso = () => iso(new Date());
@@ -562,12 +563,20 @@ export async function appendEvent(db: Kysely<Database>, input: AppendEventInput)
     await tx.updateTable("sessions").set(sessionUpdate).where("id", "=", input.sessionId).execute();
     // outbox：NOTIFY SSE 消费者（事务提交后由 PG 送达）
     await sql`SELECT pg_notify('session:' || ${input.sessionId}, ${seq}::text)`.execute(tx);
-    return {
+    const result = {
       id: eventId,
       type: input.type as SessionEventJson["type"],
       processed_at: iso(new Date(t)),
       ...payload,
     };
+    // webhook outbox（事务外尽力而为；失败不影响事件写入）
+    await enqueueWebhookDeliveries(db, {
+      sessionId: input.sessionId,
+      eventId,
+      eventType: input.type,
+      payload: payload as Record<string, unknown>,
+    }).catch(() => undefined);
+    return result;
   });
 }
 
@@ -578,16 +587,17 @@ export async function appendApiEvent(
   type: string,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  await db.transaction().execute(async (tx) => {
+  const eventId = await db.transaction().execute(async (tx): Promise<string> => {
     const state = await loadSeqState(tx, sessionId);
     const seq = Number(state.last_event_seq ?? 0) + 1;
     const lastMs = state.last_processed_at ? state.last_processed_at.getTime() : 0;
     const t = Math.max(Date.now(), lastMs + 1);
-    const eventId = payload.id as string | undefined ?? `sevt_${Math.floor(Math.random() * 1e9).toString(36)}${Date.now().toString(36)}`;
+    const rowId =
+      payload.id as string | undefined ?? `sevt_${Math.floor(Math.random() * 1e9).toString(36)}${Date.now().toString(36)}`;
     await tx.insertInto("session_events").values({
       session_id: sessionId,
       seq,
-      id: eventId,
+      id: rowId,
       type,
       payload,
       processed_at: new Date(t),
@@ -607,7 +617,10 @@ export async function appendApiEvent(
       .where("id", "=", sessionId)
       .execute();
     await sql`SELECT pg_notify('session:' || ${sessionId}, ${seq}::text)`.execute(tx);
+    return rowId;
   });
+  // webhook outbox（事务外尽力而为）
+  await enqueueWebhookDeliveries(db, { sessionId, eventId, eventType: type, payload }).catch(() => undefined);
 }
 
 // ---------------------------------------------------------------------------

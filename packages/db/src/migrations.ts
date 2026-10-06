@@ -350,4 +350,36 @@ CREATE TABLE IF NOT EXISTS deployment_runs (
 CREATE INDEX IF NOT EXISTS deployment_runs_dep_ix ON deployment_runs (deployment_id, created_at DESC);
 `,
   },
+  {
+    name: "0011_webhooks",
+    sql: `
+CREATE TABLE IF NOT EXISTS webhooks (
+  id text PRIMARY KEY,
+  workspace_id text NOT NULL REFERENCES workspaces(id),
+  url text NOT NULL,
+  events jsonb NOT NULL DEFAULT '[]',
+  secret text NOT NULL,
+  description text,
+  archived_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id text PRIMARY KEY,
+  workspace_id text NOT NULL,
+  webhook_id text NOT NULL REFERENCES webhooks(id),
+  event_id text NOT NULL,
+  event_type text NOT NULL,
+  payload jsonb NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  attempts int NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  last_status_code int,
+  last_error text,
+  delivered_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_due_ix ON webhook_deliveries (status, next_attempt_at);
+`,
+  },
 ];

@@ -21,7 +21,9 @@
   "devDependencies": {
     "@mas/core": "workspace:*",
     "@mas/db": "workspace:*",
+    "@mas/egress": "workspace:*",
     "@mas/runtime": "workspace:*",
+    "@mas/sandbox": "workspace:*",
     "@mas/server": "workspace:*",
     "@mas/worker": "workspace:*",
     "@types/node": "^22.10.0",

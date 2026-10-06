@@ -63,6 +63,7 @@ export interface SessionRow {
   last_completed_execution_id: string | null;
   active_workspace_checkpoint: Record<string, unknown> | null;
   active_output_manifest: Record<string, unknown> | null;
+  sandbox_id: string | null;
   codex_thread_id: string | null;
   codex_version_digest: string | null;
   archived_at: Date | null;
@@ -157,6 +158,17 @@ export interface IdempotencyKeyRow {
   response: Record<string, unknown> | null;
   created_at: Generated<Date>;
 }
+export interface SandboxOrphanRow {
+  id: Generated<number>;
+  sandbox_ref: string;
+  session_id: string;
+  generation: number;
+  reason: string;
+  attempts: Generated<number>;
+  last_error: string | null;
+  created_at: Generated<Date>;
+  resolved_at: Date | null;
+}
 export interface WorkspaceCheckpointRow {
   checkpoint_id: string;
   session_id: string;
@@ -192,4 +204,5 @@ export interface Database {
   idempotency_keys: IdempotencyKeyRow;
   session_internal_events: SessionInternalEventRow;
   workspace_checkpoints: WorkspaceCheckpointRow;
+  sandbox_orphans: SandboxOrphanRow;
 }

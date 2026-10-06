@@ -30,9 +30,11 @@
 | 输出清单 | ✅ | 轮末枚举 outputs → sha256 内容寻址上传 → fence CAS 发布 manifest → `(session,path,sha256)` 去重登记 File（§5.5 / REC-08） |
 | 能力协商 fail closed | ✅ | env.isolation 要求 vs provider 实际等级，不满足 → terminated + capability_unsatisfied，禁止降级（REC-09） |
 | digest 下线降级 | ✅ | 原 codex digest 不一致 → 强制 Level 0 + `runtime_upgraded`（retrying），会话可继续（REC-10） |
+| SandboxProvider 抽象 | ✅ | capabilities 协商 + create/pause/resume/destroy 生命周期 + sandbox_orphans 登记/reconcile（§9.0/§9.3）；FakeSandboxProvider（开发/测试）与 DockerProvider（runsc + CapDrop ALL + no-new-privileges + internal 网络 + 资源限额，§9.1） |
+| egress-proxy | ✅ | 出站授权 token（HMAC，绑定 fence，exp≤租约×2）、fence 4s 缓存校验、平台黑名单、limited/unrestricted 主机策略、凭据注入（剥离竞争头 + 占位符替换）、403 + x-mas-denied-host + `session.error{egress_denied}` 限频（§10.2/§10.4） |
 | Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试；`out <text>` 模拟沙箱产出 |
 
-未实现（按 plan 后续里程碑）：OpenSandbox/gVisor 真实沙箱与 egress-proxy + CredentialEgress（M4 后半，VLT-05~08/SBX-06~08 的前置）、model-gateway（M2 2.11）、确定性混沌车道（M3 3.9）、Memory Stores / Skills / Deployments（二期 API 面）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
+未实现（按 plan 后续里程碑）：model-gateway（M2 2.11）、egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、确定性混沌车道（M3 3.9）、Memory Stores / Skills / Deployments（二期 API 面）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
 
 ## 快速开始
 
@@ -49,6 +51,7 @@ export DATABASE_URL=postgres://<user>@localhost:5432/<db>
 pnpm --filter @mas/db migrate      # 建表
 pnpm dev:server                    # api（首次启动自动 bootstrap 并打印 API key）
 pnpm dev:worker                    # session-worker（另开终端）
+pnpm --filter @mas/egress-proxy start   # egress-proxy（默认 127.0.0.1:8081；MAS_EGRESS_SECRET 签发/验签）
 ```
 
 冒烟：
@@ -110,6 +113,8 @@ scripts/smoke.ts     # 端到端冒烟
 - **输出清单**（§5.5）：轮末枚举沙箱 outputs 目录，逐文件 sha256 后按 `outputs/{session}/{sha256}` 内容寻址上传（字节一致 = 幂等）；manifest 只有当前 fence 能 CAS 发布为 `sessions.active_output_manifest`；条目登记为 session 范围 File，`(scope_id, filename, sha256)` 唯一索引保证重复收集不产生重复 File（REC-08）；失败条目写 `session.error{output_incomplete}`。
 - **凭据与挂载**（§10.1/§5.5）：机密字段双层 AES-256-GCM 信封加密（数据密钥 + 主密钥包裹），API 只回 `***`+末 4 位；会话创建校验 `vault_ids`（存在/同租户/未归档）；File Resource 由 worker 每轮物化到 `<home>/uploads/<mount_path>`（重挂载重建、卸载即删）。
 - **能力协商**（§9.0）：环境 `config.isolation`（gvisor/microvm/runc，缺省 = 平台默认 gvisor|microvm）对 worker 的 `providerIsolation`（`MAS_SANDBOX_ISOLATION`）校验，不满足 fail closed → `terminated` + `session.error{capability_unsatisfied}`，禁止静默降级（REC-09）。
+- **沙箱 provider**（§9）：`SandboxProvider` 是 worker 与沙箱实现的唯一边界——`capabilities()` 供 §9.0 fail closed 协商（Fake 声明式，Docker 探测 runsc runtime 后如实上报）；`create()` 落 §9.2 目录约定（DockerProvider 挂载 `/session/.codex`、`/mnt/session/outputs`、只读 uploads）；强杀失败记 `sandbox_orphans`（不含 fence token，reaper 只能销毁不能发布状态）。
+- **egress-proxy**（§10.2/§10.4）：沙箱 `http_proxy` 指向本服务，`proxy-authorization` 携带出站 token（HMAC 签名，claims 绑定 workspace/session/execution/generation/sandbox，签发走 `POST /internal/bindings` + 管理密钥）。每请求：token 验签/时效 → fence 时效（generation 数值比较，4s 缓存）→ 黑名单（元数据服务/RFC1918）→ 凭据命中（先按会话 `vault_ids` 缩小候选再按 host 匹配，剥离 `authorization`/`x-api-key` 后注入真实值，占位符 `mas_ph_*` 永不出代理）→ env networking（limited 按 allowed_hosts 通配、unrestricted 仅 80/443）；拒绝带 `x-mas-denied-host`，`session.error{egress_denied}` 同 host 每分钟至多一条。
 - **水位线恢复**（§14.2.1）：接管方 acquire runtime 时判定 —— `active_workspace_checkpoint.completed_execution_watermark === sessions.last_completed_execution_id` 且 `codex_version_digest` 一致 → **Level 1**（restoreCheckpoint 还原文件 + `thread/resume` 原生续聊）；否则（checkpoint 缺失/落后/损坏）→ **Level 0** 语义恢复：从事件日志重放 `user.message`/`agent.message` 文本（绝不重放工具输入），写内部事件 `runtime.recovered{mode, reason}`；checkpoint 校验失败额外写 `session.error{checkpoint_corrupt}`。
 
 ## 与规格的已知偏差（务实取舍）
@@ -119,10 +124,12 @@ scripts/smoke.ts     # 端到端冒烟
 3. 限流为单进程内存令牌桶；多实例部署需换 PG/Redis（spec §13.4 预留）。
 4. checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。
 5. File 内容与 output 对象存本地 FS（`MAS_FILES_DIR`，默认 `/tmp/mas-files`）而非 MinIO；Key 布局与 spec 一致（`files/{org}/{file_id}`、`outputs/{session}/{sha256}`），换 S3 实现即可。
-6. 沙箱能力协商目前是 worker 侧静态声明（`MAS_SANDBOX_ISOLATION`），OpenSandbox/Docker+runsc provider 接入后改为 provider 真实上报。
-7. Idempotency-Key 已挂 POST events；其余 POST 路由（agents/environments 等）幂等按 M5 全量化推进。
-8. agent 事件 `span.model_request_*`/`session.usage` 由 runtime 上报路径尚未接线（fake 不产生计量）。
+6. egress-proxy MVP 只处理 HTTP 绝对 URI 形态（无 CONNECT/TLS 终止）；真实部署需镜像预置企业 CA、代理按 SNI 签发证书（§10.1）。worker 侧 prepare/attach/revoke 生命周期接线随真实沙箱宿主落地。
+7. DockerProvider 通过 docker CLI 驱动（非 dockerode），且未在 runsc 宿主上验证（macOS 开发机不可用）；结构按 §9.1 硬编码全部隔离参数。
+8. 沙箱能力协商目前 FakeSandboxProvider 为声明式（`MAS_SANDBOX_ISOLATION`/构造参数），DockerProvider 已按 runsc 探测如实上报。
+9. Idempotency-Key 已挂 POST events；其余 POST 路由（agents/environments 等）幂等按 M5 全量化推进。
+10. agent 事件 `span.model_request_*`/`session.usage` 由 runtime 上报路径尚未接线（fake 不产生计量）。
 
 ## 后续路线（按 plan.md）
 
-M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 前半已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10，测试 74/74 绿）→ M4 后半：sandbox provider（OpenSandbox/Docker+runsc）、egress-proxy/CredentialEgress、model-gateway → M5：幂等全量、可观测、性能。
+M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成主体（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider 抽象 + DockerProvider + egress-proxy 服务与验收，测试 80/80 绿）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、model-gateway → M5：幂等全量、可观测、性能。

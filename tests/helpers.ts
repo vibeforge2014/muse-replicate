@@ -37,6 +37,7 @@ export async function setupEnv(): Promise<TestEnv> {
     "session_internal_events",
     "credentials",
     "vaults",
+    "sandbox_orphans",
     "idempotency_keys",
     "session_resources",
     "files",

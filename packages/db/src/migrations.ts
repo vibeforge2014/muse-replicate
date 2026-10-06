@@ -222,4 +222,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS files_session_output_ix
   ON files (scope_id, filename, sha256) WHERE scope_type = 'session';
 `,
   },
+  {
+    name: "0007_sandbox",
+    sql: `
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_id text;
+CREATE TABLE IF NOT EXISTS sandbox_orphans (
+  id bigserial PRIMARY KEY,
+  sandbox_ref text NOT NULL,
+  session_id text NOT NULL,
+  generation bigint NOT NULL,
+  reason text NOT NULL,
+  attempts int NOT NULL DEFAULT 0,
+  last_error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz
+);
+`,
+  },
 ];

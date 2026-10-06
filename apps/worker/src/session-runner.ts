@@ -31,6 +31,7 @@ import {
   type NormalizedRuntimeEvent,
   type RuntimeHandle,
 } from "@mas/runtime";
+import { FakeSandboxProvider, type SandboxProvider } from "@mas/sandbox";
 
 const LEASE_SECONDS = 30;
 const RENEW_INTERVAL_MS = 10_000;
@@ -61,14 +62,23 @@ export class SessionRunner {
   /** 测试故障注入（spec §5.19 的进程内等价物）。 */
   readonly faults: RunnerFaults = {};
 
+  private provider: SandboxProvider;
+
   constructor(
     private db: Kysely<Database>,
     private driver: FakeCodexDriver,
     private workerId = `worker_${process.pid}`,
     private store: SnapshotStore = new FsSnapshotStore(process.env.MAS_SNAPSHOT_DIR ?? "/tmp/mas-snapshots"),
-    /** 沙箱 provider 实际提供的隔离等级（REC-09 能力协商）。 */
-    readonly providerIsolation: string = process.env.MAS_SANDBOX_ISOLATION ?? "gvisor",
-  ) {}
+    /** 沙箱 provider（或其声明的隔离等级字符串；Fake provider 兜底）。 */
+    providerOrIsolation: SandboxProvider | string = new FakeSandboxProvider(
+      (process.env.MAS_SANDBOX_ISOLATION as "gvisor" | "microvm" | "runc") ?? "gvisor",
+    ),
+  ) {
+    this.provider =
+      typeof providerOrIsolation === "string"
+        ? new FakeSandboxProvider(providerOrIsolation as "gvisor" | "microvm" | "runc")
+        : providerOrIsolation;
+  }
 
   /** 模拟 kill -9：中止在途工作并停掉全部 runtime（测试用）。 */
   async dispose(): Promise<void> {
@@ -172,17 +182,19 @@ export class SessionRunner {
     // 1.5) 能力协商（spec §9.0 / REC-09）：不满足就 fail closed，禁止静默降级
     const envConfig = (session.environment_snapshot as { config?: { isolation?: string } }).config ?? {};
     const requiredIsolation = envConfig.isolation; // undefined → 平台默认 gvisor/microvm
+    const caps = await this.provider.capabilities();
+    const providedIsolation = caps.isolation;
     const isolationOk =
       requiredIsolation === "runc" ||
-      this.providerIsolation === requiredIsolation ||
-      (requiredIsolation === undefined && (this.providerIsolation === "gvisor" || this.providerIsolation === "microvm"));
+      providedIsolation === requiredIsolation ||
+      (requiredIsolation === undefined && (providedIsolation === "gvisor" || providedIsolation === "microvm"));
     if (!isolationOk) {
       await append("session.error", {
         error: {
           type: "capability_unsatisfied",
           message: "sandbox provider cannot satisfy the environment's isolation requirement",
           retry_status: "terminal",
-          details: { required: requiredIsolation ?? "gvisor|microvm", provided: this.providerIsolation },
+          details: { required: requiredIsolation ?? "gvisor|microvm", provided: providedIsolation },
         },
       });
       await append("session.status_terminated", { stop_reason: { type: "capability_unsatisfied" } });
@@ -376,7 +388,7 @@ export class SessionRunner {
    */
   private async acquireRuntime(
     sessionId: string,
-    session: { codex_thread_id: string | null; codex_version_digest: string | null; last_completed_execution_id: string | null; active_workspace_checkpoint: Record<string, unknown> | null },
+    session: { codex_thread_id: string | null; codex_version_digest: string | null; last_completed_execution_id: string | null; active_workspace_checkpoint: Record<string, unknown> | null; sandbox_id: string | null },
     agent: { system: string | null; model: { id: string; effort?: string } },
     hasAsk: boolean,
     hasToolset: boolean,
@@ -460,9 +472,21 @@ export class SessionRunner {
     });
     const held: HeldRuntime = { handle, toolUseIds: new Map() };
     this.runtimes.set(sessionId, held);
+    // 沙箱创建/复用（spec §9.3）：首个 runtime 生命周期内创建一次，登记 sandbox_id
+    let sandboxId = session.sandbox_id;
+    if (!sandboxId) {
+      const sbx = await this.provider.create({
+        sessionId,
+        generation: fence.generation,
+        mounts: [],
+        codexHome: fakeCodexHome(sessionId),
+        outputsDir: join(fakeCodexHome(sessionId), "outputs"),
+      });
+      sandboxId = sbx.sandboxId;
+    }
     await this.db
       .updateTable("sessions")
-      .set({ codex_thread_id: handle.threadId, codex_version_digest: digest })
+      .set({ codex_thread_id: handle.threadId, codex_version_digest: digest, sandbox_id: sandboxId })
       .where("id", "=", sessionId)
       .execute();
     if (recovered) {

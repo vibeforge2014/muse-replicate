@@ -9,6 +9,7 @@
 | api | `pnpm dev:server` / compose `api` | 8080 | Fastify，全部 `/v1/*` |
 | worker | `pnpm dev:worker` / compose `worker` | – | SessionRunner drain 循环（NOTIFY + 1s 轮询兜底） |
 | egress-proxy | `pnpm --filter @mas/egress-proxy start` | 8081（`MAS_EGRESS_PORT`） | 沙箱出网强制点 |
+| model-gateway | `pnpm --filter @mas/model-gateway start` | 8082（`MAS_GATEWAY_PORT`） | Responses API 网关：会话 token 鉴权 + 上游 key 注入 + 计量落账（§10.3） |
 | PostgreSQL | compose `postgres` | 5432 | 事件日志 / 队列 / 元数据 |
 | 对象存储 | 本地目录（`/tmp/mas-snapshots`、`/tmp/mas-files`） | – | checkpoint 归档与 File 内容；接 MinIO 时换 `SnapshotStore` 的 S3 实现 |
 
@@ -23,6 +24,9 @@ docker compose：`docker compose -f deploy/compose/docker-compose.yml up --build
 | `MAS_FILES_DIR` | `/tmp/mas-files` | File 内容 / 输出对象根目录（api 与 worker 必须一致） |
 | `MAS_MASTER_KEY` | 开发默认（**生产必设**，64 位 hex） | 机密信封加密主密钥 |
 | `MAS_EGRESS_SECRET` | 开发默认（**生产必设**） | 出站 token 签发/验签密钥 |
+| `MAS_GATEWAY_SECRET` | 开发默认（**生产必设**） | model-gateway 会话 token（`masmt_v1`）签发/验签密钥 |
+| `MAS_UPSTREAM_BASE_URL` | `https://api.openai.com` | model-gateway 上游（Responses API 兼容） |
+| `MAS_UPSTREAM_API_KEY` | – | model-gateway 注入上游的真实 API key（永不下发给会话侧） |
 | `MAS_INTERNAL_TOKEN` | 未设置=开放 | `/internal/*`（metrics/debug）的门禁 |
 | `MAS_SANDBOX_ISOLATION` | `gvisor` | Fake provider 声明的隔离等级（协商用） |
 | `MAS_RATELIMIT_BURST` / `MAS_RATELIMIT_PER_MIN` | – | 限流令牌桶 |
@@ -61,5 +65,7 @@ docker compose：`docker compose -f deploy/compose/docker-compose.yml up --build
 - `mas_api_latency_seconds_*`：P99 告警；
 - `mas_sessions{status}`：`running` 长期堆积 → worker 容量/毒任务；
 - `mas_egress_denied_total`：突增 → 沙箱内异常出网尝试。
+
+model-gateway 另有 `GET /internal/metrics`：`mas_model_tokens_total{model,kind}`（input/output/cached 累计），按模型核对上游账单。
 
 未在本 MVP 实现的观测项（OTel 链路、Grafana 看板、告警规则文件）见 README「后续路线」。

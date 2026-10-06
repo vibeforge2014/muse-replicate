@@ -149,6 +149,8 @@ export interface SessionResourceRow {
   type: string;
   file_id: string | null;
   memory_store_id: string | null;
+  skill_id: string | null;
+  skill_version: number | null;
   read_only: Generated<boolean>;
   mount_path: string;
   created_at: Generated<Date>;
@@ -182,6 +184,28 @@ export interface MemoryVersionRow {
   content_sha256: string | null;
   size_bytes: number;
   redacted_at: Date | null;
+  created_at: Generated<Date>;
+}
+export interface SkillRow {
+  id: string;
+  workspace_id: string;
+  source: Generated<string>;
+  directory: string;
+  description: string | null;
+  latest_version: number;
+  archived_at: Date | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+export interface SkillVersionRow {
+  id: string;
+  skill_id: string;
+  workspace_id: string;
+  version: number;
+  object_key: string;
+  file_count: number;
+  size_bytes: number;
+  sha256: string;
   created_at: Generated<Date>;
 }
 export interface IdempotencyKeyRow {
@@ -237,6 +261,8 @@ export interface Database {
   memory_stores: MemoryStoreRow;
   memories: MemoryRow;
   memory_versions: MemoryVersionRow;
+  skills: SkillRow;
+  skill_versions: SkillVersionRow;
   idempotency_keys: IdempotencyKeyRow;
   session_internal_events: SessionInternalEventRow;
   workspace_checkpoints: WorkspaceCheckpointRow;

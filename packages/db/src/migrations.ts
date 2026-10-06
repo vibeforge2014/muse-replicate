@@ -283,4 +283,36 @@ ALTER TABLE session_resources
   ADD COLUMN IF NOT EXISTS read_only boolean NOT NULL DEFAULT true;
 `,
   },
+  {
+    name: "0009_skills",
+    sql: `
+CREATE TABLE IF NOT EXISTS skills (
+  id text PRIMARY KEY,
+  workspace_id text NOT NULL REFERENCES workspaces(id),
+  source text NOT NULL DEFAULT 'user',
+  directory text NOT NULL,
+  description text,
+  latest_version int NOT NULL DEFAULT 0,
+  archived_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (workspace_id, directory)
+);
+CREATE TABLE IF NOT EXISTS skill_versions (
+  id text PRIMARY KEY,
+  skill_id text NOT NULL REFERENCES skills(id),
+  workspace_id text NOT NULL,
+  version int NOT NULL,
+  object_key text NOT NULL,
+  file_count int NOT NULL,
+  size_bytes bigint NOT NULL,
+  sha256 text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (skill_id, version)
+);
+ALTER TABLE session_resources
+  ADD COLUMN IF NOT EXISTS skill_id text,
+  ADD COLUMN IF NOT EXISTS skill_version int;
+`,
+  },
 ];

@@ -36,6 +36,8 @@ export async function setupEnv(): Promise<TestEnv> {
   const tables = [
     "session_internal_events",
     "memory_versions",
+    "skill_versions",
+    "skills",
     "memories",
     "memory_stores",
     "credentials",

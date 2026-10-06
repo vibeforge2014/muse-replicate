@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Kysely } from "kysely";
 import type { Database } from "../schema.js";
+import { seedBuiltinSkills } from "../skills.js";
+import { FsSnapshotStore } from "../checkpoint.js";
 
 export function sha256hex(s: string): string {
   return createHash("sha256").update(s).digest("hex");
@@ -12,12 +14,12 @@ export interface BootstrapResult {
   apiKey: string; // 只在创建时返回明文
 }
 
-/** 首次启动：创建默认 org/workspace，并发放一个 API key（幂等）。 */
+/** 首次启动：创建默认 org/workspace，并发放一个 API key（幂等）；播种内置 skills（SKL-07）。 */
 export async function bootstrap(
   db: Kysely<Database>,
   opts: { orgName?: string; workspaceName?: string } = {},
 ): Promise<BootstrapResult> {
-  return db.transaction().execute(async (tx) => {
+  const result = await db.transaction().execute(async (tx) => {
     let org = await tx.selectFrom("orgs").select(["id"]).limit(1).executeTakeFirst();
     if (!org) {
       const orgId = `org_${randomBytes(10).toString("hex")}`;
@@ -61,6 +63,8 @@ export async function bootstrap(
       .execute();
     return { orgId: org.id, workspaceId: ws.id, apiKey: secret };
   });
+  await seedBuiltinSkills(db, new FsSnapshotStore(process.env.MAS_FILES_DIR ?? "/tmp/mas-files"));
+  return result;
 }
 
 export interface AuthContext {

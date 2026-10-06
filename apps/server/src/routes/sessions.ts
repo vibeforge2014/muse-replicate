@@ -80,7 +80,7 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
       system: overrides?.system !== undefined ? overrides.system : agent.system,
       tools: overrides?.tools !== undefined ? overrides.tools : agent.tools,
       mcp_servers: overrides?.mcp_servers !== undefined ? overrides.mcp_servers : agent.mcp_servers,
-      skills: [],
+      skills: agent.skills ?? [],
       metadata: agent.metadata,
     };
 
@@ -128,6 +128,33 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
             read_only: r.read_only ?? true,
             // 挂载点由平台固定（spec §19）：/mnt/memory/<slug>
             mount_path: `/mnt/memory/${store.slug}`,
+          })
+          .execute();
+        continue;
+      }
+      if (r.type === "skill") {
+        const skill = await ctx.db
+          .selectFrom("skills")
+          .select(["id", "directory", "latest_version", "archived_at"])
+          .where("id", "=", r.skill_id)
+          .where("workspace_id", "=", ws)
+          .executeTakeFirst();
+        if (!skill) throw errNotFound(`skill ${r.skill_id} not found`);
+        if (skill.archived_at) throw errConflict(`skill ${r.skill_id} is archived`);
+        if (r.version !== undefined && r.version > skill.latest_version) {
+          throw errInvalid(`skill ${r.skill_id} has no version ${r.version}; latest is ${skill.latest_version}`);
+        }
+        await ctx.db
+          .insertInto("session_resources")
+          .values({
+            id: newId("sesrsc"),
+            session_id: sessionId,
+            type: "skill",
+            file_id: null,
+            skill_id: r.skill_id,
+            skill_version: r.version ?? null,
+            // 挂载点固定（plan M6 W12 / SKL-06）：/workspace/skills/<directory>
+            mount_path: `/workspace/skills/${skill.directory}`,
           })
           .execute();
         continue;
@@ -270,7 +297,7 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
     return { id, type: "session_deleted" as const };
   });
 
-  // 运行中挂载资源（RES-02 / MEM-08）
+  // 运行中挂载资源（RES-02 / MEM-08 / SKL-06）
   app.post("/v1/sessions/:id/resources", async (req) => {
     const { id } = req.params as { id: string };
     const body = req.body as {
@@ -279,9 +306,46 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
       mount_path?: string;
       memory_store_id?: string;
       read_only?: boolean;
+      skill_id?: string;
+      version?: number;
     };
     const row = await getSessionRow(ctx.db, req.mas.auth!.workspaceId, id);
     if (row.archived_at) throw errConflict("session is archived");
+
+    if (body.type === "skill") {
+      if (!body.skill_id) throw errInvalid("skill resources require skill_id");
+      const ws = req.mas.auth!.workspaceId;
+      const skill = await ctx.db
+        .selectFrom("skills")
+        .select(["id", "directory", "latest_version", "archived_at"])
+        .where("id", "=", body.skill_id)
+        .where("workspace_id", "=", ws)
+        .executeTakeFirst();
+      if (!skill) throw errNotFound(`skill ${body.skill_id} not found`);
+      if (skill.archived_at) throw errConflict(`skill ${body.skill_id} is archived`);
+      const existing = await listSessionResources(ctx.db, id);
+      if (existing.filter((e) => e.type === "skill").length >= 16) {
+        throw errInvalid("at most 16 skill resources per session");
+      }
+      const pinned = body.version ?? null;
+      if (pinned !== null && pinned > skill.latest_version) {
+        throw errInvalid(`skill ${body.skill_id} has no version ${pinned}; latest is ${skill.latest_version}`);
+      }
+      const rid = newId("sesrsc");
+      await ctx.db
+        .insertInto("session_resources")
+        .values({
+          id: rid,
+          session_id: id,
+          type: "skill",
+          file_id: null,
+          skill_id: body.skill_id,
+          skill_version: pinned,
+          mount_path: `/workspace/skills/${skill.directory}`,
+        })
+        .execute();
+      return { id: rid, type: "skill", skill_id: body.skill_id, version: pinned, mount_path: `/workspace/skills/${skill.directory}` };
+    }
 
     if (body.type === "memory_store") {
       if (!body.memory_store_id) throw errInvalid("memory_store resources require memory_store_id");

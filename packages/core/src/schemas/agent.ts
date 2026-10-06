@@ -111,13 +111,16 @@ export const agentCreateSchema = z
     system: z.string().max(100_000).nullable().optional(),
     tools: z.array(toolConfigSchema).max(128).optional(),
     mcp_servers: z.array(mcpServerSchema).max(20).optional(),
-    skills: z.array(z.unknown()).max(20).optional(),
+    skills: z.array(z.string().min(3).max(128)).max(20).optional(),
     metadata: metadataSchema.optional(),
   })
   .strict()
   .superRefine((a, ctx) => {
-    if (a.skills && a.skills.length > 0) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "skills are not supported yet" });
+    if (a.skills) {
+      const set = new Set(a.skills);
+      if (set.size !== a.skills.length) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "skills must not contain duplicates" });
+      }
     }
     validateTools(a.tools ?? [], a.mcp_servers ?? [], ctx);
   });
@@ -130,14 +133,17 @@ export const agentUpdateSchema = z
     system: z.string().max(100_000).nullable().optional(),
     tools: z.array(toolConfigSchema).max(128).nullable().optional(),
     mcp_servers: z.array(mcpServerSchema).max(20).nullable().optional(),
-    skills: z.array(z.unknown()).max(20).nullable().optional(),
+    skills: z.array(z.string().min(3).max(128)).max(20).nullable().optional(),
     metadata: metadataSchema.nullable().optional(),
     version: z.number().int().min(1).optional(),
   })
   .strict()
   .superRefine((a, ctx) => {
-    if (a.skills && a.skills.length > 0) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "skills are not supported yet" });
+    if (a.skills) {
+      const set = new Set(a.skills);
+      if (set.size !== a.skills.length) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "skills must not contain duplicates" });
+      }
     }
     if (a.name !== undefined && a.name === null) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, message: "name cannot be set to null" });

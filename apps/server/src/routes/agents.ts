@@ -5,6 +5,7 @@ import {
   agentUpdateSchema,
   decodeCursor,
   encodeCursor,
+  errConflict,
   errInvalid,
   errNotFound,
   mergeMetadata,
@@ -33,6 +34,7 @@ function canonicalAgentConfig(input: {
   system?: string | null;
   tools?: unknown[];
   mcp_servers?: unknown[];
+  skills?: string[];
   metadata?: Record<string, string>;
 }): Record<string, unknown> {
   return {
@@ -42,15 +44,30 @@ function canonicalAgentConfig(input: {
     system: input.system ?? null,
     tools: normalizeAgentTools((input.tools ?? []) as never[]),
     mcp_servers: input.mcp_servers ?? [],
-    skills: [],
+    skills: input.skills ?? [],
     metadata: input.metadata ?? {},
   };
+}
+
+/** 校验 agent 引用的 skill 都存在且未归档（SKL-05 引用闭环）。 */
+async function validateSkillRefs(ctx: RouteCtx, ws: string, skills: string[] | undefined): Promise<void> {
+  for (const id of skills ?? []) {
+    const row = await ctx.db
+      .selectFrom("skills")
+      .select(["id", "archived_at"])
+      .where("id", "=", id)
+      .where("workspace_id", "=", ws)
+      .executeTakeFirst();
+    if (!row) throw errNotFound(`skill ${id} not found`);
+    if (row.archived_at) throw errConflict(`skill ${id} is archived`);
+  }
 }
 
 export function registerAgentRoutes(app: FastifyInstance, ctx: RouteCtx): void {
   app.post("/v1/agents", async (req, reply) =>
     withIdempotency(ctx.db, req, reply, async () => {
       const parsed = agentCreateSchema.parse(req.body ?? {});
+      await validateSkillRefs(ctx, req.mas.auth!.workspaceId, parsed.skills);
       const config = canonicalAgentConfig(parsed);
       const agentId = newId("agent");
       const agent = await createAgent(ctx.db, req.mas.auth!.workspaceId, agentId, config);
@@ -109,6 +126,9 @@ export function registerAgentRoutes(app: FastifyInstance, ctx: RouteCtx): void {
     const current = await getAgent(ctx.db, req.mas.auth!.workspaceId, id);
 
     // 字段语义：省略不变；数组整体替换（null 清空）；metadata 按键合并（GEN-04）
+    const nextSkills =
+      patch.skills !== undefined ? (patch.skills ?? []) : ((current.skills as string[] | undefined) ?? []);
+    await validateSkillRefs(ctx, req.mas.auth!.workspaceId, nextSkills);
     const next = canonicalAgentConfig({
       name: patch.name ?? current.name,
       description: patch.description !== undefined ? patch.description : current.description,
@@ -116,6 +136,7 @@ export function registerAgentRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       system: patch.system !== undefined ? patch.system : current.system,
       tools: (patch.tools !== undefined ? patch.tools : current.tools) as unknown[],
       mcp_servers: (patch.mcp_servers !== undefined ? patch.mcp_servers : current.mcp_servers) as unknown[],
+      skills: nextSkills,
       metadata: mergeMetadata(current.metadata, patch.metadata as Record<string, string | null> | null | undefined),
     });
     const outcome = await updateAgent(ctx.db, req.mas.auth!.workspaceId, id, next, patch.version);

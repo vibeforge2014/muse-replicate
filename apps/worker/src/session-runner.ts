@@ -19,6 +19,7 @@ import {
   listFallbackCheckpoints,
   markCheckpointCorrupt,
   markDelivered,
+  readSkillZip,
   restoreCheckpoint,
   renewExecution,
   settleExecution,
@@ -630,6 +631,18 @@ export class SessionRunner {
       .where("session_resources.session_id", "=", sessionId)
       .where("session_resources.type", "=", "memory_store")
       .execute();
+    const skillRows = await this.db
+      .selectFrom("session_resources")
+      .innerJoin("skills", (join) => join.onRef("skills.id", "=", "session_resources.skill_id"))
+      .select([
+        "session_resources.skill_id",
+        "session_resources.skill_version",
+        "skills.directory",
+        "skills.latest_version",
+      ])
+      .where("session_resources.session_id", "=", sessionId)
+      .where("session_resources.type", "=", "skill")
+      .execute();
 
     const home = fakeCodexHome(sessionId);
     const uploads = join(home, "uploads");
@@ -649,7 +662,6 @@ export class SessionRunner {
     const mntRoot = join(home, "mnt", "memory");
     chmodRecursiveWritable(mntRoot);
     rmSync(mntRoot, { recursive: true, force: true });
-    if (memRows.length === 0) return;
     for (const m of memRows) {
       if (!m.memory_store_id) continue;
       const storeDir = join(mntRoot, m.slug);
@@ -677,6 +689,32 @@ export class SessionRunner {
         // 只读挂载：目录 555 / 文件 444（owner 无写位 → 同 uid 进程写入 EACCES）
         chmodRecursiveReadOnly(storeDir);
       }
+    }
+
+    // Skill 挂载：<home>/workspace/skills/<directory>/（SKL-06；每轮按固定版本重建）
+    const skillsRoot = join(home, "workspace", "skills");
+    chmodRecursiveWritable(skillsRoot);
+    rmSync(skillsRoot, { recursive: true, force: true });
+    if (skillRows.length === 0) return;
+    for (const s of skillRows) {
+      if (!s.skill_id) continue;
+      const version = s.skill_version ?? s.latest_version;
+      const row = await this.db
+        .selectFrom("skill_versions")
+        .select(["object_key"])
+        .where("skill_id", "=", s.skill_id)
+        .where("version", "=", version)
+        .executeTakeFirst();
+      if (!row) continue;
+      const bytes = await this.filesStore.get(row.object_key).catch(() => null);
+      if (!bytes) continue;
+      const dir = join(skillsRoot, s.directory);
+      for (const f of readSkillZip(bytes)) {
+        const target = join(dir, f.path);
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, f.content);
+      }
+      chmodRecursiveReadOnly(dir);
     }
   }
 

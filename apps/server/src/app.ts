@@ -12,6 +12,7 @@ import { registerEventRoutes } from "./routes/events.js";
 import { registerVaultRoutes } from "./routes/vaults.js";
 import { registerFileRoutes } from "./routes/files.js";
 import { registerMemoryRoutes } from "./routes/memory.js";
+import { registerSkillRoutes } from "./routes/skills.js";
 import { registerInternalRoutes } from "./routes/internal.js";
 import { newMetricsState, registerMetrics } from "./plugins/metrics.js";
 
@@ -89,6 +90,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   registerVaultRoutes(app, ctx);
   registerFileRoutes(app, ctx);
   registerMemoryRoutes(app, ctx);
+  registerSkillRoutes(app, ctx);
   registerInternalRoutes(app, ctx);
   const metrics = newMetricsState();
   app.decorate("masMetrics", metrics);

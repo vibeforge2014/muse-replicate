@@ -2,7 +2,7 @@
   "name": "muse-replicate",
   "private": true,
   "version": "0.1.0",
-  "description": "\u4f01\u4e1a\u79c1\u6709\u5316 Managed Agents \u5e73\u53f0\uff08Meta Muse \u590d\u523b\uff09\u2014 spec/plan \u89c1 *.md",
+  "description": "企业私有化 Managed Agents 平台（Meta Muse 复刻）— spec/plan 见 *.md",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "engines": {
@@ -34,6 +34,7 @@
     "pg": "^8.23.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.0",
+    "adm-zip": "^0.6.1"
   }
 }

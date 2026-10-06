@@ -24,6 +24,7 @@ export interface SessionJson {
   resources: (
     | { type: string; file_id: string; mount_path: string; id?: string }
     | { type: string; memory_store_id?: string | null; read_only?: boolean; mount_path: string; id?: string }
+    | { type: string; skill_id?: string | null; skill_version?: number | null; mount_path: string; id?: string }
   )[];
   vault_ids: string[];
   usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number };
@@ -47,7 +48,11 @@ export function sessionRowToJson(
     metadata: s.metadata,
     resources: resources.map((r) => ({
       type: r.type,
-      ...(r.type === "file" ? { file_id: r.file_id } : { memory_store_id: r.memory_store_id, read_only: r.read_only }),
+      ...(r.type === "file"
+        ? { file_id: r.file_id }
+        : r.type === "memory_store"
+          ? { memory_store_id: r.memory_store_id, read_only: r.read_only }
+          : { skill_id: r.skill_id, skill_version: r.skill_version }),
       mount_path: r.mount_path,
     })),
     vault_ids: s.vault_ids,
@@ -79,6 +84,8 @@ export interface SessionResourceView {
   file_id: string | null;
   memory_store_id?: string | null;
   read_only?: boolean;
+  skill_id?: string | null;
+  skill_version?: number | null;
   mount_path: string;
 }
 
@@ -88,7 +95,7 @@ export async function listSessionResources(
 ): Promise<SessionResourceView[]> {
   const rows = await db
     .selectFrom("session_resources")
-    .select(["id", "type", "file_id", "memory_store_id", "read_only", "mount_path"])
+    .select(["id", "type", "file_id", "memory_store_id", "read_only", "skill_id", "skill_version", "mount_path"])
     .where("session_id", "=", sessionId)
     .orderBy("created_at asc")
     .execute();
@@ -97,6 +104,7 @@ export async function listSessionResources(
     type: r.type,
     file_id: r.file_id,
     ...(r.type === "memory_store" ? { memory_store_id: r.memory_store_id, read_only: r.read_only } : {}),
+    ...(r.type === "skill" ? { skill_id: r.skill_id, skill_version: r.skill_version } : {}),
     mount_path: r.mount_path,
   }));
 }

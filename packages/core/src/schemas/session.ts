@@ -24,6 +24,14 @@ const sessionResourceSchema = z.union([
       read_only: z.boolean().optional(),
     })
     .strict(),
+  // Skill 挂载：挂载点固定 /workspace/skills/<directory>（plan M6 W12 / SKL-06）
+  z
+    .object({
+      type: z.literal("skill"),
+      skill_id: z.string().min(3).max(128),
+      version: z.number().int().min(1).optional(),
+    })
+    .strict(),
 ]);
 export type SessionResourceInput = z.infer<typeof sessionResourceSchema>;
 
@@ -86,7 +94,15 @@ export const sessionCreateSchema = z
       if (memIds.size !== memStores.length) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, message: "memory_store resources must not contain duplicates" });
       }
-      if (s.resources.length - memStores.length > 500) {
+      const skills = s.resources.filter((r) => r.type === "skill");
+      if (skills.length > 16) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "at most 16 skill resources per session" });
+      }
+      const skillKeys = new Set(skills.map((r) => `${r.skill_id}@${r.version ?? "latest"}`));
+      if (skillKeys.size !== skills.length) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "skill resources must not contain duplicates" });
+      }
+      if (s.resources.length - memStores.length - skills.length > 500) {
         ctx.addIssue({ code: z.ZodIssueCode.custom, message: "at most 500 file resources per session" });
       }
     }

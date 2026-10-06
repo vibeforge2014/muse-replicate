@@ -13,7 +13,13 @@ export type IdPrefix =
   | "exe"
   | "mstr"
   | "mem"
-  | "memv";
+  | "memv"
+  | "skl"
+  | "skv"
+  | "dply"
+  | "dprn"
+  | "whk"
+  | "whd";
 
 const PREFIXES: IdPrefix[] = [
   "agent",
@@ -29,6 +35,12 @@ const PREFIXES: IdPrefix[] = [
   "mstr",
   "mem",
   "memv",
+  "skl",
+  "skv",
+  "dply",
+  "dprn",
+  "whk",
+  "whd",
 ];
 
 export function newId(prefix: IdPrefix): string {

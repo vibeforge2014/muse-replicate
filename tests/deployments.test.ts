@@ -92,7 +92,8 @@ describe("DEP-04 手动 run 生命周期", () => {
     expect(run.json.session_id).toBeNull();
 
     const started = await waitForRun(run.json.id, (r) => r.session_id !== null);
-    expect(started.status).toBe("running");
+    // 启动后即 running；极快场景（fake codex 轮次毫秒级）可能已经收尾
+    expect(["running", "succeeded"]).toContain(started.status);
     // 会话首轮消息来自 deployment input
     const events = await call(url, key, "GET", `/v1/sessions/${started.session_id}/events`);
     const userMsg = events.json.data.find((e: any) => e.type === "user.message");

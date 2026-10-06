@@ -32,9 +32,12 @@
 | digest 下线降级 | ✅ | 原 codex digest 不一致 → 强制 Level 0 + `runtime_upgraded`（retrying），会话可继续（REC-10） |
 | SandboxProvider 抽象 | ✅ | capabilities 协商 + create/pause/resume/destroy 生命周期 + sandbox_orphans 登记/reconcile（§9.0/§9.3）；FakeSandboxProvider（开发/测试）与 DockerProvider（runsc + CapDrop ALL + no-new-privileges + internal 网络 + 资源限额，§9.1） |
 | egress-proxy | ✅ | 出站授权 token（HMAC，绑定 fence，exp≤租约×2）、fence 4s 缓存校验、平台黑名单、limited/unrestricted 主机策略、凭据注入（剥离竞争头 + 占位符替换）、403 + x-mas-denied-host + `session.error{egress_denied}` 限频（§10.2/§10.4） |
+| 幂等全量（M5） | ✅ | POST agents/environments/sessions/vaults/credentials/events 全部支持 Idempotency-Key（同 key 同 body 回放、异 body 409） |
+| 指标与调试（M5） | ✅ | `GET /internal/metrics`（Prometheus 文本：请求计数/延迟/会话 gauge/SSE 连接/egress 拒绝）；`GET /internal/sessions/:id/debug`（内部事件 + runtime/checkpoint/output 全景）；`MAS_INTERNAL_TOKEN` 门禁 |
+| 运维手册（M5） | ✅ | [docs/OPS.md](docs/OPS.md)：部署形态、备份恢复、runtime 升级、故障排查表、告警建议 |
 | Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试；`out <text>` 模拟沙箱产出 |
 
-未实现（按 plan 后续里程碑）：model-gateway（M2 2.11）、egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、确定性混沌车道（M3 3.9）、Memory Stores / Skills / Deployments（二期 API 面）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
+未实现（按 plan 后续里程碑）：model-gateway（M2 2.11）、egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、确定性混沌车道（M3 3.9）、OTel 链路 / Grafana 看板 / k6 性能压测（M5 5.2/5.3 的重型件，需专门基础设施）、Memory Stores / Skills / Deployments（M6 二期）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
 
 ## 快速开始
 
@@ -127,9 +130,9 @@ scripts/smoke.ts     # 端到端冒烟
 6. egress-proxy MVP 只处理 HTTP 绝对 URI 形态（无 CONNECT/TLS 终止）；真实部署需镜像预置企业 CA、代理按 SNI 签发证书（§10.1）。worker 侧 prepare/attach/revoke 生命周期接线随真实沙箱宿主落地。
 7. DockerProvider 通过 docker CLI 驱动（非 dockerode），且未在 runsc 宿主上验证（macOS 开发机不可用）；结构按 §9.1 硬编码全部隔离参数。
 8. 沙箱能力协商目前 FakeSandboxProvider 为声明式（`MAS_SANDBOX_ISOLATION`/构造参数），DockerProvider 已按 runsc 探测如实上报。
-9. Idempotency-Key 已挂 POST events；其余 POST 路由（agents/environments 等）幂等按 M5 全量化推进。
-10. agent 事件 `span.model_request_*`/`session.usage` 由 runtime 上报路径尚未接线（fake 不产生计量）。
+9. agent 事件 `span.model_request_*`/`session.usage` 由 runtime 上报路径尚未接线（fake 不产生计量）；指标端点为单进程聚合，多实例部署需加 Prometheus 联邦或 pushgateway。
+10. 文件上传（multipart）暂未接 Idempotency-Key（请求体哈希需累积原始流，随 M6 补）。
 
 ## 后续路线（按 plan.md）
 
-M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成主体（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider 抽象 + DockerProvider + egress-proxy 服务与验收，测试 80/80 绿）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、model-gateway → M5：幂等全量、可观测、性能。
+M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md；测试 86/86 绿）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、model-gateway、OTel/k6（需专门基础设施）、M6 二期 API。

@@ -11,6 +11,8 @@ import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerEventRoutes } from "./routes/events.js";
 import { registerVaultRoutes } from "./routes/vaults.js";
 import { registerFileRoutes } from "./routes/files.js";
+import { registerInternalRoutes } from "./routes/internal.js";
+import { newMetricsState, registerMetrics } from "./plugins/metrics.js";
 
 export interface BuildAppOptions {
   db: DbHandle;
@@ -85,6 +87,10 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   registerEventRoutes(app, ctx);
   registerVaultRoutes(app, ctx);
   registerFileRoutes(app, ctx);
+  registerInternalRoutes(app, ctx);
+  const metrics = newMetricsState();
+  app.decorate("masMetrics", metrics);
+  registerMetrics(app, { db: opts.db.db }, metrics);
 
   return app;
 }

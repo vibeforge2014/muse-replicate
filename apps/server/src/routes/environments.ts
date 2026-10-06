@@ -6,6 +6,7 @@ import {
   normalizeEnvironmentConfig,
 } from "@mas/core";
 import type { Database } from "@mas/db";
+import { withIdempotency } from "../plugins/idempotent-route.js";
 import {
   archiveEnvironment,
   createEnvironment,
@@ -18,10 +19,11 @@ import type { RouteCtx } from "./agents.js";
 
 export function registerEnvironmentRoutes(app: FastifyInstance, ctx: RouteCtx): void {
   // 创建返回 200（与 BigModel 一致，spec §11.3）
-  app.post("/v1/environments", async (req) => {
+  app.post("/v1/environments", async (req, reply) =>
+    withIdempotency(ctx.db, req, reply, async () => {
     const parsed = environmentCreateSchema.parse(req.body ?? {});
     const config = normalizeEnvironmentConfig(parsed.config);
-    return createEnvironment(ctx.db, {
+    return (await createEnvironment(ctx.db, {
       id: newId("env"),
       workspace_id: req.mas.auth!.workspaceId,
       name: parsed.name,
@@ -29,8 +31,9 @@ export function registerEnvironmentRoutes(app: FastifyInstance, ctx: RouteCtx): 
       config: config as unknown as Record<string, unknown>,
       metadata: parsed.metadata ?? {},
       archived_at: null,
-    });
-  });
+    })) as unknown as Record<string, unknown>;
+    }),
+  );
 
   app.get("/v1/environments", async (req) => {
     const query = req.query as Record<string, string>;

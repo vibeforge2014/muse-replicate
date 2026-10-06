@@ -13,6 +13,7 @@ import {
 } from "@mas/core";
 import type { CredentialRow, VaultRow } from "@mas/db";
 import type { RouteCtx } from "./agents.js";
+import { withIdempotency } from "../plugins/idempotent-route.js";
 
 /**
  * Vaults / Credentials（spec §10.1、§11.4）：
@@ -132,7 +133,8 @@ async function getVaultRow(ctx: RouteCtx, ws: string, id: string): Promise<Selec
 
 export function registerVaultRoutes(app: FastifyInstance, ctx: RouteCtx): void {
   // ---- Vault CRUD ----
-  app.post("/v1/vaults", async (req) => {
+  app.post("/v1/vaults", async (req, reply) =>
+    withIdempotency(ctx.db, req, reply, async () => {
     const ws = req.mas.auth!.workspaceId;
     const body = req.body as { display_name?: unknown; metadata?: unknown };
     const displayName = typeof body?.display_name === "string" ? body.display_name.trim() : "";
@@ -149,8 +151,9 @@ export function registerVaultRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       .values({ id, workspace_id: ws, display_name: displayName, metadata })
       .execute();
     const row = await getVaultRow(ctx, ws, id);
-    return vaultJson(row);
-  });
+    return vaultJson(row) as unknown as Record<string, unknown>;
+    }),
+  );
 
   app.get("/v1/vaults", async (req) => {
     const ws = req.mas.auth!.workspaceId;
@@ -199,7 +202,8 @@ export function registerVaultRoutes(app: FastifyInstance, ctx: RouteCtx): void {
   });
 
   // ---- Credentials ----
-  app.post("/v1/vaults/:id/credentials", async (req) => {
+  app.post("/v1/vaults/:id/credentials", async (req, reply) =>
+    withIdempotency(ctx.db, req, reply, async () => {
     const { id } = req.params as { id: string };
     const ws = req.mas.auth!.workspaceId;
     const vault = await getVaultRow(ctx, ws, id);
@@ -233,8 +237,9 @@ export function registerVaultRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       .selectAll()
       .where("id", "=", cid)
       .executeTakeFirst();
-    return credentialJson(row!);
-  });
+    return credentialJson(row!) as unknown as Record<string, unknown>;
+    }),
+  );
 
   app.get("/v1/vaults/:id/credentials", async (req) => {
     const { id } = req.params as { id: string };

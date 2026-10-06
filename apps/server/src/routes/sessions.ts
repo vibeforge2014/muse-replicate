@@ -19,9 +19,11 @@ import {
   sessionRowToJson,
 } from "@mas/db";
 import type { RouteCtx } from "./agents.js";
+import { withIdempotency } from "../plugins/idempotent-route.js";
 
 export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void {
-  app.post("/v1/sessions", async (req) => {
+  app.post("/v1/sessions", async (req, reply) =>
+    withIdempotency(ctx.db, req, reply, async () => {
     const parsed = sessionCreateSchema.parse(req.body ?? {});
     const ws = req.mas.auth!.workspaceId;
 
@@ -143,8 +145,9 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
 
     const row = await getSessionRow(ctx.db, ws, sessionId);
     const resources = await listSessionResources(ctx.db, sessionId);
-    return sessionRowToJson(row, resources);
-  });
+    return sessionRowToJson(row, resources) as unknown as Record<string, unknown>;
+    }),
+  );
 
   app.get("/v1/sessions", async (req) => {
     const query = req.query as Record<string, string | string[]>;

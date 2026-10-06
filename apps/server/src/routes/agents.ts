@@ -14,6 +14,7 @@ import {
 } from "@mas/core";
 import type { Database } from "@mas/db";
 import { archiveAgent, createAgent, getAgent, listAgentVersions, updateAgent } from "@mas/db";
+import { withIdempotency } from "../plugins/idempotent-route.js";
 
 export interface RouteCtx {
   db: Kysely<Database>;
@@ -47,14 +48,17 @@ function canonicalAgentConfig(input: {
 }
 
 export function registerAgentRoutes(app: FastifyInstance, ctx: RouteCtx): void {
-  app.post("/v1/agents", async (req, reply) => {
-    const parsed = agentCreateSchema.parse(req.body ?? {});
-    const config = canonicalAgentConfig(parsed);
-    const agentId = newId("agent");
-    const agent = await createAgent(ctx.db, req.mas.auth!.workspaceId, agentId, config);
-    // 按方言回显工具集名
-    reply.code(201).send(agent);
-  });
+  app.post("/v1/agents", async (req, reply) =>
+    withIdempotency(ctx.db, req, reply, async () => {
+      const parsed = agentCreateSchema.parse(req.body ?? {});
+      const config = canonicalAgentConfig(parsed);
+      const agentId = newId("agent");
+      const agent = await createAgent(ctx.db, req.mas.auth!.workspaceId, agentId, config);
+      // 按方言回显工具集名
+      reply.code(201);
+      return agent as unknown as Record<string, unknown>;
+    }),
+  );
 
   app.get("/v1/agents", async (req) => {
     const query = req.query as Record<string, string>;

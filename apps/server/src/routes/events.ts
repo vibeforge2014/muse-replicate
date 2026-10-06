@@ -213,7 +213,10 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
     });
     client.on("error", () => raw.end());
 
+    const metrics = (app as unknown as { masMetrics?: { sseConnections: number } }).masMetrics ?? null;
+    if (metrics) metrics.sseConnections += 1;
     req.raw.on("close", () => {
+      if (metrics) metrics.sseConnections -= 1;
       void client.end().catch(() => undefined);
     });
 

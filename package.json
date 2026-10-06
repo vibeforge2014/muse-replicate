@@ -1,0 +1,36 @@
+{
+  "name": "muse-replicate",
+  "private": true,
+  "version": "0.1.0",
+  "description": "企业私有化 Managed Agents 平台（Meta Muse 复刻）— spec/plan 见 *.md",
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -b packages/core packages/db packages/runtime apps/server apps/worker",
+    "dev:server": "pnpm --filter @mas/server dev",
+    "dev:worker": "pnpm --filter @mas/worker dev",
+    "migrate": "pnpm --filter @mas/db migrate",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/db/tsconfig.json && tsc --noEmit -p packages/runtime/tsconfig.json && tsc --noEmit -p apps/server/tsconfig.json && tsc --noEmit -p apps/worker/tsconfig.json",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "devDependencies": {
+    "@mas/core": "workspace:*",
+    "@mas/db": "workspace:*",
+    "@mas/runtime": "workspace:*",
+    "@mas/server": "workspace:*",
+    "@mas/worker": "workspace:*",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.23.1",
+    "fastify": "^5.12.5",
+    "kysely": "^0.27.6",
+    "pg": "^8.23.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

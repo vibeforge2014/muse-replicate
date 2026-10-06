@@ -1,0 +1,45 @@
+# 单机部署拓扑（spec §18.1 的 MVP 子集：postgres + server + worker）
+# 生产沙箱（OpenSandbox/gVisor、egress-proxy、model-gateway、MinIO）按 spec §9/§10 在后续里程碑接入。
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mas
+      POSTGRES_DB: mas_dev
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mas"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["npx", "tsx", "apps/server/src/main.ts"]
+    environment:
+      DATABASE_URL: postgres://mas@postgres:5432/mas_dev
+      PORT: "8080"
+      HOST: 0.0.0.0
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["npx", "tsx", "apps/worker/src/main.ts"]
+    environment:
+      DATABASE_URL: postgres://mas@postgres:5432/mas_dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pg:

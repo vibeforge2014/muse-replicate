@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { sql, type Kysely } from "kysely";
 import { newId, type SessionEventJson } from "@mas/core";
 import type { Database } from "@mas/db";
@@ -8,6 +9,7 @@ import {
   appendEvent,
   appendInternalEvent,
   assignSeqAndProcessedAt,
+  collectOutputs,
   commitCheckpoint,
   FAKE_CODEX_DIGEST,
   reapExhaustedExecutions,
@@ -47,11 +49,15 @@ interface HeldRuntime {
 export interface RunnerFaults {
   /** 在 checkpoint 候选上传后、CAS 发布前模拟 worker 崩溃（REC-03）。 */
   crashBeforeCheckpointPublish?: boolean;
+  /** 在输出对象上传后、manifest CAS 发布前模拟 worker 崩溃（REC-08）。 */
+  crashAfterOutputUpload?: boolean;
 }
 
 export class SessionRunner {
   private runtimes = new Map<string, HeldRuntime>();
   private disposed = false;
+  /** File 内容存储（与 api 同根；MVP 本地 FS）。 */
+  private filesStore = new FsSnapshotStore(process.env.MAS_FILES_DIR ?? "/tmp/mas-files");
   /** 测试故障注入（spec §5.19 的进程内等价物）。 */
   readonly faults: RunnerFaults = {};
 
@@ -60,6 +66,8 @@ export class SessionRunner {
     private driver: FakeCodexDriver,
     private workerId = `worker_${process.pid}`,
     private store: SnapshotStore = new FsSnapshotStore(process.env.MAS_SNAPSHOT_DIR ?? "/tmp/mas-snapshots"),
+    /** 沙箱 provider 实际提供的隔离等级（REC-09 能力协商）。 */
+    readonly providerIsolation: string = process.env.MAS_SANDBOX_ISOLATION ?? "gvisor",
   ) {}
 
   /** 模拟 kill -9：中止在途工作并停掉全部 runtime（测试用）。 */
@@ -161,8 +169,34 @@ export class SessionRunner {
       return true;
     }
 
+    // 1.5) 能力协商（spec §9.0 / REC-09）：不满足就 fail closed，禁止静默降级
+    const envConfig = (session.environment_snapshot as { config?: { isolation?: string } }).config ?? {};
+    const requiredIsolation = envConfig.isolation; // undefined → 平台默认 gvisor/microvm
+    const isolationOk =
+      requiredIsolation === "runc" ||
+      this.providerIsolation === requiredIsolation ||
+      (requiredIsolation === undefined && (this.providerIsolation === "gvisor" || this.providerIsolation === "microvm"));
+    if (!isolationOk) {
+      await append("session.error", {
+        error: {
+          type: "capability_unsatisfied",
+          message: "sandbox provider cannot satisfy the environment's isolation requirement",
+          retry_status: "terminal",
+          details: { required: requiredIsolation ?? "gvisor|microvm", provided: this.providerIsolation },
+        },
+      });
+      await append("session.status_terminated", { stop_reason: { type: "capability_unsatisfied" } });
+      await settleExecution(this.db, executionId, generation, attemptId, {
+        state: "failed",
+        failure: { reason: "capability_unsatisfied" },
+      });
+      return false;
+    }
+
     // 2) runtime（内存缓存；requires_action 期间保留）——按水位线决定 Level 0/1 恢复
     let held = await this.acquireRuntime(sessionId, session, agent, hasAsk, hasToolset, { executionId, generation, attemptId, append });
+    // 2.1) 挂载 Session File Resource 到沙箱 uploads（只读；每轮重建，卸载即消失）
+    await this.materializeResources(sessionId);
     // 3) 按执行类型推进（spec §5.6 kind）
     if (kind === "interrupt") {
       // requires_action 时的 interrupt：未决审批按 deny 处理（spec §6 / TOOL-09），最终 idle(end_turn)
@@ -224,6 +258,8 @@ export class SessionRunner {
           if (done === "turn_done") {
             // 轮末持久化：watermark + checkpoint（spec §9.4 / §14.2.1）
             await this.checkpointTurn(sessionId, executionId, generation, attemptId);
+            // 轮末产出收集：outputs → manifest → File 登记（spec §5.5 / REC-08）
+            await this.collectOutputsTurn(sessionId, executionId, generation, attemptId, append);
           }
           return true;
         }
@@ -363,25 +399,37 @@ export class SessionRunner {
     if (session.last_completed_execution_id || active) {
       if (
         active &&
-        active.completed_execution_watermark === session.last_completed_execution_id &&
-        active.codex_version_digest === digest
+        active.completed_execution_watermark === session.last_completed_execution_id
       ) {
-        // Level 1：水位线一致 → 从 checkpoint 恢复文件并原生 resume
-        try {
-          await restoreCheckpoint(this.store, active, fakeCodexHome(sessionId));
-          resumeThreadId = active.thread_id || undefined;
-          recovered = { mode: "native" };
-        } catch {
-          // 校验失败：标记 corrupt、报 session.error，再降级语义恢复（REC-05）
-          await markCheckpointCorrupt(this.db, sessionId, active.checkpoint_id);
+        if (active.codex_version_digest === digest) {
+          // Level 1：水位线一致 → 从 checkpoint 恢复文件并原生 resume
+          try {
+            await restoreCheckpoint(this.store, active, fakeCodexHome(sessionId));
+            resumeThreadId = active.thread_id || undefined;
+            recovered = { mode: "native" };
+          } catch {
+            // 校验失败：标记 corrupt、报 session.error，再降级语义恢复（REC-05）
+            await markCheckpointCorrupt(this.db, sessionId, active.checkpoint_id);
+            await fence.append("session.error", {
+              error: {
+                type: "checkpoint_corrupt",
+                message: `checkpoint ${active.checkpoint_id} failed integrity verification`,
+                retry_status: "terminal",
+              },
+            });
+            recovered = { mode: "semantic", reason: "checkpoint_corrupt" };
+          }
+        } else {
+          // 原 digest 已下线（升级/召回）：强制 Level 0 并告知用户（spec §8.7 / REC-10）
           await fence.append("session.error", {
             error: {
-              type: "checkpoint_corrupt",
-              message: `checkpoint ${active.checkpoint_id} failed integrity verification`,
-              retry_status: "terminal",
+              type: "runtime_upgraded",
+              message: "runtime digest changed; falling back to semantic recovery",
+              retry_status: "retrying",
+              details: { checkpoint_digest: active.codex_version_digest, current_digest: digest },
             },
           });
-          recovered = { mode: "semantic", reason: "checkpoint_corrupt" };
+          recovered = { mode: "semantic", reason: "runtime_upgraded" };
         }
       } else {
         // 水位线不一致（checkpoint 落后/超前或缺失）→ Level 0（REC-03）
@@ -451,6 +499,46 @@ export class SessionRunner {
     return history;
   }
 
+  /** 轮末输出收集（spec §5.5）；上传后崩溃的注入点在 CAS 之前（REC-08）。 */
+  private async collectOutputsTurn(
+    sessionId: string,
+    executionId: string,
+    generation: number,
+    attemptId: string,
+    append: (type: string, payload: Record<string, unknown>) => Promise<SessionEventJson | null>,
+  ): Promise<void> {
+    if (this.faults.crashAfterOutputUpload) {
+      // 模拟"对象已上传、CAS 之前"崩溃：先真实上传内容，再中止（恢复后靠 (path, sha256) 去重登记）
+      const dir = join(fakeCodexHome(sessionId), "outputs");
+      const entries = existsSync(dir) ? readdirSync(dir).sort() : [];
+      for (const name of entries) {
+        const bytes = readFileSync(join(dir, name));
+        const sha = createHash("sha256").update(bytes).digest("hex");
+        await this.filesStore.putIfAbsent(`outputs/${sessionId}/${sha}`, bytes);
+      }
+      throw new Error("fault: crash after output upload");
+    }
+    const result = await collectOutputs({
+      db: this.db,
+      store: this.filesStore,
+      sessionId,
+      executionId,
+      generation,
+      attemptId,
+      outputsDir: join(fakeCodexHome(sessionId), "outputs"),
+    });
+    if (result.manifest.incomplete.length > 0) {
+      await append("session.error", {
+        error: {
+          type: "output_incomplete",
+          message: "some output files failed to upload or were still changing",
+          retry_status: "terminal",
+          details: { paths: result.manifest.incomplete },
+        },
+      });
+    }
+  }
+
   /**
    * 轮末持久化（spec §9.4 / §14.2.1 第 1-2 步）：
    * watermark.json 落盘到 CODEX_HOME → 打包不可变候选 → sha256 校验 → fence CAS 发布 → GC。
@@ -490,6 +578,27 @@ export class SessionRunner {
       codexVersionDigest: digest,
       threadId: s.codex_thread_id ?? "",
     });
+  }
+
+  /** 把 session_resources 指向的 File 内容放到 <home>/uploads/<mount_path>（spec §9.2）。 */
+  private async materializeResources(sessionId: string): Promise<void> {
+    const rows = await this.db
+      .selectFrom("session_resources")
+      .innerJoin("files", (join) => join.onRef("files.id", "=", "session_resources.file_id"))
+      .select(["mount_path", "object_key"])
+      .where("session_resources.session_id", "=", sessionId)
+      .execute();
+    const uploads = join(fakeCodexHome(sessionId), "uploads");
+    rmSync(uploads, { recursive: true, force: true });
+    if (rows.length === 0) return;
+    mkdirSync(uploads, { recursive: true });
+    for (const r of rows) {
+      const content = await this.filesStore.get(r.object_key).catch(() => null);
+      if (!content) continue;
+      const target = join(uploads, r.mount_path);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, content);
+    }
   }
 
   private async workspaceOf(sessionId: string): Promise<string> {

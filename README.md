@@ -24,9 +24,15 @@
 | Worker 接管语义 | ✅ | 已 delivered 的过期租约不重放用户消息（terminal error）；持久化中断被接管方遵守（REC-01/02） |
 | 毒任务回收 | ✅ | attempt 耗尽 + 租约过期 → failed + `session.error(exhausted)` + idle(retries_exhausted)（REC-06） |
 | Idempotency-Key | ✅ | POST events：同 key 同 body 回放首次响应、异 body 409 idempotency_conflict（REC-07） |
-| Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试 |
+| Vaults / Credentials | ✅ | 信封加密（AES-256-GCM 双层，主密钥 `MAS_MASTER_KEY`）、API 永不回显（`***`+末 4 位）、轮换语义、归档（VLT-01~04/09） |
+| Files API | ✅ | multipart 上传、sha256 校验、before_id/after_id 分页、下载/删除（FILE-01~05） |
+| Session Resource 挂载 | ✅ | 创建/运行中挂载、worker 每轮物化到沙箱 uploads（只读语义）、卸载即消失（RES-01/02/06、SES-28） |
+| 输出清单 | ✅ | 轮末枚举 outputs → sha256 内容寻址上传 → fence CAS 发布 manifest → `(session,path,sha256)` 去重登记 File（§5.5 / REC-08） |
+| 能力协商 fail closed | ✅ | env.isolation 要求 vs provider 实际等级，不满足 → terminated + capability_unsatisfied，禁止降级（REC-09） |
+| digest 下线降级 | ✅ | 原 codex digest 不一致 → 强制 Level 0 + `runtime_upgraded`（retrying），会话可继续（REC-10） |
+| Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试；`out <text>` 模拟沙箱产出 |
 
-未实现（按 plan 后续里程碑）：OpenSandbox/gVisor 沙箱（M1 0.x/M4）、egress-proxy + CredentialEgress（M4）、Vault/Files/Resources API（M4）、model-gateway（M2 2.11）、输出清单/会话级 digest（REC-08/10 前置）、确定性混沌车道（M3 3.9）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
+未实现（按 plan 后续里程碑）：OpenSandbox/gVisor 真实沙箱与 egress-proxy + CredentialEgress（M4 后半，VLT-05~08/SBX-06~08 的前置）、model-gateway（M2 2.11）、确定性混沌车道（M3 3.9）、Memory Stores / Skills / Deployments（二期 API 面）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
 
 ## 快速开始
 
@@ -101,6 +107,9 @@ scripts/smoke.ts     # 端到端冒烟
 - **审批映射**（§8.2/§12.1）：`always_ask` → driver `approvalPolicy=untrusted`；`item/awaitingApproval` → `agent.tool_use(evaluated_permission=ask)` + `session.status_idle{requires_action, event_ids}`；`user.tool_confirmation` 走 `kind=tool_confirmation` execution 回写 runtime；resolution 校验 404/409。
 - **SSE**（§11.5）：每连接独立 LISTEN client；先 LISTEN 再回补再按 seq 去重；无 Last-Event-ID 时从当前 max(seq) 起步（默认只推实时）；15s 心跳；删除会话用 `pg_notify(payload='deleted')` 推送合成 `session.deleted` 帧后关闭。
 - **Checkpoint 提交协议**（§9.4）：每轮 settle 后写 `watermark.json` 到 runtime home → 打包不可变候选（`json.gz/v1`，目录文件集的 gzip JSON）→ 重新读取校验 sha256 → 事务内 CAS 发布（fence 失效则候选作废）→ GC 保留最近 3 个。对象存储走 `SnapshotStore` 抽象（MVP 为本地 `FsSnapshotStore`，接 MinIO 换 S3 实现）。
+- **输出清单**（§5.5）：轮末枚举沙箱 outputs 目录，逐文件 sha256 后按 `outputs/{session}/{sha256}` 内容寻址上传（字节一致 = 幂等）；manifest 只有当前 fence 能 CAS 发布为 `sessions.active_output_manifest`；条目登记为 session 范围 File，`(scope_id, filename, sha256)` 唯一索引保证重复收集不产生重复 File（REC-08）；失败条目写 `session.error{output_incomplete}`。
+- **凭据与挂载**（§10.1/§5.5）：机密字段双层 AES-256-GCM 信封加密（数据密钥 + 主密钥包裹），API 只回 `***`+末 4 位；会话创建校验 `vault_ids`（存在/同租户/未归档）；File Resource 由 worker 每轮物化到 `<home>/uploads/<mount_path>`（重挂载重建、卸载即删）。
+- **能力协商**（§9.0）：环境 `config.isolation`（gvisor/microvm/runc，缺省 = 平台默认 gvisor|microvm）对 worker 的 `providerIsolation`（`MAS_SANDBOX_ISOLATION`）校验，不满足 fail closed → `terminated` + `session.error{capability_unsatisfied}`，禁止静默降级（REC-09）。
 - **水位线恢复**（§14.2.1）：接管方 acquire runtime 时判定 —— `active_workspace_checkpoint.completed_execution_watermark === sessions.last_completed_execution_id` 且 `codex_version_digest` 一致 → **Level 1**（restoreCheckpoint 还原文件 + `thread/resume` 原生续聊）；否则（checkpoint 缺失/落后/损坏）→ **Level 0** 语义恢复：从事件日志重放 `user.message`/`agent.message` 文本（绝不重放工具输入），写内部事件 `runtime.recovered{mode, reason}`；checkpoint 校验失败额外写 `session.error{checkpoint_corrupt}`。
 
 ## 与规格的已知偏差（务实取舍）
@@ -109,9 +118,11 @@ scripts/smoke.ts     # 端到端冒烟
 2. api 在 `requires_action` 等状态下可能从快照读 stop_reason 而非事件推导（物化视图已同步维护）。
 3. 限流为单进程内存令牌桶；多实例部署需换 PG/Redis（spec §13.4 预留）。
 4. checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。
-5. Idempotency-Key 已挂 POST events；其余 POST 路由（agents/environments 等）幂等按 M5 全量化推进。
-6. agent 事件 `span.model_request_*`/`session.usage` 由 runtime 上报路径尚未接线（fake 不产生计量）。
+5. File 内容与 output 对象存本地 FS（`MAS_FILES_DIR`，默认 `/tmp/mas-files`）而非 MinIO；Key 布局与 spec 一致（`files/{org}/{file_id}`、`outputs/{session}/{sha256}`），换 S3 实现即可。
+6. 沙箱能力协商目前是 worker 侧静态声明（`MAS_SANDBOX_ISOLATION`），OpenSandbox/Docker+runsc provider 接入后改为 provider 真实上报。
+7. Idempotency-Key 已挂 POST events；其余 POST 路由（agents/environments 等）幂等按 M5 全量化推进。
+8. agent 事件 `span.model_request_*`/`session.usage` 由 runtime 上报路径尚未接线（fake 不产生计量）。
 
 ## 后续路线（按 plan.md）
 
-M3 已完成（含 checkpoint/水位线恢复与 REC-01~07 验收；REC-08/09/10 依赖输出清单与沙箱基础设施，随 M4 补）→ M4：sandbox provider（OpenSandbox/Docker+runsc）、egress-proxy/CredentialEgress、Vault/Files → M5：幂等全量、可观测、性能。
+M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 前半已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10，测试 74/74 绿）→ M4 后半：sandbox provider（OpenSandbox/Docker+runsc）、egress-proxy/CredentialEgress、model-gateway → M5：幂等全量、可观测、性能。

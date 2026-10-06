@@ -23,7 +23,7 @@ export interface TestEnv {
   pauseWorker(): void;
   resumeWorker(): void;
   /** 用同一 db / snapshot store 构造可注入故障的 runner。 */
-  newRunner(workerId: string, faults?: RunnerFaults): SessionRunner;
+  newRunner(workerId: string, faults?: RunnerFaults, opts?: { providerIsolation?: string }): SessionRunner;
   close(): Promise<void>;
 }
 
@@ -35,6 +35,8 @@ export async function setupEnv(): Promise<TestEnv> {
   // 干净的测试库
   const tables = [
     "session_internal_events",
+    "credentials",
+    "vaults",
     "idempotency_keys",
     "session_resources",
     "files",
@@ -96,8 +98,8 @@ export async function setupEnv(): Promise<TestEnv> {
       paused = false;
       void drain();
     },
-    newRunner: (workerId: string, faults?: RunnerFaults) => {
-      const r = new SessionRunner(db.db, new FakeCodexDriver(), workerId, store);
+    newRunner: (workerId: string, faults?: RunnerFaults, opts?: { providerIsolation?: string }) => {
+      const r = new SessionRunner(db.db, new FakeCodexDriver(), workerId, store, opts?.providerIsolation ?? "gvisor");
       if (faults) Object.assign(r.faults, faults);
       return r;
     },

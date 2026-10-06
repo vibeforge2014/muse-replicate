@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { mkdirSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { ulid } from "ulid";
 import type { Kysely } from "kysely";
@@ -23,6 +23,8 @@ import type { Database } from "./schema.js";
 export interface SnapshotStore {
   /** 写入新对象；key 已存在时抛错（不可变候选，永不覆盖）。 */
   put(key: string, bytes: Buffer): Promise<void>;
+  /** 内容寻址写入：已存在且字节一致视为幂等成功，字节不一致抛错。 */
+  putIfAbsent(key: string, bytes: Buffer): Promise<void>;
   get(key: string): Promise<Buffer>;
   delete(key: string): Promise<void>;
 }
@@ -40,6 +42,17 @@ export class FsSnapshotStore implements SnapshotStore {
     mkdirSync(join(p, ".."), { recursive: true });
     if (existsSync(p)) throw new Error(`snapshot object already exists: ${key}`);
     writeFileSync(p, bytes);
+  }
+  async putIfAbsent(key: string, bytes: Buffer): Promise<void> {
+    const p = this.path(key);
+    mkdirSync(join(p, ".."), { recursive: true });
+    if (!existsSync(p)) {
+      writeFileSync(p, bytes);
+      return;
+    }
+    // 已存在：字节一致（内容寻址 key）→ 幂等成功；不一致 → 损坏，拒绝
+    const existing = readFileSync(p);
+    if (!existing.equals(bytes)) throw new Error(`snapshot object ${key} exists with different bytes`);
   }
   async get(key: string): Promise<Buffer> {
     return readFileSync(this.path(key));
@@ -86,14 +99,18 @@ export interface CommitCheckpointResult {
   manifest: CheckpointManifest;
 }
 
-/** 把目录打包为归档字节（json.gz/v1：{files:[{name,data(base64)}]}）。 */
+/** 把目录打包为归档字节（json.gz/v1：{files:[{name,data(base64)}]}，递归子目录）。 */
 function packDir(sourceDir: string): Buffer {
   const files: { name: string; data: string }[] = [];
-  if (existsSync(sourceDir)) {
-    for (const name of readdirSync(sourceDir).sort()) {
-      files.push({ name, data: readFileSync(join(sourceDir, name)).toString("base64") });
+  const walk = (dir: string, prefix: string) => {
+    if (!existsSync(dir)) return;
+    for (const name of readdirSync(dir).sort()) {
+      const p = join(dir, name);
+      if (statSync(p).isDirectory()) walk(p, `${prefix}${name}/`);
+      else files.push({ name: `${prefix}${name}`, data: readFileSync(p).toString("base64") });
     }
-  }
+  };
+  walk(sourceDir, "");
   return gzipSync(JSON.stringify({ format: "json.gz/v1", files }));
 }
 
@@ -106,8 +123,12 @@ function unpackDir(bytes: Buffer, targetDir: string): void {
   rmSync(targetDir, { recursive: true, force: true });
   mkdirSync(targetDir, { recursive: true });
   for (const f of parsed.files) {
-    if (f.name.includes("/") || f.name.includes("..")) throw new Error(`illegal archive entry ${f.name}`);
-    writeFileSync(join(targetDir, f.name), Buffer.from(f.data, "base64"));
+    const target = join(targetDir, f.name);
+    // 归档条目只允许相对路径内的嵌套文件
+    if (!resolve(target).startsWith(resolve(targetDir))) throw new Error(`illegal archive entry ${f.name}`);
+    if (f.name.endsWith("/") || f.name.includes("..")) throw new Error(`illegal archive entry ${f.name}`);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, Buffer.from(f.data, "base64"));
   }
 }
 

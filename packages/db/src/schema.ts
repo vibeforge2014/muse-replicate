@@ -62,6 +62,7 @@ export interface SessionRow {
   last_processed_at: Date | null;
   last_completed_execution_id: string | null;
   active_workspace_checkpoint: Record<string, unknown> | null;
+  active_output_manifest: Record<string, unknown> | null;
   codex_thread_id: string | null;
   codex_version_digest: string | null;
   archived_at: Date | null;
@@ -118,6 +119,29 @@ export interface FileRow {
   created_at: Generated<Date>;
   expires_at: Date | null;
 }
+export interface VaultRow {
+  id: string;
+  workspace_id: string;
+  display_name: string;
+  metadata: Generated<Record<string, unknown>>;
+  archived_at: Date | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+export interface CredentialRow {
+  id: string;
+  vault_id: string;
+  workspace_id: string;
+  type: string;
+  identity_key: string;
+  secret_ciphertext: string;
+  networking: Generated<Record<string, unknown>>;
+  injection: Record<string, unknown> | null;
+  last_four: Generated<string>;
+  archived_at: Date | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
 export interface SessionResourceRow {
   id: string;
   session_id: string;
@@ -162,6 +186,8 @@ export interface Database {
   session_events: SessionEventRow;
   session_executions: ExecutionRow;
   files: FileRow;
+  vaults: VaultRow;
+  credentials: CredentialRow;
   session_resources: SessionResourceRow;
   idempotency_keys: IdempotencyKeyRow;
   session_internal_events: SessionInternalEventRow;

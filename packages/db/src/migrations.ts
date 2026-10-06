@@ -190,4 +190,36 @@ CREATE TABLE session_internal_events (
 );
 `,
   },
+  {
+    name: "0006_vaults_outputs",
+    sql: `
+CREATE TABLE vaults (
+  id text PRIMARY KEY,
+  workspace_id text NOT NULL REFERENCES workspaces(id),
+  display_name text NOT NULL,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  archived_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE credentials (
+  id text PRIMARY KEY,
+  vault_id text NOT NULL REFERENCES vaults(id),
+  workspace_id text NOT NULL,
+  type text NOT NULL,
+  identity_key text NOT NULL,
+  secret_ciphertext text NOT NULL,
+  networking jsonb NOT NULL DEFAULT '{}',
+  injection jsonb,
+  last_four text NOT NULL DEFAULT '',
+  archived_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (vault_id, type, identity_key)
+);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active_output_manifest jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS files_session_output_ix
+  ON files (scope_id, filename, sha256) WHERE scope_type = 'session';
+`,
+  },
 ];

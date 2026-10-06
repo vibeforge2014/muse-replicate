@@ -56,6 +56,18 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
     const env = await getEnvironmentRow(ctx.db, ws, parsed.environment_id);
     if (env.archived_at) throw errInvalid("environment is archived"); // ENV-11
 
+    // vault_ids 校验：存在、同 workspace、未归档（spec §10.1 解析时机）
+    for (const vid of parsed.vault_ids ?? []) {
+      const vault = await ctx.db
+        .selectFrom("vaults")
+        .select(["id", "archived_at"])
+        .where("id", "=", vid)
+        .where("workspace_id", "=", ws)
+        .executeTakeFirst();
+      if (!vault) throw errNotFound(`vault ${vid} not found`);
+      if (vault.archived_at) throw errConflict(`vault ${vid} is archived`);
+    }
+
     // 快照：overrides 整体替换（SES-04）
     const snapshot: Record<string, unknown> = {
       type: "agent",

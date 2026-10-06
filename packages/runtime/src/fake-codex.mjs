@@ -4,6 +4,7 @@
  * 行为由用户输入中的指令前缀驱动，供集成测试使用：
  *   - 默认：回显（agent.message = "echo: <text>"）
  *   - "run <cmd>"    → bash tool_use + tool_result（模拟执行 echo）
+ *   - "out <text>"   → 把 text 写入 outputs/note.txt（模拟沙箱产出，SBX-03/REC-08）
  *   - "ask ..."      → 审批流：tool_use(ask) → 等待 approvalResponse → tool_result
  *   - "sleep <sec>"  → 慢任务（测中断）
  *   - "fail"         → error 通知（可重试）
@@ -179,6 +180,17 @@ async function runTurn(params) {
       notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: "tool was denied" });
       history.push({ role: "agent", text: "tool was denied" });
     }
+    persist();
+    notify("turn/completed", { reason: "completed" });
+    return;
+  }
+  if (text.startsWith("out")) {
+    // 模拟沙箱产出：写入 <home>/outputs/note.txt，轮末由 worker 收集为 File（spec §5.5）
+    const payload = text.slice(3).trim() || "(empty)";
+    mkdirSync(join(home, "outputs"), { recursive: true });
+    writeFileSync(join(home, "outputs", "note.txt"), payload);
+    notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: `wrote note.txt (${payload.length} bytes)` });
+    history.push({ role: "user", text }, { role: "agent", text: `wrote note.txt (${payload.length} bytes)` });
     persist();
     notify("turn/completed", { reason: "completed" });
     return;

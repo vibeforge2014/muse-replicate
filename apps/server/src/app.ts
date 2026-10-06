@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import multipart from "@fastify/multipart";
 import { ZodError } from "zod";
 import { MasError, errAuth } from "@mas/core";
 import { authenticate, type DbHandle } from "@mas/db";
@@ -8,6 +9,8 @@ import { registerAgentRoutes } from "./routes/agents.js";
 import { registerEnvironmentRoutes } from "./routes/environments.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerEventRoutes } from "./routes/events.js";
+import { registerVaultRoutes } from "./routes/vaults.js";
+import { registerFileRoutes } from "./routes/files.js";
 
 export interface BuildAppOptions {
   db: DbHandle;
@@ -37,6 +40,7 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   });
 
   registerRateLimit(app);
+  void app.register(multipart, { limits: { fileSize: Number(process.env.MAS_MAX_FILE_BYTES ?? 500 * 1024 * 1024) } });
 
   // 错误映射：MasError → 方言信封；zod → 400；其他 → 500（spec §11.1）
   app.setErrorHandler((err: unknown, req, reply) => {
@@ -79,6 +83,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   registerEnvironmentRoutes(app, ctx);
   registerSessionRoutes(app, ctx);
   registerEventRoutes(app, ctx);
+  registerVaultRoutes(app, ctx);
+  registerFileRoutes(app, ctx);
 
   return app;
 }

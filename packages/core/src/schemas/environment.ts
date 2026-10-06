@@ -46,7 +46,13 @@ const packagesSchema = z
   .strict();
 
 const envConfigSchema = z
-  .object({ type: z.literal("cloud"), packages: packagesSchema.optional(), networking: networkingSchema.optional() })
+  .object({
+    type: z.literal("cloud"),
+    packages: packagesSchema.optional(),
+    networking: networkingSchema.optional(),
+    // 内部字段（spec §9.0）：环境对沙箱隔离等级的要求/放宽；缺省走平台默认 gvisor|microvm
+    isolation: z.enum(["gvisor", "microvm", "runc"]).optional(),
+  })
   .strict();
 
 export const environmentCreateSchema = z
@@ -85,15 +91,18 @@ export type EnvironmentConfig = z.infer<typeof envConfigSchema>;
 /** 规范化：packages 6 字段全出现；networking 默认 unrestricted；limited 布尔默认 false（ENV-01/02）。 */
 export function normalizeEnvironmentConfig(config: EnvironmentConfig): {
   type: "cloud";
+  isolation?: "gvisor" | "microvm" | "runc";
   packages: { apt: string[]; npm: string[]; pip: string[]; cargo: string[]; gem: string[]; go: string[] };
   networking:
     | { type: "unrestricted" }
     | { type: "limited"; allowed_hosts: string[]; allow_package_managers: boolean; allow_mcp_servers: boolean };
 } {
   const p = config.packages ?? {};
+  const isolation = config.isolation;
   if (config.networking?.type === "limited") {
     return {
       type: "cloud",
+      ...(isolation ? { isolation } : {}),
       packages: {
         apt: p.apt ?? [],
         npm: p.npm ?? [],
@@ -112,6 +121,7 @@ export function normalizeEnvironmentConfig(config: EnvironmentConfig): {
   }
   return {
     type: "cloud",
+    ...(isolation ? { isolation } : {}),
     packages: {
       apt: p.apt ?? [],
       npm: p.npm ?? [],

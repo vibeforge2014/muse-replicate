@@ -12,6 +12,7 @@
     "test": "vitest run --root ."
   },
   "dependencies": {
+    "@fastify/multipart": "^10.1.2",
     "@mas/core": "workspace:*",
     "@mas/db": "workspace:*",
     "@mas/runtime": "workspace:*",

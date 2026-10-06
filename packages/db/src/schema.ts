@@ -60,6 +60,10 @@ export interface SessionRow {
   usage: Generated<{ input_tokens: number; output_tokens: number; cache_read_input_tokens: number }>;
   last_event_seq: Generated<number>;
   last_processed_at: Date | null;
+  last_completed_execution_id: string | null;
+  active_workspace_checkpoint: Record<string, unknown> | null;
+  codex_thread_id: string | null;
+  codex_version_digest: string | null;
   archived_at: Date | null;
   created_at: Generated<Date>;
   updated_at: Generated<Date>;
@@ -129,6 +133,16 @@ export interface IdempotencyKeyRow {
   response: Record<string, unknown> | null;
   created_at: Generated<Date>;
 }
+export interface WorkspaceCheckpointRow {
+  checkpoint_id: string;
+  session_id: string;
+  generation: number;
+  execution_id: string;
+  manifest: Record<string, unknown>;
+  state: string;
+  created_at: Generated<Date>;
+}
+
 export interface SessionInternalEventRow {
   id: Generated<number>;
   session_id: string;
@@ -151,4 +165,5 @@ export interface Database {
   session_resources: SessionResourceRow;
   idempotency_keys: IdempotencyKeyRow;
   session_internal_events: SessionInternalEventRow;
+  workspace_checkpoints: WorkspaceCheckpointRow;
 }

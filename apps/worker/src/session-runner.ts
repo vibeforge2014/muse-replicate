@@ -1,15 +1,28 @@
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { sql, type Kysely } from "kysely";
 import { newId, type SessionEventJson } from "@mas/core";
 import type { Database } from "@mas/db";
 import {
   appendEvent,
+  appendInternalEvent,
   assignSeqAndProcessedAt,
+  commitCheckpoint,
+  FAKE_CODEX_DIGEST,
+  reapExhaustedExecutions,
+  fakeCodexHome,
+  FsSnapshotStore,
   getSessionRow,
+  listFallbackCheckpoints,
+  markCheckpointCorrupt,
   markDelivered,
+  restoreCheckpoint,
   renewExecution,
   settleExecution,
   claimNextExecution,
+  type CheckpointManifest,
+  type SnapshotStore,
 } from "@mas/db";
 import {
   FakeCodexDriver,
@@ -31,21 +44,39 @@ interface HeldRuntime {
  * SessionRunner：持租约驱动一个会话的执行（spec §8、§7.1）。
  * MVP 用 FakeCodexDriver；真实部署替换为 codex app-server driver，接口不变。
  */
+export interface RunnerFaults {
+  /** 在 checkpoint 候选上传后、CAS 发布前模拟 worker 崩溃（REC-03）。 */
+  crashBeforeCheckpointPublish?: boolean;
+}
+
 export class SessionRunner {
   private runtimes = new Map<string, HeldRuntime>();
+  private disposed = false;
+  /** 测试故障注入（spec §5.19 的进程内等价物）。 */
+  readonly faults: RunnerFaults = {};
 
   constructor(
     private db: Kysely<Database>,
     private driver: FakeCodexDriver,
     private workerId = `worker_${process.pid}`,
+    private store: SnapshotStore = new FsSnapshotStore(process.env.MAS_SNAPSHOT_DIR ?? "/tmp/mas-snapshots"),
   ) {}
 
+  /** 模拟 kill -9：中止在途工作并停掉全部 runtime（测试用）。 */
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    for (const [, held] of this.runtimes) await held.handle.stop("disposed").catch(() => undefined);
+    this.runtimes.clear();
+  }
+
   async processSession(sessionId: string): Promise<void> {
-    for (let i = 0; i < 20; i++) {
+    // 毒任务回收（REC-06）：耗尽且租约过期的执行置 failed 并写 exhausted 事件
+    await reapExhaustedExecutions(this.db);
+    for (let i = 0; i < 20 && !this.disposed; i++) {
       const attemptId = `att_${randomUUID().slice(0, 12)}`;
       const exec = await claimNextExecution(this.db, sessionId, this.workerId, attemptId, LEASE_SECONDS);
       if (!exec) return;
-      const more = await this.runExecution(sessionId, exec.id, exec.generation, attemptId, exec.kind, exec.input_event_ids, exec.interrupt_requested_at !== null);
+      const more = await this.runExecution(sessionId, exec, attemptId);
       if (!more) return;
     }
   }
@@ -53,13 +84,18 @@ export class SessionRunner {
   /** 返回 true 表示同会话还有后续工作。 */
   private async runExecution(
     sessionId: string,
-    executionId: string,
-    generation: number,
+    exec: { id: string; generation: number; kind: string; input_event_ids: string[]; interrupt_requested_at: Date | null; delivered_at: Date | null },
     attemptId: string,
-    kind: string,
-    inputEventIds: string[],
-    interruptAlreadyRequested: boolean,
   ): Promise<boolean> {
+    const executionId = exec.id;
+    const generation = exec.generation;
+    const kind = exec.kind;
+    const inputEventIds = exec.input_event_ids;
+    const interruptAlreadyRequested = exec.interrupt_requested_at !== null;
+    // 接管判定：claim 到的是已 delivered 的过期租约 → 消息可能已进入 runtime，
+    // 不得重放（避免重复副作用，spec §14.1 / REC-01）
+    const tookOverDelivered = exec.delivered_at !== null && kind === "user_message" && !interruptAlreadyRequested;
+
     const session = await getSessionRow(this.db, (await this.workspaceOf(sessionId)), sessionId);
     const agent = session.agent_snapshot as {
       system: string | null;
@@ -76,22 +112,6 @@ export class SessionRunner {
       await assignSeqAndProcessedAt(tx, sessionId, inputEventIds, "normal");
     });
     await this.notifySeq(sessionId);
-
-    // 2) runtime（内存缓存；requires_action 期间保留）
-    let held = this.runtimes.get(sessionId);
-    if (!held) {
-      const replay = FakeCodexDriver.readHistory(sessionId);
-      const handle = await this.driver.start({
-        sessionId,
-        system: agent.system,
-        model: agent.model,
-        approvalPolicy: hasAsk ? "untrusted" : "never",
-        hasBuiltinToolset: hasToolset,
-        ...(replay.length ? { replayHistory: replay } : {}),
-      });
-      held = { handle, toolUseIds: new Map() };
-      this.runtimes.set(sessionId, held);
-    }
 
     let fenceLost = false;
     let interruptSent = interruptAlreadyRequested;
@@ -127,6 +147,22 @@ export class SessionRunner {
       }
     };
 
+    if (tookOverDelivered) {
+      // REC-01：接管已投递的执行 → 不重放用户消息，terminal error + idle(end_turn)
+      await append("session.error", {
+        error: {
+          type: "worker_takeover",
+          message: "worker lost lease mid-turn; user message was not replayed",
+          retry_status: "terminal",
+        },
+      });
+      await append("session.status_idle", { stop_reason: { type: "end_turn" } });
+      await settleExecution(this.db, executionId, generation, attemptId, { state: "completed" });
+      return true;
+    }
+
+    // 2) runtime（内存缓存；requires_action 期间保留）——按水位线决定 Level 0/1 恢复
+    let held = await this.acquireRuntime(sessionId, session, agent, hasAsk, hasToolset, { executionId, generation, attemptId, append });
     // 3) 按执行类型推进（spec §5.6 kind）
     if (kind === "interrupt") {
       // requires_action 时的 interrupt：未决审批按 deny 处理（spec §6 / TOOL-09），最终 idle(end_turn)
@@ -185,6 +221,10 @@ export class SessionRunner {
         const done = await this.onRuntimeEvent(sessionId, executionId, generation, attemptId, held, ev, append);
         if (done !== null) {
           await settleExecution(this.db, executionId, generation, attemptId, { state: "completed" });
+          if (done === "turn_done") {
+            // 轮末持久化：watermark + checkpoint（spec §9.4 / §14.2.1）
+            await this.checkpointTurn(sessionId, executionId, generation, attemptId);
+          }
           return true;
         }
         continue;
@@ -288,6 +328,168 @@ export class SessionRunner {
       default:
         return null;
     }
+  }
+
+  /**
+   * 获取/恢复 runtime（spec §14.2.1 恢复判定）：
+   *  - 无历史 → 全新 thread；
+   *  - active checkpoint 水位线+digest 与 sessions 行匹配 → Level 1 原生恢复
+   *    （restore 文件 + thread/resume）；
+   *  - 否则 → Level 0 语义恢复：从事件日志重放 user/agent 消息（绝不重放工具输入），
+   *    产出内部事件 runtime.recovered{mode:"semantic",reason}。
+   */
+  private async acquireRuntime(
+    sessionId: string,
+    session: { codex_thread_id: string | null; codex_version_digest: string | null; last_completed_execution_id: string | null; active_workspace_checkpoint: Record<string, unknown> | null },
+    agent: { system: string | null; model: { id: string; effort?: string } },
+    hasAsk: boolean,
+    hasToolset: boolean,
+    fence: {
+      executionId: string;
+      generation: number;
+      attemptId: string;
+      append: (type: string, payload: Record<string, unknown>) => Promise<SessionEventJson | null>;
+    },
+  ): Promise<HeldRuntime> {
+    const existing = this.runtimes.get(sessionId);
+    if (existing) return existing;
+
+    const digest = session.codex_version_digest ?? FAKE_CODEX_DIGEST;
+    const active = session.active_workspace_checkpoint as unknown as CheckpointManifest | null;
+    let resumeThreadId: string | undefined;
+    let replayHistory: { role: "user" | "agent"; text: string }[] | undefined;
+    let recovered: { mode: "native" } | { mode: "semantic"; reason: string } | null = null;
+
+    if (session.last_completed_execution_id || active) {
+      if (
+        active &&
+        active.completed_execution_watermark === session.last_completed_execution_id &&
+        active.codex_version_digest === digest
+      ) {
+        // Level 1：水位线一致 → 从 checkpoint 恢复文件并原生 resume
+        try {
+          await restoreCheckpoint(this.store, active, fakeCodexHome(sessionId));
+          resumeThreadId = active.thread_id || undefined;
+          recovered = { mode: "native" };
+        } catch {
+          // 校验失败：标记 corrupt、报 session.error，再降级语义恢复（REC-05）
+          await markCheckpointCorrupt(this.db, sessionId, active.checkpoint_id);
+          await fence.append("session.error", {
+            error: {
+              type: "checkpoint_corrupt",
+              message: `checkpoint ${active.checkpoint_id} failed integrity verification`,
+              retry_status: "terminal",
+            },
+          });
+          recovered = { mode: "semantic", reason: "checkpoint_corrupt" };
+        }
+      } else {
+        // 水位线不一致（checkpoint 落后/超前或缺失）→ Level 0（REC-03）
+        recovered = { mode: "semantic", reason: "watermark_mismatch" };
+      }
+      if (recovered.mode === "semantic") {
+        // 尽力恢复最近一个 superseded checkpoint 的文件（workspace 层面少丢一点）
+        for (const fb of await listFallbackCheckpoints(this.db, sessionId)) {
+          try {
+            await restoreCheckpoint(this.store, fb, fakeCodexHome(sessionId));
+            break;
+          } catch {
+            /* 尝试下一个回退候选 */
+          }
+        }
+        replayHistory = await this.buildReplayHistory(sessionId);
+      }
+    }
+
+    const handle = await this.driver.start({
+      sessionId,
+      system: agent.system,
+      model: agent.model,
+      approvalPolicy: hasAsk ? "untrusted" : "never",
+      hasBuiltinToolset: hasToolset,
+      ...(resumeThreadId ? { resumeThreadId } : {}),
+      ...(replayHistory?.length ? { replayHistory } : {}),
+    });
+    const held: HeldRuntime = { handle, toolUseIds: new Map() };
+    this.runtimes.set(sessionId, held);
+    await this.db
+      .updateTable("sessions")
+      .set({ codex_thread_id: handle.threadId, codex_version_digest: digest })
+      .where("id", "=", sessionId)
+      .execute();
+    if (recovered) {
+      await appendInternalEvent(this.db, sessionId, "runtime.recovered", {
+        mode: recovered.mode,
+        ...(recovered.mode === "semantic" ? { reason: recovered.reason } : {}),
+      });
+    }
+    return held;
+  }
+
+  /**
+   * Level 0 语义恢复的重放历史：只取 user.message / agent.message 的文本块
+   * （spec §14.2.1：绝不重放工具输入与结果），按 seq 排序。
+   */
+  private async buildReplayHistory(sessionId: string): Promise<{ role: "user" | "agent"; text: string }[]> {
+    const rows = await this.db
+      .selectFrom("session_events")
+      .select(["type", "payload"])
+      .where("session_id", "=", sessionId)
+      .where("seq", "is not", null)
+      .where("type", "in", ["user.message", "agent.message"])
+      .orderBy("seq", "asc")
+      .execute();
+    const history: { role: "user" | "agent"; text: string }[] = [];
+    for (const r of rows) {
+      const content = (r.payload as { content?: { type: string; text?: string }[] }).content ?? [];
+      const text = content
+        .filter((b) => b.type === "text" && b.text)
+        .map((b) => b.text!)
+        .join("\n");
+      if (text) history.push({ role: r.type === "user.message" ? "user" : "agent", text });
+    }
+    return history;
+  }
+
+  /**
+   * 轮末持久化（spec §9.4 / §14.2.1 第 1-2 步）：
+   * watermark.json 落盘到 CODEX_HOME → 打包不可变候选 → sha256 校验 → fence CAS 发布 → GC。
+   */
+  private async checkpointTurn(
+    sessionId: string,
+    executionId: string,
+    generation: number,
+    attemptId: string,
+  ): Promise<void> {
+    const ws = await this.workspaceOf(sessionId);
+    const s = await getSessionRow(this.db, ws, sessionId);
+    if (!s.last_completed_execution_id) return;
+    const digest = s.codex_version_digest ?? FAKE_CODEX_DIGEST;
+    const home = fakeCodexHome(sessionId);
+    writeFileSync(
+      join(home, "watermark.json"),
+      JSON.stringify({
+        last_completed_execution_id: s.last_completed_execution_id,
+        codex_thread_id: s.codex_thread_id,
+        codex_version_digest: digest,
+      }),
+    );
+    if (this.faults.crashBeforeCheckpointPublish) {
+      // 模拟 crash：settle 之后、候选写入之前（REC-03 场景）
+      throw new Error("fault: crash before checkpoint publish");
+    }
+    await commitCheckpoint({
+      db: this.db,
+      store: this.store,
+      sessionId,
+      executionId,
+      generation,
+      attemptId,
+      watermarkExecutionId: s.last_completed_execution_id,
+      sourceDir: home,
+      codexVersionDigest: digest,
+      threadId: s.codex_thread_id ?? "",
+    });
   }
 
   private async workspaceOf(sessionId: string): Promise<string> {

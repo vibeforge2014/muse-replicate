@@ -19,9 +19,14 @@
 | 持久化中断 | ✅ | running 中断 / requires_action 作废未决审批（TOOL-09/15） |
 | SSE 实时流 | ✅ | LISTEN/NOTIFY、15s 心跳、Last-Event-ID 回补、只推实时、session.deleted 关闭（§11.5 / EVT-R） |
 | 鉴权 / 错误信封 / request-id / 限流 | ✅ | 方言检测（zai-* / anthropic-*），BigModel 409 → invalid_request_error（§11.1） |
+| Checkpoint 提交协议 | ✅ | 轮末不可变候选（json.gz/v1）+ sha256 校验 + fence CAS 发布 + GC keep=3（§9.4） |
+| 水位线恢复 | ✅ | 水位线+digest 一致 → Level 1 原生 resume；不一致 → Level 0 语义重放（仅 user/agent 消息）+ `runtime.recovered` 内部事件（§14.2.1 / REC-01~06） |
+| Worker 接管语义 | ✅ | 已 delivered 的过期租约不重放用户消息（terminal error）；持久化中断被接管方遵守（REC-01/02） |
+| 毒任务回收 | ✅ | attempt 耗尽 + 租约过期 → failed + `session.error(exhausted)` + idle(retries_exhausted)（REC-06） |
+| Idempotency-Key | ✅ | POST events：同 key 同 body 回放首次响应、异 body 409 idempotency_conflict（REC-07） |
 | Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试 |
 
-未实现（按 plan 后续里程碑）：OpenSandbox/gVisor 沙箱（M1 0.x/M4）、egress-proxy + CredentialEgress（M4）、Vault/Files/Resources API（M4）、model-gateway（M2 2.11）、checkpoint/水位线恢复（M3 3.6）、Idempotency-Key 落库、确定性混沌车道（M3 3.9）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
+未实现（按 plan 后续里程碑）：OpenSandbox/gVisor 沙箱（M1 0.x/M4）、egress-proxy + CredentialEgress（M4）、Vault/Files/Resources API（M4）、model-gateway（M2 2.11）、输出清单/会话级 digest（REC-08/10 前置）、确定性混沌车道（M3 3.9）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
 
 ## 快速开始
 
@@ -95,15 +100,18 @@ scripts/smoke.ts     # 端到端冒烟
 - **中断是持久状态**（§6）：POST events 同一事务内写 `interrupt_requested_at`、取消同 lane 的 queued 输入（其事件定序并标记 `flushed`，保留在历史）；worker tick 检测后调用 `turn/interrupt`；requires_action 期间的 interrupt 生成 `kind=interrupt` 执行，未决审批按 deny 处理。
 - **审批映射**（§8.2/§12.1）：`always_ask` → driver `approvalPolicy=untrusted`；`item/awaitingApproval` → `agent.tool_use(evaluated_permission=ask)` + `session.status_idle{requires_action, event_ids}`；`user.tool_confirmation` 走 `kind=tool_confirmation` execution 回写 runtime；resolution 校验 404/409。
 - **SSE**（§11.5）：每连接独立 LISTEN client；先 LISTEN 再回补再按 seq 去重；无 Last-Event-ID 时从当前 max(seq) 起步（默认只推实时）；15s 心跳；删除会话用 `pg_notify(payload='deleted')` 推送合成 `session.deleted` 帧后关闭。
+- **Checkpoint 提交协议**（§9.4）：每轮 settle 后写 `watermark.json` 到 runtime home → 打包不可变候选（`json.gz/v1`，目录文件集的 gzip JSON）→ 重新读取校验 sha256 → 事务内 CAS 发布（fence 失效则候选作废）→ GC 保留最近 3 个。对象存储走 `SnapshotStore` 抽象（MVP 为本地 `FsSnapshotStore`，接 MinIO 换 S3 实现）。
+- **水位线恢复**（§14.2.1）：接管方 acquire runtime 时判定 —— `active_workspace_checkpoint.completed_execution_watermark === sessions.last_completed_execution_id` 且 `codex_version_digest` 一致 → **Level 1**（restoreCheckpoint 还原文件 + `thread/resume` 原生续聊）；否则（checkpoint 缺失/落后/损坏）→ **Level 0** 语义恢复：从事件日志重放 `user.message`/`agent.message` 文本（绝不重放工具输入），写内部事件 `runtime.recovered{mode, reason}`；checkpoint 校验失败额外写 `session.error{checkpoint_corrupt}`。
 
 ## 与规格的已知偏差（务实取舍）
 
 1. runtime 为 FakeCodexDriver（本机子进程 + `/tmp` rollout），非沙箱内 `codex app-server`；协议形态一致（initialize/thread/start/turn/start/item/*/turn/completed），替换真实 driver 不动 worker。
 2. api 在 `requires_action` 等状态下可能从快照读 stop_reason 而非事件推导（物化视图已同步维护）。
 3. 限流为单进程内存令牌桶；多实例部署需换 PG/Redis（spec §13.4 预留）。
-4. Idempotency-Key 中间件已实现占位/冲突检测，但未挂到全部 POST 路由（REC-07 未覆盖）。
-5. agent 事件 `span.model_request_*`/`session.usage` 由 runtime 上报路径尚未接线（fake 不产生计量）。
+4. checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。
+5. Idempotency-Key 已挂 POST events；其余 POST 路由（agents/environments 等）幂等按 M5 全量化推进。
+6. agent 事件 `span.model_request_*`/`session.usage` 由 runtime 上报路径尚未接线（fake 不产生计量）。
 
 ## 后续路线（按 plan.md）
 
-M3 剩余：checkpoint 提交协议（§9.4）、水位线恢复（§14.2.1）、故障注入测试 → M4：sandbox provider（OpenSandbox/Docker+runsc）、egress-proxy/CredentialEgress、Vault/Files → M5：幂等全量、可观测、性能。
+M3 已完成（含 checkpoint/水位线恢复与 REC-01~07 验收；REC-08/09/10 依赖输出清单与沙箱基础设施，随 M4 补）→ M4：sandbox provider（OpenSandbox/Docker+runsc）、egress-proxy/CredentialEgress、Vault/Files → M5：幂等全量、可观测、性能。

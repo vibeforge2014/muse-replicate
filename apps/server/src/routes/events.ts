@@ -12,6 +12,7 @@ import {
 } from "@mas/core";
 import type { Database } from "@mas/db";
 import { admitEvents, getSessionRow, listEvents, appendApiEvent } from "@mas/db";
+import { beginIdempotent, finishIdempotent } from "../plugins/idempotency.js";
 import { parseTimeFilter } from "@mas/core";
 import type { RouteCtx } from "./agents.js";
 
@@ -46,6 +47,12 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
   app.post("/v1/sessions/:id/events", async (req, reply) => {
     const { id } = req.params as { id: string };
     const ws = req.mas.auth!.workspaceId;
+    // Idempotency-Key：同 key 同 body 回放首次响应（REC-07）
+    const idem = await beginIdempotent(ctx.db, req);
+    if (idem.replayed && idem.response) {
+      reply.code(idem.response.status);
+      return idem.response.body as Record<string, unknown>;
+    }
     const body = req.body as { events?: unknown[] };
     if (!Array.isArray(body?.events)) throw errInvalid("body must be {events: [...]}");
     if (body.events.length < 1 || body.events.length > 10) {
@@ -94,7 +101,9 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       events: rows,
       executionKind: interruptExecution ? "interrupt" : kind === "tool_confirmation" ? "tool_confirmation" : "user_message",
     });
-    return { data: admitted.events };
+    const out = { data: admitted.events };
+    await finishIdempotent(ctx.db, req, { status: 200, body: out });
+    return out;
   });
 
   // ---- 历史事件（spec §7.3 第 5 条）----

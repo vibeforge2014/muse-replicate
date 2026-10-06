@@ -386,6 +386,71 @@ export async function settleExecution(
   });
 }
 
+/** 毒任务回收（spec §5.6 / REC-06）：attempt 耗尽且租约过期的执行置为 failed，返回需要收尾的会话。 */
+export async function failExhaustedExecutions(db: Kysely<Database>): Promise<
+  { sessionId: string; executionId: string }[]
+> {
+  const result = await sql<{ id: string; session_id: string }>`
+    UPDATE session_executions
+       SET state='failed', settled_at=now(), failure='{"reason":"exhausted"}'::jsonb
+     WHERE state IN ('claimed','delivered')
+       AND attempt_count >= max_attempts
+       AND lease_expires_at < now()
+     RETURNING id, session_id`.execute(db);
+  return result.rows.map((r) => ({ sessionId: r.session_id, executionId: r.id }));
+}
+
+/** 毒任务回收 + 会话收尾（REC-06）：failed 之后写 session.error(exhausted) + idle，并物化状态。 */
+export async function reapExhaustedExecutions(db: Kysely<Database>): Promise<void> {
+  const reaped = await failExhaustedExecutions(db);
+  for (const r of reaped) {
+    await db.transaction().execute(async (tx) => {
+      const s = await tx
+        .selectFrom("sessions")
+        .select(["id", "status"])
+        .where("id", "=", r.sessionId)
+        .executeTakeFirst();
+      // 仅 running/rescheduling 的会话需要收尾；idle 会话只保留 failed 记录
+      if (!s || (s.status !== "running" && s.status !== "rescheduling")) return;
+      const state = await loadSeqState(tx, r.sessionId);
+      let seq = Number(state.last_event_seq ?? 0);
+      let lastMs = state.last_processed_at ? state.last_processed_at.getTime() : 0;
+      const insert = async (type: string, payload: Record<string, unknown>) => {
+        seq += 1;
+        lastMs = Math.max(Date.now(), lastMs + 1);
+        await tx
+          .insertInto("session_events")
+          .values({
+            session_id: r.sessionId,
+            seq,
+            id: `sevt_${Math.floor(Math.random() * 1e9).toString(36)}${Date.now().toString(36)}`,
+            type,
+            payload,
+            processed_at: new Date(lastMs),
+          })
+          .execute();
+        await sql`SELECT pg_notify('session:' || ${r.sessionId}, ${seq}::text)`.execute(tx);
+      };
+      await insert("session.error", {
+        error: { type: "execution_exhausted", message: "retries exhausted", retry_status: "exhausted" },
+      });
+      await insert("session.status_idle", { stop_reason: { type: "retries_exhausted" } });
+      await tx
+        .updateTable("sessions")
+        .set({
+          status: "idle",
+          stop_reason: { type: "retries_exhausted" } as Record<string, unknown>,
+          last_event_seq: seq,
+          last_processed_at: new Date(lastMs),
+          last_completed_execution_id: r.executionId,
+          updated_at: new Date(),
+        })
+        .where("id", "=", r.sessionId)
+        .execute();
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Worker 侧事件追加（带 fence），状态物化（spec §6/§7）
 // ---------------------------------------------------------------------------
@@ -446,6 +511,11 @@ export async function appendEvent(db: Kysely<Database>, input: AppendEventInput)
     if (input.type === "session.status_idle") {
       sessionUpdate.status = "idle";
       sessionUpdate.stop_reason = payload.stop_reason ?? null;
+      const stopType = (payload.stop_reason as { type?: string } | undefined)?.type;
+      // 轮真正落定（end_turn/error/exhausted）才推进 canonical 水位线；requires_action 不算（§14.2.1）
+      if (stopType && stopType !== "requires_action") {
+        sessionUpdate.last_completed_execution_id = input.executionId;
+      }
     }
     if (input.type === "session.status_rescheduled") sessionUpdate.status = "rescheduling";
     if (input.type === "session.status_terminated") {

@@ -130,6 +130,26 @@ CREATE INDEX execution_lane_ix ON session_executions (workspace_id, session_id, 
 `,
   },
   {
+    name: "0005_checkpoints",
+    sql: /* sql */ `
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS last_completed_execution_id text,
+  ADD COLUMN IF NOT EXISTS active_workspace_checkpoint jsonb,
+  ADD COLUMN IF NOT EXISTS codex_thread_id text,
+  ADD COLUMN IF NOT EXISTS codex_version_digest text;
+CREATE TABLE workspace_checkpoints (
+  checkpoint_id text PRIMARY KEY,
+  session_id text NOT NULL,
+  generation bigint NOT NULL,
+  execution_id text NOT NULL,
+  manifest jsonb NOT NULL,
+  state text NOT NULL DEFAULT 'candidate',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX workspace_checkpoints_session_ix ON workspace_checkpoints (session_id, created_at DESC);
+`,
+  },
+  {
     name: "0004_files_resources",
     sql: /* sql */ `
 CREATE TABLE files (

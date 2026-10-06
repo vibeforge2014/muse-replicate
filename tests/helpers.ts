@@ -1,8 +1,12 @@
 import type { FastifyInstance } from "fastify";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "pg";
 import { bootstrap, createDb, runMigrations, sessionsWithWork, type DbHandle } from "@mas/db";
+import { FsSnapshotStore } from "@mas/db";
 import { FakeCodexDriver } from "@mas/runtime";
-import { SessionRunner } from "../apps/worker/src/session-runner.ts";
+import { SessionRunner, type RunnerFaults } from "../apps/worker/src/session-runner.ts";
 import { buildApp } from "../apps/server/src/app.ts";
 
 process.env.DATABASE_URL ??= "postgres://mas@localhost:5433/mas_test";
@@ -13,6 +17,13 @@ export interface TestEnv {
   key: string;
   db: DbHandle;
   runner: SessionRunner;
+  /** FsSnapshotStore 根目录（REC-05 直接破坏归档用）。 */
+  snapshotDir: string;
+  /** 暂停后台 drain（REC 崩溃/接管类用例需要手工驱动 worker）。 */
+  pauseWorker(): void;
+  resumeWorker(): void;
+  /** 用同一 db / snapshot store 构造可注入故障的 runner。 */
+  newRunner(workerId: string, faults?: RunnerFaults): SessionRunner;
   close(): Promise<void>;
 }
 
@@ -29,6 +40,7 @@ export async function setupEnv(): Promise<TestEnv> {
     "files",
     "session_executions",
     "session_events",
+    "workspace_checkpoints",
     "sessions",
     "agent_versions",
     "agents",
@@ -47,12 +59,16 @@ export async function setupEnv(): Promise<TestEnv> {
   await app.listen({ port: 0, host: "127.0.0.1" });
   const url = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
 
-  const runner = new SessionRunner(db.db, new FakeCodexDriver(), "worker_test");
+  const snapshotDir = mkdtempSync(join(tmpdir(), "mas-snaps-"));
+  const store = new FsSnapshotStore(snapshotDir);
+  const runner = new SessionRunner(db.db, new FakeCodexDriver(), "worker_test", store);
   const client = new Client({ connectionString: process.env.DATABASE_URL });
   await client.connect();
   await client.query("LISTEN session_exec");
   const inFlight = new Set<string>();
+  let paused = false;
   const drain = async () => {
+    if (paused) return;
     const ids = await sessionsWithWork(db.db);
     for (const sessionId of ids) {
       if (inFlight.has(sessionId)) continue;
@@ -72,6 +88,19 @@ export async function setupEnv(): Promise<TestEnv> {
     key: boot.apiKey,
     db,
     runner,
+    snapshotDir,
+    pauseWorker: () => {
+      paused = true;
+    },
+    resumeWorker: () => {
+      paused = false;
+      void drain();
+    },
+    newRunner: (workerId: string, faults?: RunnerFaults) => {
+      const r = new SessionRunner(db.db, new FakeCodexDriver(), workerId, store);
+      if (faults) Object.assign(r.faults, faults);
+      return r;
+    },
     async close() {
       clearInterval(timer);
       await client.end().catch(() => undefined);

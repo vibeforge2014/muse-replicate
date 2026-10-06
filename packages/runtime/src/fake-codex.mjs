@@ -10,6 +10,7 @@
  *   - "crash"        → 进程直接退出（测 worker 恢复）
  */
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import readline from "node:readline";
@@ -19,6 +20,9 @@ mkdirSync(home, { recursive: true });
 const rolloutPath = join(home, "rollout.json");
 
 let nextId = 1;
+// 每进程随机 tag：worker 重启/多 worker 场景下 itemId 全局唯一，
+// 避免事件 source_event_id 唯一约束把新轮产出误判为重放
+const tag = randomUUID().slice(0, 6);
 const pendingApprovals = new Map(); // itemId -> {resolve}
 let awaitingInterrupt = null;
 let hasBash = true;
@@ -72,12 +76,19 @@ async function handle(msg) {
       return;
     case "thread/start":
       hasBash = params.capabilities?.bash !== false;
-      reply(id, { threadId: "thrx_" + (nextId++).toString(36) });
+      reply(id, { threadId: `thrx_${tag}_${(nextId++).toString(36)}` });
       return;
     case "thread/resume":
       reply(id, { threadId: params.threadId ?? "thrx_resumed" });
       return;
     case "thread/inject_items":
+      // Level 0 语义恢复：注入的历史成为 fake 的持久化 rollout（下一轮可被 checkpoint 捕获）
+      for (const item of params.items ?? []) {
+        if (item.type === "message") {
+          history.push({ role: item.role, text: item.text });
+        }
+      }
+      persist();
       reply(id, { ok: true });
       return;
     case "turn/start":
@@ -144,7 +155,7 @@ async function runTurn(params) {
     return;
   }
   if (text.startsWith("ask")) {
-    const itemId = "itm_ask_" + nextId++;
+    const itemId = `itm_ask_${tag}_${nextId++}`;
     notify("item/started", {
       itemId,
       itemType: "commandExecution",
@@ -156,7 +167,7 @@ async function runTurn(params) {
     history.push({ role: "user", text });
     if (response.approved) {
       notify("item/completed", { itemId, itemType: "commandExecution", exitCode: 0, output: `approved-run:${text.slice(3).trim()}` });
-      notify("item/completed", { itemId: "itm_msg_" + nextId++, itemType: "agentMessage", text: "done after approval" });
+      notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: "done after approval" });
       history.push({ role: "agent", text: "done after approval" });
     } else {
       notify("item/completed", {
@@ -165,7 +176,7 @@ async function runTurn(params) {
         exitCode: 1,
         output: `denied: ${response.denyMessage ?? "user denied"}`,
       });
-      notify("item/completed", { itemId: "itm_msg_" + nextId++, itemType: "agentMessage", text: "tool was denied" });
+      notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: "tool was denied" });
       history.push({ role: "agent", text: "tool was denied" });
     }
     persist();
@@ -174,26 +185,26 @@ async function runTurn(params) {
   }
   if (text.startsWith("run")) {
     if (!hasBash) {
-      notify("item/completed", { itemId: "itm_msg_" + nextId++, itemType: "agentMessage", text: "no tools available" });
+      notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: "no tools available" });
       notify("turn/completed", { reason: "completed" });
       return;
     }
     const cmd = text.slice(3).trim();
-    const itemId = "itm_cmd_" + nextId++;
+    const itemId = `itm_cmd_${tag}_${nextId++}`;
     notify("item/started", { itemId, itemType: "commandExecution", command: cmd, evaluatedPermission: approval ? "ask" : "allow" });
     // always_allow 直接执行；always_ask 也自动放行（平台 ApprovalBroker 在 untrusted 下会拦截真正的破坏性命令）
     await sleep(approval ? 30 : 10);
     const output = `ran: ${cmd}`;
     notify("item/completed", { itemId, itemType: "commandExecution", exitCode: 0, output });
-    notify("item/completed", { itemId: "itm_msg_" + nextId++, itemType: "agentMessage", text: `ran ${cmd}` });
+    notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: `ran ${cmd}` });
     history.push({ role: "user", text }, { role: "agent", text: `ran ${cmd}` });
     persist();
     notify("turn/completed", { reason: "completed" });
     return;
   }
   const response = text.startsWith("echo:") ? text.slice(5).trim() : `echo: ${text}`;
-  notify("item/started", { itemId: "itm_rsn_" + nextId++, itemType: "reasoning", summary: "thinking about it" });
-  notify("item/completed", { itemId: "itm_msg_" + nextId++, itemType: "agentMessage", text: response });
+  notify("item/started", { itemId: `itm_rsn_${tag}_${nextId++}`, itemType: "reasoning", summary: "thinking about it" });
+  notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: response });
   history.push({ role: "user", text }, { role: "agent", text: response });
   persist();
   notify("turn/completed", { reason: "completed" });

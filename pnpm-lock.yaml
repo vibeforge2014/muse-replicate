@@ -78,6 +78,27 @@ importers:
         specifier: ^4.20.6
         version: 4.23.15
 
+  apps/model-gateway:
+    dependencies:
+      '@mas/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@mas/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      fastify:
+        specifier: ^5.12.5
+        version: 5.12.5
+      kysely:
+        specifier: ^0.27.6
+        version: 0.27.6
+      pg:
+        specifier: ^8.16.3
+        version: 8.23.1
+      tsx:
+        specifier: ^4.20.6
+        version: 4.23.15
+
   apps/server:
     dependencies:
       '@fastify/multipart':

@@ -562,9 +562,18 @@ export async function appendApiEvent(
       payload,
       processed_at: new Date(t),
     }).execute();
+    const sessionUpdate: Record<string, unknown> = { last_event_seq: seq, last_processed_at: new Date(t) };
+    if (type === "session.usage") {
+      // gateway 计量走 api 侧写入：payload.usage 为累计值，直接替换物化（§10.3）
+      sessionUpdate.usage = (payload as { usage?: Record<string, number> }).usage ?? {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+      };
+    }
     await tx
       .updateTable("sessions")
-      .set({ last_event_seq: seq, last_processed_at: new Date(t) })
+      .set(sessionUpdate)
       .where("id", "=", sessionId)
       .execute();
     await sql`SELECT pg_notify('session:' || ${sessionId}, ${seq}::text)`.execute(tx);

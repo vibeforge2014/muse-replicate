@@ -2,7 +2,7 @@
   "name": "muse-replicate",
   "private": true,
   "version": "0.1.0",
-  "description": "企业私有化 Managed Agents 平台（Meta Muse 复刻）— spec/plan 见 *.md",
+  "description": "\u4f01\u4e1a\u79c1\u6709\u5316 Managed Agents \u5e73\u53f0\uff08Meta Muse \u590d\u523b\uff09\u2014 spec/plan \u89c1 *.md",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "engines": {
@@ -16,7 +16,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/db/tsconfig.json && tsc --noEmit -p packages/runtime/tsconfig.json && tsc --noEmit -p apps/server/tsconfig.json && tsc --noEmit -p apps/worker/tsconfig.json",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "test:chaos": "tsx scripts/chaos.ts"
   },
   "devDependencies": {
     "@mas/core": "workspace:*",

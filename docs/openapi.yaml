@@ -1,0 +1,1810 @@
+openapi: 3.1.0
+info:
+  title: muse-replicate Managed Agents API
+  version: 0.1.0
+  description: |
+    企业私有化 Managed Agents 平台（Meta Muse 复刻）的 HTTP API，方言为 BigModel Managed Agents 子集。
+
+    **鉴权**：`Authorization: Bearer mas_sk_...` 或 `x-api-key: mas_sk_...`（任选其一）。
+
+    **方言 headers**（建议随请求发送）：
+    - `zai-version: 2026-05-26`
+    - `zai-beta: managed-agents-2026-05-26`
+
+    兼容 Anthropic 方言（`anthropic-version` / `anthropic-beta` / `x-api-key`），服务端按 header 自动检测方言并适配错误信封。
+
+    **错误信封**（所有非 2xx）：
+    ```json
+    { "type": "error", "error": { "type": "invalid_request_error", "message": "...", "details": {} }, "request_id": "req_..." }
+    ```
+
+    **通用语义**：
+    - 所有 POST 接受 `Idempotency-Key` header（同 key 同 body 回放首次响应，异 body 409 `idempotency_conflict`）；
+    - 列表接口支持 `limit` / 分页游标（`next_page`），Files 用 `before_id`/`after_id`；
+    - 事件日志是唯一事实来源：会话事件按 `seq` 单调定序；SSE 见 `GET /v1/sessions/{id}/events/stream`。
+servers:
+  - url: http://127.0.0.1:8080
+    description: 本地部署（PORT 环境变量覆盖）
+tags:
+  - { name: Agents }
+  - { name: Environments }
+  - { name: Sessions }
+  - { name: Events }
+  - { name: Files }
+  - { name: Vaults }
+  - { name: Memory }
+  - { name: Skills }
+  - { name: Deployments }
+  - { name: Webhooks }
+
+# ---- 复用锚点（YAML anchor，非 OpenAPI 字段）----
+x-anchors:
+  dialect-params: &dialect
+    - $ref: "#/components/parameters/ZaiVersion"
+    - $ref: "#/components/parameters/ZaiBeta"
+    - $ref: "#/components/parameters/IdempotencyKey"
+  dialect-params-no-idem: &dialectGet
+    - $ref: "#/components/parameters/ZaiVersion"
+    - $ref: "#/components/parameters/ZaiBeta"
+
+security:
+  - bearerAuth: []
+  - apiKeyHeader: []
+
+paths:
+  /v1/agents:
+    post:
+      tags: [Agents]
+      operationId: createAgent
+      summary: 创建 Agent（AGT-01）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AgentCreate" }
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Agent" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    get:
+      tags: [Agents]
+      operationId: listAgents
+      summary: 列出 Agent（include_archived / created_at 过滤 / 游标分页）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: include_archived, in: query, schema: { type: string, enum: ["true"] } }
+        - { name: page, in: query, schema: { type: string }, description: "base64 游标（next_page 原样回传）" }
+      responses:
+        "200":
+          description: Agent 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Agent" } }
+                  next_page: { type: [string, "null"] }
+  /v1/agents/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Agents]
+      operationId: getAgent
+      summary: 查询单个 Agent（?version= 固定版本）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: version, in: query, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: Agent
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Agent" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Agents]
+      operationId: updateAgent
+      summary: 更新 Agent（乐观锁 version；metadata 按键合并，数组整体替换；无变化不升版）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AgentUpdate" }
+      responses:
+        "200":
+          description: 更新后的 Agent
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Agent" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/agents/{id}/versions:
+    get:
+      tags: [Agents]
+      operationId: listAgentVersions
+      summary: Agent 全版本快照（每版本完整配置）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: 版本列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Agent" } }
+                  next_page: { type: [string, "null"] }
+  /v1/agents/{id}/archive:
+    post:
+      tags: [Agents]
+      operationId: archiveAgent
+      summary: 归档 Agent（幂等；联动归档其 Deployments）
+      parameters: *dialect
+      responses:
+        "200":
+          description: 归档后的 Agent
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Agent" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/environments:
+    post:
+      tags: [Environments]
+      operationId: createEnvironment
+      summary: 创建 Environment（ENV-01；networking/packages 校验）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnvironmentCreate" }
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Environment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    get:
+      tags: [Environments]
+      operationId: listEnvironments
+      summary: 列出 Environment
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: include_archived, in: query, schema: { type: string, enum: ["true"] } }
+      responses:
+        "200":
+          description: Environment 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Environment" } }
+                  next_page: { type: [string, "null"] }
+  /v1/environments/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Environments]
+      operationId: getEnvironment
+      summary: 查询单个 Environment
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Environment
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Environment" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Environments]
+      operationId: updateEnvironment
+      summary: 更新（config 整体替换；metadata 按键合并；归档后 400）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnvironmentUpdate" }
+      responses:
+        "200":
+          description: 更新后的 Environment
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Environment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    delete:
+      tags: [Environments]
+      operationId: deleteEnvironment
+      summary: 删除 Environment（有会话引用时 409）
+      parameters: *dialectGet
+      responses:
+        "200": { description: 删除成功（返回 id 与 type:environment_deleted） }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/environments/{id}/archive:
+    post:
+      tags: [Environments]
+      operationId: archiveEnvironment
+      summary: 归档 Environment（幂等）
+      parameters: *dialect
+      responses:
+        "200":
+          description: 归档后的 Environment
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Environment" }
+
+  /v1/sessions:
+    post:
+      tags: [Sessions]
+      operationId: createSession
+      summary: 创建会话（SES-01~10；agent 三形态引用 + 快照固化 + resources/vault_ids/initial_events）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SessionCreate" }
+      responses:
+        "200":
+          description: 创建的会话（status=idle）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      summary: 列出会话（agent_id/agent_version/statuses/created_at/include_archived）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: agent_id, in: query, schema: { type: string } }
+        - { name: agent_version, in: query, schema: { type: integer, minimum: 1 }, description: "需配合 agent_id" }
+        - { name: statuses, in: query, schema: { type: string }, description: "逗号分隔：idle,running,rescheduling,terminated" }
+        - { name: "created_at[gte]", in: query, schema: { type: string, format: date-time } }
+        - { name: include_archived, in: query, schema: { type: string, enum: ["true"] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+      responses:
+        "200":
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Session" } }
+                  next_page: { type: [string, "null"] }
+  /v1/sessions/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      summary: 查询会话（含物化 status/stop_reason/usage/resources）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: 会话
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Sessions]
+      operationId: updateSession
+      summary: 更新 title/metadata；idle 时可整体替换 agent.tools/mcp_servers（running 409）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SessionUpdate" }
+      responses:
+        "200":
+          description: 更新后的会话
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [Sessions]
+      operationId: deleteSession
+      summary: 删除会话（running 409；写 session.deleted 后清理事件/资源并关 SSE）
+      parameters: *dialectGet
+      responses:
+        "200": { description: 删除成功（返回 id 与 type:session_deleted） }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/sessions/{id}/archive:
+    post:
+      tags: [Sessions]
+      operationId: archiveSession
+      summary: 归档会话（重复归档 409 session_archived；running 409）
+      parameters: *dialect
+      responses:
+        "200":
+          description: 归档后的会话
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/sessions/{id}/resources:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Sessions]
+      operationId: listSessionResources
+      summary: 列出挂载资源（file / memory_store / skill）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: 资源列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/SessionResource" } }
+                  next_page: { type: [string, "null"] }
+    post:
+      tags: [Sessions]
+      operationId: mountSessionResource
+      summary: 运行中挂载资源（RES-02 / MEM-08 / SKL-06）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SessionResourceMount" }
+      responses:
+        "200": { description: 挂载成功（返回资源对象） }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/sessions/{id}/resources/{rid}:
+    delete:
+      tags: [Sessions]
+      operationId: unmountSessionResource
+      summary: 卸载资源（下一轮物化时消失）
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+        - { name: rid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: 卸载成功（返回 id 与 type:session_resource_deleted） }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/sessions/{id}/events:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    post:
+      tags: [Events]
+      operationId: sendEvents
+      summary: 发送用户事件（1-10 条；排队 processed_at=null；interrupt/confirmation 状态前置校验）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EventsSend" }
+      responses:
+        "200":
+          description: 准入结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/SessionEvent" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    get:
+      tags: [Events]
+      operationId: listEvents
+      summary: 历史事件（types/order/created_at/after_seq/limit≤100；排队事件排在 asc 末尾）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: types, in: query, schema: { type: string }, description: "逗号分隔事件类型" }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
+        - { name: after_seq, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+        - { name: "created_at[gt]", in: query, schema: { type: string, format: date-time } }
+        - { name: "created_at[gte]", in: query, schema: { type: string, format: date-time } }
+        - { name: "created_at[lt]", in: query, schema: { type: string, format: date-time } }
+        - { name: "created_at[lte]", in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: 事件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/SessionEvent" } }
+                  next_page: { type: [string, "null"] }
+  /v1/sessions/{id}/events/stream:
+    get:
+      tags: [Events]
+      operationId: streamEvents
+      summary: SSE 实时流（LISTEN/NOTIFY、15s 心跳、Last-Event-ID 回补、session.deleted 关闭）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: Last-Event-ID, in: header, schema: { type: string }, description: "从该事件 id 起回补" }
+      responses:
+        "200":
+          description: "text/event-stream（event: 事件类型；data: 事件 JSON；: ping 心跳）"
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+  /v1/files:
+    post:
+      tags: [Files]
+      operationId: uploadFile
+      summary: multipart 上传文件（FILE-01；sha256 服务端计算；文件名黑名单 FILE-02）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        "200":
+          description: 上传成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileObject" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    get:
+      tags: [Files]
+      operationId: listFiles
+      summary: 文件列表（before_id/after_id 分页；scope 过滤）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: before_id, in: query, schema: { type: string } }
+        - { name: after_id, in: query, schema: { type: string } }
+        - { name: session_id, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: 文件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/FileObject" } }
+                  next_page: { type: [string, "null"] }
+  /v1/files/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Files]
+      operationId: getFile
+      summary: 文件元数据
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: 文件元数据
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileObject" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Files]
+      operationId: deleteFile
+      summary: 删除文件
+      parameters: *dialectGet
+      responses:
+        "200": { description: 删除成功 }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/files/{id}/content:
+    get:
+      tags: [Files]
+      operationId: downloadFileContent
+      summary: 下载文件内容（Content-Type 透传）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: 文件字节流
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+
+  /v1/vaults:
+    post:
+      tags: [Vaults]
+      operationId: createVault
+      summary: 创建 Vault（VLT-01）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VaultCreate" }
+      responses:
+        "200":
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Vault" }
+    get:
+      tags: [Vaults]
+      operationId: listVaults
+      summary: Vault 列表（include_archived）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: include_archived, in: query, schema: { type: string, enum: ["true"] } }
+      responses:
+        "200":
+          description: Vault 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Vault" } }
+                  next_page: { type: [string, "null"] }
+  /v1/vaults/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Vaults]
+      operationId: getVault
+      summary: 查询 Vault（含凭据，机密永不回显）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Vault
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Vault" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Vaults]
+      operationId: deleteVault
+      summary: 删除 Vault（有会话引用 409）
+      parameters: *dialectGet
+      responses:
+        "200": { description: 删除成功 }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/vaults/{id}/archive:
+    post:
+      tags: [Vaults]
+      operationId: archiveVault
+      summary: 归档 Vault（幂等）
+      parameters: *dialect
+      responses:
+        "200":
+          description: 归档后的 Vault
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Vault" }
+  /v1/vaults/{id}/credentials:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Vaults]
+      operationId: listCredentials
+      summary: 凭据列表（只回 ***+末 4 位）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: 凭据列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Credential" } }
+                  next_page: { type: [string, "null"] }
+    post:
+      tags: [Vaults]
+      operationId: createCredential
+      summary: 创建凭据（static_bearer/bearer/environment_variable；响应永不回显机密）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CredentialCreate" }
+      responses:
+        "200":
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Credential" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/vaults/{id}/credentials/{cid}:
+    get:
+      tags: [Vaults]
+      operationId: getCredential
+      summary: 查询单条凭据（机密永不回显）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - $ref: "#/components/parameters/IdPath"
+        - { name: cid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: 凭据
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Credential" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Vaults]
+      operationId: rotateCredential
+      summary: 轮换凭据（同 type 只带机密；带身份键或改 type 400）
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+        - { name: cid, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CredentialRotate" }
+      responses:
+        "200":
+          description: 轮换后的凭据
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Credential" }
+    delete:
+      tags: [Vaults]
+      operationId: deleteCredential
+      summary: 删除凭据
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+        - { name: cid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: 删除成功 }
+  /v1/vaults/{id}/credentials/{cid}/archive:
+    post:
+      tags: [Vaults]
+      operationId: archiveCredential
+      summary: 归档凭据（幂等）
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+        - { name: cid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: 归档后的凭据
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Credential" }
+
+  /v1/memory-stores:
+    post:
+      tags: [Memory]
+      operationId: createMemoryStore
+      summary: 创建 Memory Store（MEM-01；name 1-255 → slug 唯一）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MemoryStoreCreate" }
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MemoryStore" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    get:
+      tags: [Memory]
+      operationId: listMemoryStores
+      summary: Store 列表
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Store 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/MemoryStore" } }
+                  next_page: { type: [string, "null"] }
+  /v1/memory-stores/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Memory]
+      operationId: getMemoryStore
+      summary: 查询 Store
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Store
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MemoryStore" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Memory]
+      operationId: deleteMemoryStore
+      summary: 删除 Store（仍被会话挂载 409）
+      parameters: *dialectGet
+      responses:
+        "200": { description: 删除成功 }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/memory-stores/{id}/archive:
+    post:
+      tags: [Memory]
+      operationId: archiveMemoryStore
+      summary: 归档 Store
+      parameters: *dialect
+      responses:
+        "200":
+          description: 归档后的 Store
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MemoryStore" }
+  /v1/memory-stores/{id}/memories:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    post:
+      tags: [Memory]
+      operationId: upsertMemory
+      summary: 写入 memory（MEM-02/03/04；precondition 按 head content_sha256，不一致 409）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MemoryUpsert" }
+      responses:
+        "201": { description: 新建（含 version/content_sha256） }
+        "200": { description: 更新（新版本） }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    get:
+      tags: [Memory]
+      operationId: listMemories
+      summary: memory 列表（path_prefix/depth→memory_prefix 折叠/view=full limit≤20）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: path_prefix, in: query, schema: { type: string } }
+        - { name: depth, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: view, in: query, schema: { type: string, enum: [metadata, full] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+      responses:
+        "200":
+          description: memory 与 memory_prefix 元素混合列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/MemoryListItem" } }
+                  next_page: { type: [string, "null"] }
+  /v1/memory-stores/{id}/memories/{mid}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+      - { name: mid, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Memory]
+      operationId: getMemory
+      summary: 查询单条 memory（含 head content）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: memory
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Memory" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Memory]
+      operationId: deleteMemory
+      summary: 删除 memory（expected_content_sha256 不匹配 409；MEM-05）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: expected_content_sha256, in: query, schema: { type: string, pattern: "^[0-9a-f]{64}$" } }
+      responses:
+        "200": { description: 删除成功 }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/memory-stores/{id}/memories/{mid}/versions:
+    get:
+      tags: [Memory]
+      operationId: listMemoryVersions
+      summary: 版本列表（desc；view=full 含 content；MEM-07）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+      responses:
+        "200":
+          description: 版本列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/MemoryVersion" } }
+                  next_page: { type: [string, "null"] }
+  /v1/memory-stores/{id}/memories/{mid}/versions/{vid}/redact:
+    post:
+      tags: [Memory]
+      operationId: redactMemoryVersion
+      summary: redact 历史版本（head 409；redact 后 path/content/sha 置 null；MEM-07）
+      parameters:
+        - $ref: "#/components/parameters/IdPath"
+        - { name: mid, in: path, required: true, schema: { type: string } }
+        - { name: vid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: redact 后的版本
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MemoryVersion" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/skills:
+    post:
+      tags: [Skills]
+      operationId: uploadSkill
+      summary: multipart 上传 Skill zip（SKL-01/02/03；根 SKILL.md；≤200 文件静默截断）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                directory: { type: string, description: "缺省取 zip 公共根目录" }
+                description: { type: string }
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Skill" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    get:
+      tags: [Skills]
+      operationId: listSkills
+      summary: Skill 列表（source=user|zai；SKL-07）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: source, in: query, schema: { type: string, enum: [user, zai] } }
+        - { name: include_archived, in: query, schema: { type: string, enum: ["true"] } }
+      responses:
+        "200":
+          description: Skill 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Skill" } }
+                  next_page: { type: [string, "null"] }
+  /v1/skills/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Skills]
+      operationId: getSkill
+      summary: 查询 Skill
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Skill
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Skill" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Skills]
+      operationId: deleteSkill
+      summary: 删除 Skill（仍被 agent 版本引用/会话挂载 409；SKL-05）
+      parameters: *dialectGet
+      responses:
+        "200": { description: 删除成功 }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/skills/{id}/archive:
+    post:
+      tags: [Skills]
+      operationId: archiveSkill
+      summary: 归档 Skill（幂等）
+      parameters: *dialect
+      responses:
+        "200":
+          description: 归档后的 Skill
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Skill" }
+  /v1/skills/{id}/versions:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Skills]
+      operationId: listSkillVersions
+      summary: 版本列表（desc）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: 版本列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/SkillVersion" } }
+                  next_page: { type: [string, "null"] }
+    post:
+      tags: [Skills]
+      operationId: uploadSkillVersion
+      summary: 追加新版本（SKL-04）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        "201":
+          description: 新版本
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SkillVersion" }
+  /v1/skills/{id}/content:
+    get:
+      tags: [Skills]
+      operationId: downloadSkillContent
+      summary: 下载最新版本 zip
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: application/zip
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+  /v1/skills/{id}/versions/{version}/content:
+    get:
+      tags: [Skills]
+      operationId: downloadSkillVersionContent
+      summary: 下载指定版本 zip（SKL-03/04）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: version, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "200":
+          description: application/zip
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+
+  /v1/deployments:
+    post:
+      tags: [Deployments]
+      operationId: createDeployment
+      summary: 创建 Deployment（DEP-01/02/03；cron ≥5min、有未来触发点、Asia/Shanghai；agent 版本固定）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeploymentCreate" }
+      responses:
+        "201":
+          description: 创建成功（含 upcoming_runs_at ≤5）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    get:
+      tags: [Deployments]
+      operationId: listDeployments
+      summary: Deployment 列表
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Deployment 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Deployment" } }
+                  next_page: { type: [string, "null"] }
+  /v1/deployments/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Deployments]
+      operationId: getDeployment
+      summary: 查询 Deployment（upcoming 实时计算）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Deployment
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+  /v1/deployments/{id}/archive:
+    post:
+      tags: [Deployments]
+      operationId: archiveDeployment
+      summary: 归档（幂等；归档后手动 run 409；DEP-06）
+      parameters: *dialect
+      responses:
+        "200":
+          description: 归档后的 Deployment
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+  /v1/deployments/{id}/pause:
+    post:
+      tags: [Deployments]
+      operationId: pauseDeployment
+      summary: 暂停调度（手动 run 仍允许；DEP-05）
+      parameters: *dialect
+      responses:
+        "200":
+          description: paused
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+  /v1/deployments/{id}/unpause:
+    post:
+      tags: [Deployments]
+      operationId: unpauseDeployment
+      summary: 恢复调度（upcoming 以当前时间为锚）
+      parameters: *dialect
+      responses:
+        "200":
+          description: active
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+  /v1/deployments/{id}/runs:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    post:
+      tags: [Deployments]
+      operationId: runDeployment
+      summary: 手动 run（202；调度器建会话投首轮；DEP-04）
+      parameters: *dialect
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                input: { type: object, additionalProperties: true }
+      responses:
+        "202":
+          description: 已排队
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeploymentRun" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    get:
+      tags: [Deployments]
+      operationId: listDeploymentRunsNested
+      summary: 该 deployment 的 runs
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/DeploymentRun" } }
+                  next_page: { type: [string, "null"] }
+  /v1/deployment_runs:
+    get:
+      tags: [Deployments]
+      operationId: listDeploymentRuns
+      summary: runs 过滤（deployment_id/has_error/trigger_type/created_at；limit 默认 50；DEP-07）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: deployment_id, in: query, schema: { type: string } }
+        - { name: has_error, in: query, schema: { type: string, enum: ["true", "false"] } }
+        - { name: trigger_type, in: query, schema: { type: string, enum: [manual, schedule] } }
+        - { name: "created_at[gte]", in: query, schema: { type: string, format: date-time } }
+        - { name: "created_at[lte]", in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        "200":
+          description: runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/DeploymentRun" } }
+                  next_page: { type: [string, "null"] }
+
+  /v1/webhooks:
+    post:
+      tags: [Webhooks]
+      operationId: createWebhook
+      summary: 创建 Webhook（secret 仅本次响应回显 whsec_...）
+      parameters: *dialect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookCreate" }
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebhookCreated" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    get:
+      tags: [Webhooks]
+      operationId: listWebhooks
+      summary: Webhook 列表（不回显 secret）
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Webhook 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Webhook" } }
+                  next_page: { type: [string, "null"] }
+  /v1/webhooks/{id}:
+    parameters: [{ $ref: "#/components/parameters/IdPath" }]
+    get:
+      tags: [Webhooks]
+      operationId: getWebhook
+      summary: 查询 Webhook
+      parameters: *dialectGet
+      responses:
+        "200":
+          description: Webhook
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Webhook" }
+    delete:
+      tags: [Webhooks]
+      operationId: deleteWebhook
+      summary: 删除 Webhook（连同 outbox）
+      parameters: *dialectGet
+      responses:
+        "200": { description: 删除成功 }
+  /v1/webhooks/{id}/deliveries:
+    get:
+      tags: [Webhooks]
+      operationId: listWebhookDeliveries
+      summary: 投递记录（status/limit）
+      parameters:
+        - $ref: "#/components/parameters/ZaiVersion"
+        - $ref: "#/components/parameters/ZaiBeta"
+        - { name: status, in: query, schema: { type: string, enum: [pending, delivered, failed] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        "200":
+          description: 投递记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/WebhookDelivery" } }
+                  next_page: { type: [string, "null"] }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "Authorization: Bearer mas_sk_..."
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: "x-api-key: mas_sk_...（BigModel/Anthropic 方言兼容）"
+  parameters:
+    ZaiVersion:
+      name: zai-version
+      in: header
+      required: false
+      schema: { type: string, default: "2026-05-26" }
+      description: BigModel API 版本（等价 anthropic-version）
+    ZaiBeta:
+      name: zai-beta
+      in: header
+      required: false
+      schema: { type: string, default: "managed-agents-2026-05-26" }
+      description: Managed Agents beta 通道（等价 anthropic-beta）
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 255 }
+      description: 幂等键（同 key 同 body 回放；异 body 409 idempotency_conflict）
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    BadRequest:
+      description: 请求体/参数不合法（invalid_request_error）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: 缺失或无效凭证（authentication_error）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: 资源不存在（not_found_error）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: 状态冲突 / 乐观锁 / 幂等冲突 / 引用约束（conflict_error）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  schemas:
+    Error:
+      type: object
+      required: [type, message]
+      properties:
+        type:
+          type: string
+          enum: [invalid_request_error, authentication_error, permission_error, not_found_error, conflict_error, rate_limit_error, api_error, overloaded_error]
+        message: { type: string }
+        details:
+          type: [object, "null"]
+          additionalProperties: true
+    ErrorEnvelope:
+      type: object
+      required: [type, error, request_id]
+      properties:
+        type: { const: error }
+        error: { $ref: "#/components/schemas/Error" }
+        request_id: { type: string }
+    Timestamp:
+      type: string
+      format: date-time
+    IdempotentList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: { additionalProperties: true }
+        next_page: { type: [string, "null"] }
+
+    Agent:
+      type: object
+      required: [id, type, name, version]
+      properties:
+        id: { type: string, examples: ["agt_abc123"] }
+        type: { const: agent }
+        name: { type: string }
+        description: { type: [string, "null"], maxLength: 2048 }
+        model: { $ref: "#/components/schemas/AgentModel" }
+        system: { type: [string, "null"], maxLength: 100000 }
+        tools: { type: array, items: { $ref: "#/components/schemas/ToolConfig" } }
+        mcp_servers: { type: array, items: { $ref: "#/components/schemas/McpServer" } }
+        skills: { type: array, items: { type: string } }
+        metadata: { type: object, additionalProperties: { type: string } }
+        version: { type: integer, minimum: 1 }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        archived_at: { type: [string, "null"], format: date-time }
+    AgentModel:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, examples: ["glm-5.3-flash"] }
+        effort: { type: string, enum: [low, medium, high, max] }
+        speed: { type: string, enum: [standard] }
+    ToolConfig:
+      type: object
+      additionalProperties: true
+      required: [type]
+      description: 内置工具集（agent_toolset_20260401/20260601 的 default_config/configs）或内置/自定义工具声明
+      properties:
+        type: { type: string }
+    McpServer:
+      type: object
+      required: [type, name, url]
+      properties:
+        type: { const: url }
+        name: { type: string, minLength: 1, maxLength: 128 }
+        url: { type: string, pattern: "^https://" }
+    AgentCreate:
+      type: object
+      required: [name, model]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 256 }
+        description: { type: [string, "null"], maxLength: 2048 }
+        model: { $ref: "#/components/schemas/AgentModel" }
+        system: { type: [string, "null"], maxLength: 100000 }
+        tools: { type: array, maxItems: 128, items: { $ref: "#/components/schemas/ToolConfig" } }
+        mcp_servers: { type: array, maxItems: 20, items: { $ref: "#/components/schemas/McpServer" } }
+        skills: { type: array, maxItems: 20, items: { type: string, minLength: 3, maxLength: 128 } }
+        metadata: { type: object, additionalProperties: { type: string } }
+    AgentUpdate:
+      type: object
+      properties:
+        version: { type: integer, minimum: 1, description: 提供时做乐观锁校验（基于的当前版本） }
+        name: { type: [string, "null"], minLength: 1, maxLength: 256 }
+        description: { type: [string, "null"], maxLength: 2048 }
+        model: { $ref: "#/components/schemas/AgentModel" }
+        system: { type: [string, "null"], maxLength: 100000 }
+        tools: { type: [array, "null"], maxItems: 128, items: { $ref: "#/components/schemas/ToolConfig" } }
+        mcp_servers: { type: [array, "null"], maxItems: 20, items: { $ref: "#/components/schemas/McpServer" } }
+        skills: { type: [array, "null"], maxItems: 20, items: { type: string } }
+        metadata: { type: [object, "null"], additionalProperties: { type: [string, "null"] }, description: 按键合并；值为 null 删除该键；整体 null 清空 }
+
+    Environment:
+      type: object
+      required: [id, type, name]
+      properties:
+        id: { type: string }
+        type: { const: environment }
+        name: { type: string }
+        description: { type: [string, "null"], maxLength: 2048 }
+        config: { $ref: "#/components/schemas/EnvironmentConfig" }
+        metadata: { type: object, additionalProperties: { type: string } }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        archived_at: { type: [string, "null"], format: date-time }
+    EnvironmentConfig:
+      type: object
+      required: [type]
+      properties:
+        type: { const: cloud }
+        packages:
+          type: object
+          properties:
+            apt: { type: array, items: { type: string } }
+            npm: { type: array, items: { type: string } }
+            pip: { type: array, items: { type: string } }
+            cargo: { type: array, items: { type: string } }
+            gem: { type: array, items: { type: string } }
+            go: { type: array, items: { type: string } }
+        networking:
+          oneOf:
+            - type: object
+              required: [type]
+              properties:
+                type: { const: unrestricted }
+            - type: object
+              required: [type, allowed_hosts]
+              properties:
+                type: { const: limited }
+                allowed_hosts: { type: array, maxItems: 256, items: { type: string } }
+                allow_package_managers: { type: boolean }
+                allow_mcp_servers: { type: boolean }
+        isolation: { type: string, enum: [gvisor, microvm, runc] }
+    EnvironmentCreate:
+      type: object
+      required: [name, config]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 256 }
+        description: { type: [string, "null"], maxLength: 2048 }
+        config: { $ref: "#/components/schemas/EnvironmentConfig" }
+        metadata: { type: object, additionalProperties: { type: string } }
+    EnvironmentUpdate:
+      type: object
+      properties:
+        name: { type: [string, "null"], minLength: 1, maxLength: 256 }
+        description: { type: [string, "null"], maxLength: 2048 }
+        config: { $ref: "#/components/schemas/EnvironmentConfig", description: 整体替换 }
+        metadata: { type: [object, "null"], additionalProperties: { type: [string, "null"] }, description: 按键合并 }
+
+    Session:
+      type: object
+      required: [id, type, agent, status]
+      properties:
+        id: { type: string }
+        type: { const: session }
+        agent:
+          type: object
+          additionalProperties: true
+          description: 建会话时固化的 agent 快照（含 id/name/model/system/tools 等）
+        environment_id: { type: string }
+        status: { type: string, enum: [idle, running, rescheduling, terminated] }
+        stop_reason: { type: [object, "null"], additionalProperties: true }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            cache_read_input_tokens: { type: integer }
+        resources: { type: array, items: { $ref: "#/components/schemas/SessionResource" } }
+        vault_ids: { type: array, items: { type: string } }
+        title: { type: [string, "null"] }
+        metadata: { type: object, additionalProperties: { type: string } }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        archived_at: { type: [string, "null"], format: date-time }
+    SessionCreate:
+      type: object
+      required: [agent]
+      properties:
+        agent:
+          oneOf:
+            - type: string
+              description: "agent id（建会话时快照最新版本）"
+            - type: object
+              required: [type, id]
+              properties:
+                type: { const: agent }
+                id: { type: string }
+                version: { type: integer, minimum: 1 }
+            - type: object
+              required: [type, agent]
+              properties:
+                type: { const: agent_with_overrides }
+                agent:
+                  oneOf:
+                    - type: string
+                    - type: object
+                      required: [id]
+                      properties: { id: { type: string }, version: { type: integer, minimum: 1 } }
+                system: { type: [string, "null"], maxLength: 100000 }
+                tools: { type: array, items: {} }
+                mcp_servers: { type: array, items: { type: object, additionalProperties: true } }
+                model: {}
+        environment_id: { type: string }
+        title: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        resources: { type: array, items: { $ref: "#/components/schemas/SessionResourceMount" } }
+        vault_ids: { type: array, items: { type: string } }
+        initial_events:
+          type: array
+          maxItems: 50
+          description: 仅接受 user.message（建会话时立即排队执行）
+          items: { type: object, additionalProperties: true }
+    SessionUpdate:
+      type: object
+      properties:
+        title: { type: [string, "null"] }
+        metadata: { type: object, additionalProperties: true }
+        tools: { type: array, items: { type: string }, description: 仅 idle 可改，整体替换 }
+        mcp_servers: { type: array, items: { type: object, additionalProperties: true } }
+    SessionResource:
+      type: object
+      description: file → 挂载 mount_path；memory_store → 固定 /mnt/memory/<slug>；skill → 固定 /workspace/skills/<directory>
+      required: [type, mount_path]
+      properties:
+        type: { type: string, enum: [file, memory_store, skill] }
+        file_id: { type: string }
+        mount_path: { type: string }
+        memory_store_id: { type: string }
+        read_only: { type: boolean }
+        skill_id: { type: string }
+        skill_version: { type: [integer, "null"] }
+    SessionResourceMount:
+      type: object
+      additionalProperties: true
+      properties:
+        type: { type: string, enum: [file, memory_store, skill] }
+        file_id: { type: string }
+        mount_path: { type: string }
+        memory_store_id: { type: string }
+        read_only: { type: boolean }
+        skill_id: { type: string }
+        version: { type: integer }
+
+    SessionEvent:
+      type: object
+      description: payload 在顶层展开（content/subtype/usage 等）；排队事件 seq/processed_at 为 null
+      required: [id, type]
+      properties:
+        id: { type: string }
+        type: { type: string, examples: [user.message, agent.message, session.status_running, session.status_idle, session.usage] }
+        seq: { type: [integer, "null"] }
+        processed_at: { type: [string, "null"], format: date-time }
+        received_at: { $ref: "#/components/schemas/Timestamp" }
+    EventsSend:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          minItems: 1
+          maxItems: 10
+          description: 整批原子；仅用户事件；requires_action 时只接受 tool_confirmation/interrupt
+          items:
+            oneOf:
+              - type: object
+                required: [type, content]
+                properties:
+                  type: { const: user.message }
+                  content:
+                    type: array
+                    minItems: 1
+                    maxItems: 20
+                    items:
+                      type: object
+                      additionalProperties: true
+                      required: [type]
+                      properties:
+                        type: { type: string, enum: [text, image, document] }
+                        text: { type: string }
+              - type: object
+                required: [type]
+                properties:
+                  type: { const: user.interrupt }
+              - type: object
+                required: [type, tool_use_id, result]
+                properties:
+                  type: { const: user.tool_confirmation }
+                  tool_use_id: { type: string }
+                  result: { type: string, enum: [allow, deny] }
+                  deny_message: { type: string, maxLength: 4000 }
+
+    FileObject:
+      type: object
+      required: [id, type, filename, bytes]
+      properties:
+        id: { type: string }
+        type: { const: file }
+        filename: { type: string }
+        bytes: { type: integer }
+        content_type: { type: [string, "null"] }
+        sha256: { type: string }
+        scope: { type: [string, "null"] }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+
+    Vault:
+      type: object
+      required: [id, type, name]
+      properties:
+        id: { type: string }
+        type: { const: vault }
+        name: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        credentials:
+          type: array
+          items: { $ref: "#/components/schemas/Credential" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        archived_at: { type: [string, "null"], format: date-time }
+    VaultCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        metadata: { type: object, additionalProperties: true }
+    Credential:
+      type: object
+      required: [id, type]
+      properties:
+        id: { type: string }
+        type: { const: credential }
+        name: { type: [string, "null"] }
+        credential_type: { type: string, enum: [static_bearer, bearer, environment_variable] }
+        masked_value: { type: string, examples: ["***ab12"] }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        archived_at: { type: [string, "null"], format: date-time }
+    CredentialCreate:
+      type: object
+      additionalProperties: true
+      required: [credential_type]
+      properties:
+        credential_type: { type: string, enum: [static_bearer, bearer, environment_variable] }
+        name: { type: string }
+        token: { type: string, description: static_bearer / bearer 的机密 }
+        env_var: { type: string, description: environment_variable 的变量名 }
+    CredentialRotate:
+      type: object
+      additionalProperties: true
+      description: 只允许携带机密字段（token / env_var），身份键与 type 不可变
+      properties:
+        token: { type: string }
+        env_var: { type: string }
+
+    MemoryStore:
+      type: object
+      required: [id, type, name, slug]
+      properties:
+        id: { type: string }
+        type: { const: memory_store }
+        name: { type: string }
+        slug: { type: string }
+        description: { type: [string, "null"] }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        archived_at: { type: [string, "null"], format: date-time }
+    MemoryStoreCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 255 }
+        description: { type: string }
+    Memory:
+      type: object
+      required: [id, type, path]
+      properties:
+        id: { type: string }
+        type: { const: memory }
+        path: { type: string, examples: ["notes/quarterly.md"] }
+        content: { type: [string, "null"] }
+        content_sha256: { type: [string, "null"], pattern: "^[0-9a-f]{64}$" }
+        head_version: { type: integer, minimum: 1 }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+    MemoryUpsert:
+      type: object
+      required: [path, content]
+      properties:
+        path: { type: string, maxLength: 1024 }
+        content: { type: string, maxLength: 102400, description: ≤100KiB（UTF-8 字节） }
+        precondition:
+          type: object
+          required: [type, content_sha256]
+          properties:
+            type: { const: content_sha256 }
+            content_sha256: { type: string, pattern: "^[0-9a-f]{64}$", description: 期望的 head 内容哈希；不一致 409 }
+    MemoryListItem:
+      oneOf:
+        - $ref: "#/components/schemas/Memory"
+        - type: object
+          required: [type, prefix]
+          properties:
+            type: { const: memory_prefix }
+            prefix: { type: string }
+    MemoryVersion:
+      type: object
+      required: [id, type, version]
+      properties:
+        id: { type: string }
+        type: { const: memory_version }
+        version: { type: integer, minimum: 1 }
+        path: { type: [string, "null"] }
+        content: { type: [string, "null"] }
+        content_sha256: { type: [string, "null"] }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        redacted_at: { type: [string, "null"], format: date-time }
+
+    Skill:
+      type: object
+      required: [id, type, directory]
+      properties:
+        id: { type: string }
+        type: { const: skill }
+        directory: { type: string }
+        description: { type: [string, "null"] }
+        source: { type: string, enum: [user, zai] }
+        latest_version: { type: integer, minimum: 1 }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+        archived_at: { type: [string, "null"], format: date-time }
+    SkillVersion:
+      type: object
+      required: [id, type, skill_id, version]
+      properties:
+        id: { type: string }
+        type: { const: skill_version }
+        skill_id: { type: string }
+        version: { type: integer, minimum: 1 }
+        sha256: { type: string }
+        bytes: { type: integer }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+
+    Deployment:
+      type: object
+      required: [id, type, agent, environment_id, status]
+      properties:
+        id: { type: string }
+        type: { const: deployment }
+        agent:
+          type: object
+          required: [type, id, version]
+          description: 创建时固定的 agent 版本引用
+          properties:
+            type: { const: agent }
+            id: { type: string }
+            version: { type: integer, minimum: 1 }
+        environment_id: { type: string }
+        schedule: { type: [string, "null"], examples: ["*/10 * * * *"], description: 5 字段 cron；相邻触发间隔 ≥5 分钟；时区固定 Asia/Shanghai }
+        timezone: { type: string, examples: ["Asia/Shanghai"] }
+        input: { type: [object, "null"], additionalProperties: true }
+        status: { type: string, enum: [active, paused, archived] }
+        upcoming_runs_at:
+          type: array
+          maxItems: 5
+          items: { type: string, format: date-time }
+          description: 实时计算；paused/archived 为空
+        last_scheduled_at: { type: [string, "null"], format: date-time }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+    DeploymentCreate:
+      type: object
+      required: [agent, environment_id]
+      properties:
+        agent: { type: string, description: agent id（创建时固定 head 版本） }
+        environment_id: { type: string }
+        schedule: { type: [string, "null"], description: 缺省 null = 仅手动 run }
+        timezone: { type: string, description: 仅接受 Asia/Shanghai }
+        input: { type: object, additionalProperties: true }
+    DeploymentRun:
+      type: object
+      required: [id, type, deployment_id, trigger_type, status]
+      properties:
+        id: { type: string }
+        type: { const: deployment_run }
+        deployment_id: { type: string }
+        trigger_type: { type: string, enum: [manual, schedule] }
+        trigger_context: { type: [object, "null"], additionalProperties: true }
+        scheduled_for: { type: [string, "null"], format: date-time }
+        status: { type: string, enum: [pending, running, succeeded, failed] }
+        session_id: { type: [string, "null"] }
+        error: { type: [object, "null"], additionalProperties: true }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        finished_at: { type: [string, "null"], format: date-time }
+
+    Webhook:
+      type: object
+      required: [id, type, url]
+      properties:
+        id: { type: string }
+        type: { const: webhook }
+        url: { type: string, format: uri }
+        events: { type: array, items: { type: string }, description: 空数组 = 全部事件 }
+        active: { type: boolean }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+    WebhookCreated:
+      allOf:
+        - $ref: "#/components/schemas/Webhook"
+        - type: object
+          properties:
+            secret:
+              type: string
+              description: 仅创建响应回显一次（whsec_...，Standard Webhooks v1 签名密钥）
+    WebhookCreate:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri }
+        events: { type: array, items: { type: string } }
+    WebhookDelivery:
+      type: object
+      required: [id, type, webhook_id, status]
+      properties:
+        id: { type: string }
+        type: { const: webhook_delivery }
+        webhook_id: { type: string }
+        event_type: { type: string }
+        status: { type: string, enum: [pending, delivered, failed] }
+        attempts: { type: integer }
+        response_status: { type: [integer, "null"] }
+        next_attempt_at: { type: [string, "null"], format: date-time }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }

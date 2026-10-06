@@ -15,9 +15,10 @@
     "migrate": "pnpm --filter @mas/db migrate",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/db/tsconfig.json && tsc --noEmit -p packages/runtime/tsconfig.json && tsc --noEmit -p apps/server/tsconfig.json && tsc --noEmit -p apps/worker/tsconfig.json",
+    "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/sdk/tsconfig.json && tsc --noEmit -p packages/db/tsconfig.json && tsc --noEmit -p packages/runtime/tsconfig.json && tsc --noEmit -p apps/server/tsconfig.json && tsc --noEmit -p apps/worker/tsconfig.json",
     "smoke": "tsx scripts/smoke.ts",
-    "test:chaos": "tsx scripts/chaos.ts"
+    "test:chaos": "tsx scripts/chaos.ts",
+    "gen:sdk": "pnpm --filter @mas/sdk gen"
   },
   "devDependencies": {
     "@mas/core": "workspace:*",
@@ -25,16 +26,19 @@
     "@mas/egress": "workspace:*",
     "@mas/runtime": "workspace:*",
     "@mas/sandbox": "workspace:*",
+    "@mas/sdk": "workspace:*",
     "@mas/server": "workspace:*",
     "@mas/worker": "workspace:*",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.23.1",
+    "adm-zip": "^0.6.1",
     "fastify": "^5.12.5",
     "kysely": "^0.27.6",
+    "openapi-typescript": "^7.13.0",
     "pg": "^8.23.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
-    "adm-zip": "^0.6.1"
+    "yaml": "^2.9.1"
   }
 }

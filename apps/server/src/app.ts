@@ -48,6 +48,15 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   registerRateLimit(app);
   void app.register(multipart, { limits: { fileSize: Number(process.env.MAS_MAX_FILE_BYTES ?? 500 * 1024 * 1024) } });
 
+  // 路由登记表：OpenAPI 规范零漂移校验用（tests/openapi.test.ts 读取 app.masRoutes）
+  const masRoutes: { method: string; url: string }[] = [];
+  app.addHook("onRoute", (route) => {
+    for (const m of Array.isArray(route.method) ? route.method : [route.method]) {
+      masRoutes.push({ method: String(m).toUpperCase(), url: String(route.url) });
+    }
+  });
+  app.decorate("masRoutes", masRoutes);
+
   // 错误映射：MasError → 方言信封；zod → 400；其他 → 500（spec §11.1）
   app.setErrorHandler((err: unknown, req, reply) => {
     const requestId = req.mas?.requestId ?? "req_unknown";

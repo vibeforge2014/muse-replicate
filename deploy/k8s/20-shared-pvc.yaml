@@ -1,0 +1,19 @@
+# api 与 worker 必须共享同一文件/快照根（docs/OPS.md 环境变量表）。
+# local-path 为 RWO：单节点内多 Pod 可同时挂载（server+worker 同节点）。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mas-files
+  namespace: mas
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 20Gi } }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mas-snapshots
+  namespace: mas
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 20Gi } }

@@ -1,0 +1,146 @@
+# 可观测：Prometheus 抓 mas-server /internal/metrics + Grafana 看板自动供给。
+# 与 deploy/observability/（compose 形态）等价；看板 JSON 在 grafana-dashboards ConfigMap。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: mas
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: mas
+        metrics_path: /internal/metrics
+        static_configs:
+          - targets: ["mas-server:8080"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: mas
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: prometheus } }
+  template:
+    metadata:
+      labels: { app: prometheus }
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.53.0
+          args: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+          volumeMounts: [{ name: config, mountPath: /etc/prometheus }, { name: data, mountPath: /prometheus }]
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: mas
+data:
+  prometheus.yml: |
+    apiVersion: 1
+    datasources:
+      - name: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards-provider
+  namespace: mas
+data:
+  mas.yml: |
+    apiVersion: 1
+    providers:
+      - name: mas
+        folder: MAS
+        type: file
+        options:
+          path: /etc/grafana/provisioning/dashboards-json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards-json
+  namespace: mas
+data:
+  mas-overview.json: |
+    {
+      "title": "MAS Overview", "uid": "mas-overview", "timezone": "browser", "refresh": "15s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        { "id": 1, "title": "API QPS（按路由）", "type": "timeseries", "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+          "targets": [{ "expr": "sum(rate(mas_api_requests_total[1m])) by (route)", "legendFormat": "{{route}}" }] },
+        { "id": 2, "title": "API 5xx 速率", "type": "timeseries", "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+          "targets": [{ "expr": "sum(rate(mas_api_requests_total{code=~\"5..\"}[5m]))", "legendFormat": "5xx/s" }] },
+        { "id": 3, "title": "平均延迟（按路由）", "type": "timeseries", "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+          "targets": [{ "expr": "mas_api_latency_seconds_sum / mas_api_latency_seconds_count", "legendFormat": "{{route}}" }] },
+        { "id": 4, "title": "会话状态分布", "type": "timeseries", "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+          "targets": [{ "expr": "mas_sessions", "legendFormat": "{{status}}" }] },
+        { "id": 5, "title": "SSE 实时连接", "type": "stat", "gridPos": { "x": 0, "y": 16, "w": 6, "h": 6 },
+          "targets": [{ "expr": "mas_sse_connections" }] },
+        { "id": 6, "title": "出站拒绝（egress deny）", "type": "timeseries", "gridPos": { "x": 6, "y": 16, "w": 6, "h": 6 },
+          "targets": [{ "expr": "mas_egress_denied_total" }] },
+        { "id": 7, "title": "模型 token 计量（gateway）", "type": "timeseries", "gridPos": { "x": 12, "y": 16, "w": 12, "h": 6 },
+          "targets": [{ "expr": "mas_model_tokens_total", "legendFormat": "{{model}} {{kind}}" }] }
+      ],
+      "schemaVersion": 39, "version": 1
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: mas
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: grafana } }
+  template:
+    metadata:
+      labels: { app: grafana }
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.1.0
+          env:
+            - { name: GF_SECURITY_ADMIN_USER, value: admin }
+            - { name: GF_SECURITY_ADMIN_PASSWORD, value: admin }
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Viewer }
+          volumeMounts:
+            - { name: datasources, mountPath: /etc/grafana/provisioning/datasources }
+            - { name: dashboards-provider, mountPath: /etc/grafana/provisioning/dashboards }
+            - { name: dashboards-json, mountPath: /etc/grafana/provisioning/dashboards-json }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: datasources
+          configMap: { name: grafana-datasources }
+        - name: dashboards-provider
+          configMap: { name: grafana-dashboards-provider }
+        - name: dashboards-json
+          configMap: { name: grafana-dashboards-json }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-np
+  namespace: mas
+spec:
+  type: NodePort
+  selector: { app: grafana }
+  ports: [{ port: 3000, targetPort: 3000, nodePort: 31300 }]

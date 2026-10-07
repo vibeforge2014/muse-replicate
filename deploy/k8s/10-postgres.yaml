@@ -1,0 +1,45 @@
+# PG 事件日志/队列/元数据（spec §18.1）。生产：改 secret 注入凭据 + TLS。
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: mas
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: mas
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: mas }
+            - { name: POSTGRES_DB, value: mas_dev }
+            - { name: POSTGRES_HOST_AUTH_METHOD, value: trust }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "mas"] }
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            failureThreshold: 30
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 10Gi } }

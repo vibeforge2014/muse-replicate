@@ -1,0 +1,42 @@
+# session-worker：NOTIFY 驱动 + SKIP LOCKED claim，可水平扩副本（spec §4.1/§5.6）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mas-worker
+  namespace: mas
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mas-worker } }
+  template:
+    metadata:
+      labels: { app: mas-worker }
+    spec:
+      initContainers:
+        - name: wait-postgres # k8s 无 depends_on：TCP 探测直到 PG 就绪
+          image: mas-server:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - -e
+            - "const net=require('node:net');function t(){const s=net.connect({port:5432,host:'postgres'});s.on('connect',()=>{console.log('pg up');process.exit(0)});s.on('error',()=>setTimeout(t,1000))}t()"
+      containers:
+        - name: worker
+          image: mas-server:latest # 与 server 同镜像，command 覆盖
+          imagePullPolicy: IfNotPresent
+          command: ["npx", "tsx", "apps/worker/src/main.ts"]
+          env:
+            - { name: DATABASE_URL, value: "postgres://mas@postgres:5432/mas_dev" }
+            - { name: MAS_FILES_DIR, value: /var/mas/files }
+            - { name: MAS_SNAPSHOT_DIR, value: /var/mas/snapshots }
+            # - { name: MAS_WARM_POOL_MIN, value: "2" }
+          volumeMounts:
+            - { name: files, mountPath: /var/mas/files }
+            - { name: snapshots, mountPath: /var/mas/snapshots }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: files
+          persistentVolumeClaim: { claimName: mas-files }
+        - name: snapshots
+          persistentVolumeClaim: { claimName: mas-snapshots }

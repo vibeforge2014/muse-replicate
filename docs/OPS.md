@@ -17,6 +17,8 @@
 
 docker compose：`docker compose -f deploy/compose/docker-compose.yml up --build`（宿主端口冲突时 `MAS_PORT=18090` 前缀）。
 
+**k3s/K8s 形态**（`deploy/k8s/`，单节点清单）：`k3s kubectl apply -f deploy/k8s/`。API NodePort 30080、Grafana 31300；server/worker 共享 `mas-files`/`mas-snapshots` PVC（local-path RWO 单节点内多 Pod 可挂）；无镜像仓库时 `docker save mas-server:latest | k3s ctr images import -`；国内网络在 `/etc/rancher/k3s/registries.yaml` 给 docker.io 配加速器。已在 Debian 13 + k3s v1.36 实测（smoke PASS、Prometheus 抓取 up、Grafana 看板自动供给）。注意两点实测坑：k8s 无 depends_on——server/worker 带 initContainer TCP 等 PG；`/internal/metrics` 含 PG 聚合查询，readiness 探针超时需 ≥5s（慢盘宿主）。
+
 部署后验收（对运行实例走一轮真实会话回路 + 指标端点检查）：
 
 ```bash

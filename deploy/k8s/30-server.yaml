@@ -1,0 +1,70 @@
+# api：全部 /v1/* + 进程内 Deployments/Webhook 调度器（单副本，OPS §1）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: mas-server
+  namespace: mas
+spec:
+  selector: { app: mas-server }
+  ports: [{ port: 8080, targetPort: 8080 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mas-server-np
+  namespace: mas
+spec:
+  type: NodePort
+  selector: { app: mas-server }
+  ports: [{ port: 8080, targetPort: 8080, nodePort: 30080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mas-server
+  namespace: mas
+spec:
+  replicas: 1
+  strategy: { type: Recreate } # 单副本滚动会双活（调度器单实例假设）
+  selector: { matchLabels: { app: mas-server } }
+  template:
+    metadata:
+      labels: { app: mas-server }
+    spec:
+      initContainers:
+        - name: wait-postgres # k8s 无 depends_on：TCP 探测直到 PG 就绪
+          image: mas-server:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - -e
+            - "const net=require('node:net');function t(){const s=net.connect({port:5432,host:'postgres'});s.on('connect',()=>{console.log('pg up');process.exit(0)});s.on('error',()=>setTimeout(t,1000))}t()"
+      containers:
+        - name: server
+          image: mas-server:latest
+          imagePullPolicy: IfNotPresent # 无仓库时靠 ctr 导入
+          command: ["npx", "tsx", "apps/server/src/main.ts"]
+          env:
+            - { name: DATABASE_URL, value: "postgres://mas@postgres:5432/mas_dev" }
+            - { name: PORT, value: "8080" }
+            - { name: HOST, value: "0.0.0.0" }
+            - { name: MAS_FILES_DIR, value: /var/mas/files }
+            - { name: MAS_SNAPSHOT_DIR, value: /var/mas/snapshots }
+          ports: [{ containerPort: 8080 }]
+          volumeMounts:
+            - { name: files, mountPath: /var/mas/files }
+            - { name: snapshots, mountPath: /var/mas/snapshots }
+          readinessProbe:
+            httpGet: { path: /internal/metrics, port: 8080 } # 内含 PG 聚合查询，慢盘宿主需放宽超时
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: files
+          persistentVolumeClaim: { claimName: mas-files }
+        - name: snapshots
+          persistentVolumeClaim: { claimName: mas-snapshots }

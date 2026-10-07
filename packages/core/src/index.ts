@@ -10,3 +10,4 @@ export * from "./schemas/environment.js";
 export * from "./schemas/event.js";
 export * from "./schemas/session.js";
 export * from "./schemas/memory.js";
+export * from "./otel.js";

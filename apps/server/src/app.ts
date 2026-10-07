@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import multipart from "@fastify/multipart";
 import { ZodError } from "zod";
-import { MasError, errAuth } from "@mas/core";
+import { MasError, configureOtel, errAuth } from "@mas/core";
 import { authenticate, type DbHandle } from "@mas/db";
 import { requestContextHook, sendErrorEnvelope } from "./plugins/context.js";
 import { registerRateLimit } from "./plugins/ratelimit.js";
@@ -25,6 +25,8 @@ export interface BuildAppOptions {
 }
 
 export function buildApp(opts: BuildAppOptions): FastifyInstance {
+  // OTel（spec §16）：MAS_OTLP_ENDPOINT 设置时开启 span 导出（幂等，测试可重复构建）
+  configureOtel(process.env);
   const app = Fastify({
     logger: process.env.MAS_LOG === "0" ? false : { level: process.env.MAS_LOG_LEVEL ?? "warn" },
     genReqId: () => `req_${Math.floor(Math.random() * 1e9).toString(36)}${Date.now().toString(36)}`,
@@ -32,6 +34,16 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   });
 
   app.addHook("onRequest", requestContextHook);
+  // 请求 span 收口（requestContextHook 起的 mas.api.request 在响应时结束）
+  app.addHook("onResponse", async (req, reply) => {
+    const span = req.mas?.span;
+    if (span) {
+      span.end(reply.statusCode < 500, {
+        "http.route": req.routeOptions?.url ?? req.url,
+        "http.response.status_code": reply.statusCode,
+      });
+    }
+  });
 
   // 鉴权（Authorization: Bearer 或 x-api-key；spec §11.1）
   app.addHook("preHandler", async (req, reply) => {

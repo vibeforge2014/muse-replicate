@@ -63,6 +63,8 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_CODEX_BIN` | `codex`（PATH） | 真实 driver 的 codex 可执行文件路径（如 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`） |
 | `MAS_CODEX_AUTH_FILE` | `~/.codex/auth.json` | 每会话 CODEX_HOME 复制的登录凭据来源（存在才复制；机密绝不进 checkpoint 归档） |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | codex 后端（chatgpt.com）可达性；受限网络下 worker 进程需可出站代理 |
+| `MAS_OTLP_ENDPOINT` | –（关） | OTLP/HTTP JSON 导出端点（如 `http://otel-collector:4318`）；设置后 api/worker 导出链路 span（见 §5），导出失败仅丢批 |
+| `MAS_OTLP_SERVICE_NAME` | `mas` | OTel resource 的 `service.name`（api 与 worker 可分别命名） |
 
 ## 2. 备份与恢复
 
@@ -106,4 +108,12 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 
 model-gateway 另有 `GET /internal/metrics`：`mas_model_tokens_total{model,kind}`（input/output/cached 累计），按模型核对上游账单。
 
-未在本 MVP 实现的观测项（OTel 链路、Grafana 看板、告警规则文件）见 README「后续路线」。
+### 链路追踪（spec §16）
+
+设置 `MAS_OTLP_ENDPOINT`（api 与 worker 进程启动时读取）后，按 OTLP/HTTP JSON 导出到任意标准 collector（OTel Collector / Tempo / Jaeger 的 4318 口都收 `/v1/traces`）：
+
+- `mas.api.request`：api 每请求一个 span，父 = 入口 `traceparent` 头（无头则起新 trace）；属性含 method/route/status；
+- `mas.worker.execution`：worker 每执行一个 span，**父 = `session_executions.traceparent` 列携带的上下文**——「traceparent 跟随 command」：调用方带 `traceparent` 头 POST 事件 → 落 execution 行 → 任意 worker claim 后接续同一条 trace（api → PG → worker 跨进程串联，不依赖进程间直连）；
+- `mas.worker.turn_loop`：execution 下的 driver 交互子 span，属性 `outcome=turn_done|awaiting_approval|fence_lost`。
+
+端到端断言见 `tests/otel.test.ts`（本地起 OTLP 接收器，验证四层父子串联 + OTLP 报文格式）。未实现：Grafana 看板、告警规则文件（README「后续路线」）。

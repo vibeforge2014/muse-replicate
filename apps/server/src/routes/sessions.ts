@@ -20,6 +20,7 @@ import {
 } from "@mas/db";
 import type { RouteCtx } from "./agents.js";
 import { withIdempotency } from "../plugins/idempotent-route.js";
+import { requestTraceparent } from "../plugins/context.js";
 
 export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void {
   app.post("/v1/sessions", async (req, reply) =>
@@ -190,6 +191,7 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
         sessionId,
         workspaceId: ws,
         events,
+        traceparent: requestTraceparent(req),
         executionKind: "user_message",
       });
     }

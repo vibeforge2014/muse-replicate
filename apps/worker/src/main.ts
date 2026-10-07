@@ -1,4 +1,5 @@
 import { Client } from "pg";
+import { configureOtel } from "@mas/core";
 import { createDb, runMigrations, sessionsWithWork } from "@mas/db";
 import { WarmPoolProvider, type SandboxProvider } from "@mas/sandbox";
 import { SessionRunner } from "./session-runner.js";
@@ -10,6 +11,7 @@ import { driverFromEnv, sandboxProviderFromEnv } from "./driver.js";
  * - SKIP LOCKED claim，多 worker 安全。
  */
 async function main() {
+  configureOtel(process.env); // spec §16：MAS_OTLP_ENDPOINT 设置时导出 worker span
   const db = createDb();
   await runMigrations(db.pool);
   const driver = driverFromEnv();

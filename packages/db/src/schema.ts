@@ -105,6 +105,8 @@ export interface ExecutionRow {
   delivered_at: Date | null;
   settled_at: Date | null;
   failure: Record<string, unknown> | null;
+  /** api 入口请求的 W3C traceparent（OTel 跨进程链路，spec §16）。 */
+  traceparent: string | null;
   revision: Generated<number>;
 }
 export interface FileRow {

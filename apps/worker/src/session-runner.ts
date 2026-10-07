@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { sql, type Kysely } from "kysely";
-import { newId, memoryPathError, type SessionEventJson } from "@mas/core";
+import { newId, memoryPathError, spanTraceparent, startSpan, type SessionEventJson, type Span } from "@mas/core";
 import type { Database } from "@mas/db";
 import {
   appendEvent,
@@ -115,11 +115,41 @@ export class SessionRunner {
     }
   }
 
-  /** 返回 true 表示同会话还有后续工作。 */
+  /**
+   * 执行 span 包装（spec §16：worker 以 execution.traceparent 为父）。
+   * 结束时回读 session_executions.state 作为终态，异常按 error 结束。
+   */
   private async runExecution(
+    sessionId: string,
+    exec: { id: string; generation: number; kind: string; input_event_ids: string[]; interrupt_requested_at: Date | null; delivered_at: Date | null; traceparent: string | null },
+    attemptId: string,
+  ): Promise<boolean> {
+    const span: Span = startSpan(
+      "mas.worker.execution",
+      { worker_id: this.workerId, session_id: sessionId, execution_id: exec.id, kind: exec.kind, attempt: attemptId },
+      exec.traceparent,
+    );
+    try {
+      const more = await this.runExecutionInner(sessionId, exec, attemptId, span);
+      const row = await this.db
+        .selectFrom("session_executions")
+        .select("state")
+        .where("id", "=", exec.id)
+        .executeTakeFirst();
+      span.end(row?.state !== "failed", { final_state: row?.state ?? "unknown", more_work: more });
+      return more;
+    } catch (e) {
+      span.end(false, { error: String((e as Error).message).slice(0, 200) });
+      throw e;
+    }
+  }
+
+  /** 返回 true 表示同会话还有后续工作。 */
+  private async runExecutionInner(
     sessionId: string,
     exec: { id: string; generation: number; kind: string; input_event_ids: string[]; interrupt_requested_at: Date | null; delivered_at: Date | null },
     attemptId: string,
+    parentSpan: Span,
   ): Promise<boolean> {
     const executionId = exec.id;
     const generation = exec.generation;
@@ -292,10 +322,18 @@ export class SessionRunner {
     }
 
     // 4) 事件循环：续约、中断、归一化事件 → 对外事件（spec §12.1）
+    // driver 子 span：覆盖与 runtime 的整个交互（send → nextEvent 循环 → 终态）
+    const loopSpan = startSpan(
+      "mas.worker.turn_loop",
+      { session_id: sessionId, execution_id: executionId },
+      spanTraceparent(parentSpan),
+    );
+    try {
     for (;;) {
       if (fenceLost) {
         await held.handle.stop("fence lost");
         this.runtimes.delete(sessionId);
+        loopSpan.end(false, { outcome: "fence_lost" });
         return false;
       }
       const ev = await this.driver.nextEvent(held.handle, TICK_MS);
@@ -303,6 +341,7 @@ export class SessionRunner {
         const done = await this.onRuntimeEvent(sessionId, executionId, generation, attemptId, held, ev, append);
         if (done !== null) {
           await settleExecution(this.db, executionId, generation, attemptId, { state: "completed" });
+          loopSpan.end(true, { outcome: done });
           if (done === "turn_done") {
             // 轮末持久化：watermark + checkpoint（spec §9.4 / §14.2.1）
             await this.checkpointTurn(sessionId, executionId, generation, attemptId);
@@ -328,6 +367,9 @@ export class SessionRunner {
           await this.driver.send(held.handle, { type: "interrupt" });
         }
       }
+    }
+    } finally {
+      loopSpan.end(); // 兜底收口（正常路径已在上方带 outcome 结束；幂等）
     }
   }
 

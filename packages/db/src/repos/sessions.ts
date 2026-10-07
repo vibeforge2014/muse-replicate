@@ -121,6 +121,8 @@ export interface AdmitInput {
   executionKind: "user_message" | "tool_confirmation" | "custom_tool_result" | "interrupt";
   leaseSeconds?: number;
   deadlineHours?: number;
+  /** api 入口请求的 W3C traceparent：跟随 command（execution）供 worker 接续链路（spec §16）。 */
+  traceparent?: string | null;
 }
 
 export interface AdmitResult {
@@ -235,6 +237,7 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
         input_fingerprint: fingerprintOf(input.events),
         state: "queued",
         deadline_at: new Date(Date.now() + deadlineHours * 3600_000),
+        traceparent: input.traceparent ?? null,
       }).execute();
     } else if (!interruptAccepted) {
       // idle 时单独的 interrupt：没有活跃 execution → 直接定序写入历史（EVT-S09）

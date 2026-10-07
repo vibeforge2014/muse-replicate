@@ -395,4 +395,12 @@ CREATE TABLE IF NOT EXISTS rate_limit_buckets (
 );
 `,
   },
+  {
+    name: "0013_execution_traceparent",
+    sql: `
+-- OTel 链路（spec §16）：traceparent 跟随 command——api 准入时把入口请求的
+-- W3C traceparent 写在 execution 上，worker claim 后以其为父 span（经 PG 串联）。
+ALTER TABLE session_executions ADD COLUMN IF NOT EXISTS traceparent text;
+`,
+  },
 ];

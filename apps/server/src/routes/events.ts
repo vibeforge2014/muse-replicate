@@ -13,6 +13,7 @@ import {
 import type { Database } from "@mas/db";
 import { admitEvents, getSessionRow, listEvents, appendApiEvent } from "@mas/db";
 import { beginIdempotent, finishIdempotent } from "../plugins/idempotency.js";
+import { requestTraceparent } from "../plugins/context.js";
 import { parseTimeFilter } from "@mas/core";
 import type { RouteCtx } from "./agents.js";
 
@@ -104,10 +105,12 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       type: e.type,
       payload: e as Record<string, unknown>,
     }));
+    // 追踪（spec §16）：入口 traceparent 跟随 command 落到 execution，worker 以其为 parent
     const admitted = await admitEvents(ctx.db, {
       sessionId: id,
       workspaceId: ws,
       events: rows,
+      traceparent: requestTraceparent(req),
       executionKind: interruptExecution
         ? "interrupt"
         : kind === "tool_confirmation"

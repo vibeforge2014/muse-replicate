@@ -45,7 +45,8 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
     req.mas.auth = auth;
   });
 
-  registerRateLimit(app);
+  // 限流后端（spec §13.4 / 偏差 #3）：默认内存（零开销）；MAS_RATELIMIT_BACKEND=pg 时多实例一致
+  registerRateLimit(app, process.env.MAS_RATELIMIT_BACKEND === "pg" ? opts.db.db : undefined);
   void app.register(multipart, { limits: { fileSize: Number(process.env.MAS_MAX_FILE_BYTES ?? 500 * 1024 * 1024) } });
 
   // 路由登记表：OpenAPI 规范零漂移校验用（tests/openapi.test.ts 读取 app.masRoutes）

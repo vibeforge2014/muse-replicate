@@ -46,6 +46,7 @@ export async function setupEnv(): Promise<TestEnv> {
     "memory_stores",
     "credentials",
     "vaults",
+    "rate_limit_buckets",
     "sandbox_orphans",
     "idempotency_keys",
     "session_resources",

@@ -263,6 +263,12 @@ export interface WebhookDeliveryRow {
   delivered_at: Date | null;
   created_at: Generated<Date>;
 }
+export interface RateLimitBucketRow {
+  bucket_key: string;
+  tokens: number;
+  last_refill: Generated<Date>;
+  updated_at: Generated<Date>;
+}
 export interface IdempotencyKeyRow {
   workspace_id: string;
   key: string;
@@ -322,6 +328,7 @@ export interface Database {
   deployment_runs: DeploymentRunRow;
   webhooks: WebhookRow;
   webhook_deliveries: WebhookDeliveryRow;
+  rate_limit_buckets: RateLimitBucketRow;
   idempotency_keys: IdempotencyKeyRow;
   session_internal_events: SessionInternalEventRow;
   workspace_checkpoints: WorkspaceCheckpointRow;

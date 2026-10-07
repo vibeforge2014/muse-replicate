@@ -18,7 +18,7 @@
 | 审批流 | ✅ | `always_ask` → `requires_action` → `user.tool_confirmation`（TOOL-04~11） |
 | 持久化中断 | ✅ | running 中断 / requires_action 作废未决审批（TOOL-09/15） |
 | SSE 实时流 | ✅ | LISTEN/NOTIFY、15s 心跳、Last-Event-ID 回补、只推实时、session.deleted 关闭（§11.5 / EVT-R） |
-| 鉴权 / 错误信封 / request-id / 限流 | ✅ | 方言检测（zai-* / anthropic-*），BigModel 409 → invalid_request_error（§11.1） |
+| 鉴权 / 错误信封 / request-id / 限流 | ✅ | 方言检测（zai-* / anthropic-*），BigModel 409 → invalid_request_error（§11.1）；限流可切 PG 后端（`MAS_RATELIMIT_BACKEND=pg`，RL-PG-01~03） |
 | Checkpoint 提交协议 | ✅ | 轮末不可变候选（json.gz/v1）+ sha256 校验 + fence CAS 发布 + GC keep=3（§9.4） |
 | 水位线恢复 | ✅ | 水位线+digest 一致 → Level 1 原生 resume；不一致 → Level 0 语义重放（仅 user/agent 消息）+ `runtime.recovered` 内部事件（§14.2.1 / REC-01~06） |
 | Worker 接管语义 | ✅ | 已 delivered 的过期租约不重放用户消息（terminal error）；持久化中断被接管方遵守（REC-01/02） |
@@ -76,7 +76,7 @@
 
 1. runtime 为 FakeCodexDriver（本机子进程 + `/tmp` rollout），非沙箱内 `codex app-server`；协议形态一致（initialize/thread/start/turn/start/item/*/turn/completed），替换真实 driver 不动 worker。
 2. api 在 `requires_action` 等状态下可能从快照读 stop_reason 而非事件推导（物化视图已同步维护）。
-3. 限流为单进程内存令牌桶；多实例部署需换 PG/Redis（spec §13.4 预留）。
+3. ~~限流为单进程内存令牌桶；多实例部署需换 PG/Redis（spec §13.4 预留）~~ 已收尾：`MAS_RATELIMIT_BACKEND=pg` 切换为 `rate_limit_buckets` 行锁令牌桶（事务内 FOR UPDATE 串行化、elapsed 由 DB 时钟计算——多实例时钟偏移免疫、DB 故障 fail-open）；默认仍为 memory（单实例零开销）。
 4. checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。
 5. File 内容与 output 对象存本地 FS（`MAS_FILES_DIR`，默认 `/tmp/mas-files`）而非 MinIO；Key 布局与 spec 一致（`files/{org}/{file_id}`、`outputs/{session}/{sha256}`），换 S3 实现即可。
 6. egress-proxy MVP 只处理 HTTP 绝对 URI 形态（无 CONNECT/TLS 终止）；真实部署需镜像预置企业 CA、代理按 SNI 签发证书（§10.1）。worker 侧 prepare/attach/revoke 生命周期接线随真实沙箱宿主落地。
@@ -91,4 +91,4 @@
 
 ## 后续路线（按 plan.md）
 
-M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 139/139 绿）→ M6 W11-W13 已完成：Memory Store、Skills、Deployments、Webhooks → plan 5.7 已完成：OpenAPI 3.1 规范 + @mas/sdk（74 路由零漂移）、warm pool 最小实现（FakeSandboxProvider 预热池 + attach 迟绑定，MAS_WARM_POOL_MIN 开关）→ custom tools 端到端（CT-01~05）+ multipart 幂等收尾（偏差 #10 关闭）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、K8s CRD provider / multiagent lanes / outcomes。
+M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 139/139 绿）→ M6 W11-W13 已完成：Memory Store、Skills、Deployments、Webhooks → plan 5.7 已完成：OpenAPI 3.1 规范 + @mas/sdk（74 路由零漂移）、warm pool 最小实现（FakeSandboxProvider 预热池 + attach 迟绑定，MAS_WARM_POOL_MIN 开关）→ custom tools 端到端（CT-01~05）+ multipart 幂等收尾（偏差 #10 关闭）→ PG 限流后端（偏差 #3 关闭，RL-PG-01~03，159 测试全绿）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、K8s CRD provider / multiagent lanes / outcomes。

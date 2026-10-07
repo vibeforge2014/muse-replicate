@@ -179,7 +179,7 @@ catch (e) { if (e instanceof MasApiError) console.log(e.status, e.errorType); } 
 ## 测试与验证
 
 ```bash
-pnpm test            # 156 个集成用例（真实 PG + 真实 HTTP + 假沙箱 runtime）
+pnpm test            # 159 个集成用例（真实 PG + 真实 HTTP + 假沙箱 runtime）
 pnpm test:chaos 200  # 确定性混沌门禁：200 个种子并发注入（双收/租约强过期/陈旧 fence），六不变量逐步断言
 pnpm typecheck       # 6 个工程 TypeScript strict 全量检查
 ```
@@ -226,6 +226,7 @@ spec.md · plan.md · test-case-plan.md   # 架构规格 / 执行计划 / 验收
 | `MAS_INTERNAL_TOKEN` | 未设置=开放 | `/internal/*`（metrics/debug）门禁 |
 | `MAS_SANDBOX_ISOLATION` | `gvisor` | Fake provider 声明的隔离等级 |
 | `MAS_WARM_POOL_MIN` | `0`（关） | worker 沙箱预热池保温数量 |
+| `MAS_RATELIMIT_BACKEND` | `memory` | 限流后端：`pg` = 多实例一致的行锁令牌桶（`rate_limit_buckets`），DB 故障 fail-open |
 
 完整列表与部署形态、备份恢复、故障排查见 **[docs/OPS.md](docs/OPS.md)**。
 
@@ -243,7 +244,7 @@ spec.md · plan.md · test-case-plan.md   # 架构规格 / 执行计划 / 验收
 ## 实现状态
 
 **已落地**：MVP 核心 → 审批/中断/checkpoint 恢复 → Vault/Files/egress → 幂等/指标/运维 →
-model-gateway → 混沌门禁 → Memory Store / Skills / Deployments / Webhooks → OpenAPI + SDK → warm pool → custom tools（含 multipart 幂等收尾）。
+model-gateway → 混沌门禁 → Memory Store / Skills / Deployments / Webhooks → OpenAPI + SDK → warm pool → custom tools（含 multipart 幂等收尾）→ PG 限流后端。
 
 **进行中 / 规划**：egress TLS 终止与沙箱生命周期接线、OpenSandbox / K8s CRD provider、
 OTel 链路与压测、multiagent lanes、outcomes。

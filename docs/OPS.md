@@ -32,7 +32,8 @@ docker compose：`docker compose -f deploy/compose/docker-compose.yml up --build
 | `MAS_INTERNAL_TOKEN` | 未设置=开放 | `/internal/*`（metrics/debug）的门禁 |
 | `MAS_SANDBOX_ISOLATION` | `gvisor` | Fake provider 声明的隔离等级（协商用） |
 | `MAS_WARM_POOL_MIN` | `0`（关） | worker 预热池保温数量（spec §9.3）：>0 时沙箱 create 走快路径（预建空沙箱 attach 迟绑定），池空直落冷创建；关停时自动 drain 池内沙箱 |
-| `MAS_RATELIMIT_BURST` / `MAS_RATELIMIT_PER_MIN` | – | 限流令牌桶 |
+| `MAS_RATELIMIT_BACKEND` | `memory` | 限流后端：`memory`=单进程令牌桶（零开销，单实例部署）；`pg`=`rate_limit_buckets` 行锁令牌桶（事务 + FOR UPDATE 串行化并发，elapsed 由 DB 时钟计算——多实例时钟偏移免疫，`MAS_RATELIMIT_BURST` 只在测试/本地放宽）；DB 故障时 **fail-open**（可用性优先，warn 日志可观察） |
+| `MAS_RATELIMIT_BURST` / `MAS_RATELIMIT_PER_MIN` | – | 限流令牌桶（仅测试/本地放宽用；生产走 spec §11.1 默认值） |
 
 ## 2. 备份与恢复
 

@@ -382,4 +382,17 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS webhook_deliveries_due_ix ON webhook_deliveries (status, next_attempt_at);
 `,
   },
+  {
+    name: "0012_rate_limit_buckets",
+    sql: `
+-- 多实例限流（spec §13.4 / 偏差 #3）：PG 令牌桶状态行，FOR UPDATE 原子扣减。
+-- 行数有界（workspace × kind），无需 GC。
+CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+  bucket_key text PRIMARY KEY,
+  tokens double precision NOT NULL,
+  last_refill timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+`,
+  },
 ];

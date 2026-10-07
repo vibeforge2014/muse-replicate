@@ -90,6 +90,15 @@ describe("Webhooks", () => {
     const created = await call(url, key, "POST", "/v1/webhooks", { url: receiverUrl(), events: [] });
     expect(created.status).toBe(201);
     expect(created.json.secret).toMatch(/^whsec_/);
+    // at-rest：落库的是信封密文，不是明文（偏差 #14 收尾）
+    const row = await env.db.db
+      .selectFrom("webhooks")
+      .select(["secret"])
+      .where("id", "=", created.json.id)
+      .executeTakeFirst();
+    expect(row?.secret.startsWith("{")).toBe(true);
+    expect(row?.secret).not.toContain(created.json.secret);
+    expect(() => JSON.parse(row?.secret ?? "")).not.toThrow(); // 合法 envelope JSON
     const listed = await call(url, key, "GET", "/v1/webhooks");
     expect(listed.json.data.some((w: any) => w.id === created.json.id)).toBe(true);
     expect(JSON.stringify(listed.json)).not.toContain(created.json.secret);
@@ -187,5 +196,46 @@ describe("Webhooks", () => {
     const none = received.filter((r) => r.body?.data?.content?.[0]?.text === "after delete");
     expect(none.length).toBe(0);
     await call(url, key, "DELETE", `/v1/sessions/${sid}`);
+  });
+
+  test("历史明文 secret 行兼容（信封升级前创建的 webhook 仍可投递）", async () => {
+    const legacySecret = `whsec_${Buffer.from("legacy-raw-key-32-bytes-aaaaaaaaaa").toString("base64")}`;
+    const wsRow = await env.db.db.selectFrom("workspaces").select(["id"]).limit(1).executeTakeFirst();
+    const whkId = "whk_legacycompat01";
+    await env.db.db
+      .insertInto("webhooks")
+      .values({
+        id: whkId,
+        workspace_id: wsRow!.id,
+        url: receiverUrl(),
+        events: JSON.stringify([]) as unknown as string[],
+        secret: legacySecret, // 明文（升级前形态）
+        description: null,
+      })
+      .execute();
+    await env.db.db
+      .insertInto("webhook_deliveries")
+      .values({
+        id: "whd_legacycompat01",
+        workspace_id: wsRow!.id,
+        webhook_id: whkId,
+        event_id: "sevt_legacy_test",
+        event_type: "test.legacy",
+        payload: { hello: "legacy" },
+      })
+      .execute();
+    await tickUntil(async () => {
+      const d = await env.db.db
+        .selectFrom("webhook_deliveries")
+        .select(["status"])
+        .where("id", "=", "whd_legacycompat01")
+        .executeTakeFirst();
+      return d?.status === "delivered";
+    });
+    const hit = received.find((r) => r.body?.id === "whd_legacycompat01");
+    expect(hit).toBeTruthy();
+    expect(verifySignature(hit!, legacySecret)).toBe(true);
+    await env.db.db.deleteFrom("webhook_deliveries").where("id", "=", "whd_legacycompat01").execute();
+    await env.db.db.deleteFrom("webhooks").where("id", "=", whkId).execute();
   });
 });

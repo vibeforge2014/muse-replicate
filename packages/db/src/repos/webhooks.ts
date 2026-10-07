@@ -1,6 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { type Kysely, type Selectable } from "kysely";
-import { errNotFound, newId } from "@mas/core";
+import { errNotFound, newId, openSecret, sealSecret } from "@mas/core";
 import type { Database } from "../schema.js";
 import type { WebhookDeliveryRow, WebhookRow } from "../schema.js";
 
@@ -9,6 +9,8 @@ import type { WebhookDeliveryRow, WebhookRow } from "../schema.js";
  * - 投递事件源：session_events 定序/写入路径（appendEvent / appendApiEvent）调用 enqueue；
  * - 签名：webhook-id / webhook-timestamp / webhook-signature: v1,<base64(HMAC-SHA256(key, "id.ts.body"))>；
  *   secret 为 `whsec_` + base64(32B)，创建时回显一次；
+ * - at-rest：secret 以 MAS_MASTER_KEY 信封加密存储（与 credential 同一 sealSecret），
+ *   仅投递签名时在内存解密；历史明文行兼容（按 `{` 前缀识别）；
  * - 重试：非 2xx / 网络错误 → attempts+1，backoff = 2^attempts 秒；attempts ≥ 6 → failed。
  */
 
@@ -22,11 +24,17 @@ export function newWebhookSecret(): string {
   return `whsec_${randomBytes(32).toString("base64")}`;
 }
 
+/** 存储态 → 签名用明文（历史明文行兼容）。 */
+export function unwrapWebhookSecret(stored: string): string {
+  return stored.startsWith("{") ? openSecret(stored) : stored;
+}
+
 export async function createWebhook(
   db: Kysely<Database>,
   args: { workspaceId: string; url: string; events: string[]; description: string | null },
 ): Promise<WebhookSel> {
-  return (
+  const secret = newWebhookSecret();
+  const row = (
     await db
       .insertInto("webhooks")
       .values({
@@ -35,12 +43,14 @@ export async function createWebhook(
         url: args.url,
         // node-pg 会把 JS 数组转成 PG 数组字面量，jsonb 列必须显式 stringify
         events: JSON.stringify(args.events) as unknown as string[],
-        secret: newWebhookSecret(),
+        secret: sealSecret(secret),
         description: args.description,
       })
       .returningAll()
       .executeTakeFirst()
   )!;
+  // 返回行上的 secret 用明文覆盖：创建响应一次性回显（落库的是信封密文）
+  return { ...row, secret };
 }
 
 export async function getWebhook(db: Kysely<Database>, workspaceId: string, id: string): Promise<WebhookSel> {
@@ -173,7 +183,7 @@ export async function runWebhookDispatchTick(db: Kysely<Database>): Promise<void
     .limit(10)
     .execute();
   for (const d of due) {
-    await deliverOne(db, d, d.url, d.secret);
+    await deliverOne(db, d, d.url, unwrapWebhookSecret(d.secret));
   }
 }
 

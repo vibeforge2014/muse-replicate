@@ -88,7 +88,7 @@
 11. 混沌车道中的“租约过期”通过重写 `lease_expires_at` 模拟（SQL 时钟无法虚拟化），其余动作全部走真实 db 函数。
 12. Memory Store 内容存 PG（单条 ≤100 KiB，符合验收上限），未拆对象存储；read_write 挂载的回写是轮末 diff——worker 在 agent 写入与回写之间崩溃会丢该轮记忆写入（真实部署用沙箱内 watcher 实时上报）；agent 删除文件不产生版本 tombstone。read_only 的强只读靠 chmod（555/444），root 进程可绕过（真沙箱内由 gvisor/rootfs 保证）。
 13. Deployments 的 cron 时区按平台方言硬编码 Asia/Shanghai（UTC+8 无夏令时，直接偏移求值）；deployment/webhook 两个调度器为 api 进程内 setInterval（单实例假设），多实例部署需加选主或拆独立 scheduler 进程；schedule 到点的补跑以 `last_scheduled_at` 为锚每次一个 tick 至多补一个 run（暂停期不累积风暴）。
-14. Webhook secret（whsec_）以明文存 PG（签名需要原值；生产建议 KMS 信封加密后存）；投递为单进程串行（每 tick ≤10 条）；outbox 不做死信告警之外的清理。
+14. ~~Webhook secret（whsec_）以明文存 PG（签名需要原值；生产建议 KMS 信封加密后存）~~；投递为单进程串行（每 tick ≤10 条）；outbox 不做死信告警之外的清理。已收尾：secret 落库改为 `sealSecret` 信封（与 credential 同一 MAS_MASTER_KEY 体系，AES-256-GCM 双层），仅投递签名时内存解密；历史明文行兼容（`{` 前缀识别，测试覆盖）。
 
 ## 后续路线（按 plan.md）
 

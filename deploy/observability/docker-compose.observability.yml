@@ -1,0 +1,39 @@
+# 可观测栈（spec §16 的 MVP 子集）：Prometheus 抓取 /internal/metrics + Grafana 看板。
+# 与主 compose 同网络使用：MAS_PORT=18090 docker-compose -f deploy/compose/docker-compose.yml -p mas up -d
+# 之后：docker-compose -f deploy/observability/docker-compose.observability.yml -p mas up -d
+# Grafana: http://<host>:13000（admin/admin，首登改密）。
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    networks: [mas_default]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin # 首登改密
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    networks: [mas_default]
+    ports:
+      - "${GRAFANA_PORT:-13000}:3000"
+    restart: unless-stopped
+
+networks:
+  mas_default:
+    external: true
+    name: mas_default # 主 compose（-p mas）创建的网络
+
+volumes:
+  prom-data:
+  grafana-data:

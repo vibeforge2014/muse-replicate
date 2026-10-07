@@ -1,0 +1,60 @@
+{
+  "title": "MAS Overview",
+  "uid": "mas-overview",
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "API QPS（按路由）",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "expr": "sum(rate(mas_api_requests_total[1m])) by (route)", "legendFormat": "{{route}}" }]
+    },
+    {
+      "id": 2,
+      "title": "API 5xx 速率",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "expr": "sum(rate(mas_api_requests_total{code=~\"5..\"}[5m]))", "legendFormat": "5xx/s" }]
+    },
+    {
+      "id": 3,
+      "title": "平均延迟（按路由）",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [{ "expr": "mas_api_latency_seconds_sum / mas_api_latency_seconds_count", "legendFormat": "{{route}}" }]
+    },
+    {
+      "id": 4,
+      "title": "会话状态分布",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [{ "expr": "mas_sessions", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 5,
+      "title": "SSE 实时连接",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 16, "w": 6, "h": 6 },
+      "targets": [{ "expr": "mas_sse_connections" }]
+    },
+    {
+      "id": 6,
+      "title": "出站拒绝（egress deny）",
+      "type": "timeseries",
+      "gridPos": { "x": 6, "y": 16, "w": 6, "h": 6 },
+      "targets": [{ "expr": "mas_egress_denied_total" }]
+    },
+    {
+      "id": 7,
+      "title": "模型 token 计量（gateway）",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 6 },
+      "targets": [{ "expr": "mas_model_tokens_total", "legendFormat": "{{model}} {{kind}}" }]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

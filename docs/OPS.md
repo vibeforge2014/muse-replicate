@@ -15,7 +15,20 @@
 | PostgreSQL | compose `postgres` | 5432 | 事件日志 / 队列 / 元数据 |
 | 对象存储 | 本地目录（`/tmp/mas-snapshots`、`/tmp/mas-files`） | – | checkpoint 归档与 File 内容；接 MinIO 时换 `SnapshotStore` 的 S3 实现 |
 
-docker compose：`docker compose -f deploy/compose/docker-compose.yml up --build`。
+docker compose：`docker compose -f deploy/compose/docker-compose.yml up --build`（宿主端口冲突时 `MAS_PORT=18090` 前缀）。
+
+部署后验收（对运行实例走一轮真实会话回路 + 指标端点检查）：
+
+```bash
+BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/smoke.sh
+```
+
+可观测栈（可选）：`docker compose -f deploy/observability/docker-compose.observability.yml up -d` —— Prometheus 抓取 `mas-server:8080/internal/metrics`（QPS/延迟/会话状态/SSE 连接/出站拒绝），Grafana（`GRAFANA_PORT`，默认 13000，admin/admin 首登改密）自动供给 MAS Overview 看板。已在 Synology DSM（docker 24，无 runsc，runc 降级）实测：指标抓取 up、看板出数。
+
+### 真实宿主实测记录
+
+- **Synology SA6400 / DSM 7.2.1 / docker 24.0.2 / 4C 7.4G**：全量测试 159/159 + 混沌 200/200（真实 Linux + 容器 PG）；compose 全栈（postgres+server+worker）+ Prometheus/Grafana 运行中；DockerProvider 生命周期 4/4（runc 降级路径）。
+- 该内核**未开 user namespaces，gVisor 不可用**（`/proc/self/uid_map` 不存在，runsc 硬依赖）；另未挂 pids cgroup 控制器（`--pids-limit` 被 daemon 静默丢弃）。gVisor 验证需标准 Linux 内核宿主。
 
 ### 环境变量
 

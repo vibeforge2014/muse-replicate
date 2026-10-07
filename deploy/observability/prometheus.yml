@@ -1,0 +1,13 @@
+# 抓取 mas-server 的 /internal/metrics（Prometheus 文本格式）。
+# 宿主设置了 MAS_INTERNAL_TOKEN 时在下方 authorization 行填入。
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: mas
+    metrics_path: /internal/metrics
+    # 未设 token 可整段删掉 authorization
+    # authorization:
+    #   credentials: <MAS_INTERNAL_TOKEN>
+    static_configs:
+      - targets: ["mas-server-1:8080"]

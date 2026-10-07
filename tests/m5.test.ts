@@ -1,5 +1,5 @@
 import { beforeAll, afterEach, describe, expect, test } from "vitest";
-import { call, setupEnv, type TestEnv } from "./helpers.ts";
+import { call, setupEnv, waitFor, type TestEnv } from "./helpers.ts";
 
 /**
  * M5：幂等全量（POST agents/environments/sessions/vaults/credentials）、
@@ -120,6 +120,9 @@ describe("M5 可观测与调试", () => {
       if (Date.now() - start > 15_000) throw new Error("debug target turn not completed");
       await new Promise((r) => setTimeout(r, 150));
     }
+
+    // 状态回 idle 晚于 agent.message 落库（checkpoint/settle 其后），慢盘宿主必须等状态而非等事件
+    await waitFor(url, key, sid, (s: any) => s.status === "idle");
 
     const res = await fetch(`${url}/internal/sessions/${sid}/debug`);
     expect(res.status).toBe(200);

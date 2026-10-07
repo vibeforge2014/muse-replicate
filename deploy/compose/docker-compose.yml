@@ -1,5 +1,6 @@
 # 单机部署拓扑（spec §18.1 的 MVP 子集：postgres + server + worker）
 # 生产沙箱（OpenSandbox/gVisor、egress-proxy、model-gateway、MinIO）按 spec §9/§10 在后续里程碑接入。
+# 宿主端口冲突时 MAS_PORT=18080 docker-compose up -d。
 services:
   postgres:
     image: postgres:16-alpine
@@ -24,8 +25,14 @@ services:
       DATABASE_URL: postgres://mas@postgres:5432/mas_dev
       PORT: "8080"
       HOST: 0.0.0.0
+      # api 与 worker 必须共享同一文件/快照根（docs/OPS.md 环境变量表）
+      MAS_FILES_DIR: /var/mas/files
+      MAS_SNAPSHOT_DIR: /var/mas/snapshots
+    volumes:
+      - mas-files:/var/mas/files
+      - mas-snapshots:/var/mas/snapshots
     ports:
-      - "8080:8080"
+      - "${MAS_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -37,9 +44,18 @@ services:
     command: ["npx", "tsx", "apps/worker/src/main.ts"]
     environment:
       DATABASE_URL: postgres://mas@postgres:5432/mas_dev
+      MAS_FILES_DIR: /var/mas/files
+      MAS_SNAPSHOT_DIR: /var/mas/snapshots
+      # warm pool 开关（>0 时 FakeSandboxProvider 预建 + attach 迟绑定）
+      # MAS_WARM_POOL_MIN: "2"
+    volumes:
+      - mas-files:/var/mas/files
+      - mas-snapshots:/var/mas/snapshots
     depends_on:
       postgres:
         condition: service_healthy
 
 volumes:
   pg:
+  mas-files:
+  mas-snapshots:

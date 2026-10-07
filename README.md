@@ -38,7 +38,7 @@ OpenAI Agents 托管形态）：业务方通过 HTTP API 定义 Agent、发起�
 | 领域 | 能力 |
 | --- | --- |
 | **Agent 管理** | 版本化 CRUD（乐观锁、无变化不升版、metadata 按键合并）、归档联动、内置/自定义工具集与 MCP server 配置 |
-| **会话引擎** | 三种 agent 引用形态（id / id+version / overrides）+ 快照固化；排队事件与处理时定序（seq 单调）；审批流（`requires_action` → `user.tool_confirmation`）；持久化中断（interrupt 是状态不是信号） |
+| **会话引擎** | 三种 agent 引用形态（id / id+version / overrides）+ 快照固化；排队事件与处理时定序（seq 单调）；审批流（`requires_action` → `user.tool_confirmation`）；**自定义工具**（`agent.custom_tool_use` → 业务方回 `user.custom_tool_result`，api 即时定序续轮）；持久化中断（interrupt 是状态不是信号） |
 | **可靠性** | `FOR UPDATE SKIP LOCKED` 抢占 + 30s 租约 + generation fencing；轮末不可变 checkpoint（sha256 校验 + fence CAS 发布）；水位线恢复与接管语义；`Idempotency-Key` 全量 POST 支持 |
 | **实时** | SSE 事件流（LISTEN/NOTIFY、15s 心跳、Last-Event-ID 回补、会话删除自动关闭） |
 | **安全** | Vault / Credentials（信封加密、轮换、脱敏回显）；egress-proxy（出站 token 绑定执行 fence、平台黑名单、limited/unrestricted 网络策略、竞争头剥离与凭据注入、拒绝可观察）；model-gateway（会话 token 鉴权、上游 key 注入、流式 usage 计量落账） |
@@ -179,7 +179,7 @@ catch (e) { if (e instanceof MasApiError) console.log(e.status, e.errorType); } 
 ## 测试与验证
 
 ```bash
-pnpm test            # 149 个集成用例（真实 PG + 真实 HTTP + 假沙箱 runtime）
+pnpm test            # 156 个集成用例（真实 PG + 真实 HTTP + 假沙箱 runtime）
 pnpm test:chaos 200  # 确定性混沌门禁：200 个种子并发注入（双收/租约强过期/陈旧 fence），六不变量逐步断言
 pnpm typecheck       # 6 个工程 TypeScript strict 全量检查
 ```
@@ -243,12 +243,12 @@ spec.md · plan.md · test-case-plan.md   # 架构规格 / 执行计划 / 验收
 ## 实现状态
 
 **已落地**：MVP 核心 → 审批/中断/checkpoint 恢复 → Vault/Files/egress → 幂等/指标/运维 →
-model-gateway → 混沌门禁 → Memory Store / Skills / Deployments / Webhooks → OpenAPI + SDK → warm pool。
+model-gateway → 混沌门禁 → Memory Store / Skills / Deployments / Webhooks → OpenAPI + SDK → warm pool → custom tools（含 multipart 幂等收尾）。
 
 **进行中 / 规划**：egress TLS 终止与沙箱生命周期接线、OpenSandbox / K8s CRD provider、
-OTel 链路与压测、multiagent lanes、custom tools、outcomes。
+OTel 链路与压测、multiagent lanes、outcomes。
 
-细粒度状态与已知偏差（14 项务实取舍）见 [docs/DESIGN.md](docs/DESIGN.md#与规格的已知偏差务实取舍)。
+细粒度状态与已知偏差（13 项务实取舍）见 [docs/DESIGN.md](docs/DESIGN.md#与规格的已知偏差务实取舍)。
 
 ## License
 

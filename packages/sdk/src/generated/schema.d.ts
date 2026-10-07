@@ -902,7 +902,7 @@ export interface components {
             /** @enum {string} */
             speed?: "standard";
         };
-        /** @description 内置工具集（agent_toolset_20260401/20260601 的 default_config/configs）或内置/自定义工具声明 */
+        /** @description 工具声明——内置工具集（agent_toolset_*）、mcp_toolset、或自定义工具（type=custom：name/description/input_schema，由业务方实现执行体，经 user.custom_tool_result 回传） */
         ToolConfig: {
             type: string;
         } & {
@@ -1100,6 +1100,8 @@ export interface components {
             /**
              * @example user.message
              * @example agent.message
+             * @example agent.custom_tool_use
+             * @example user.custom_tool_result
              * @example session.status_running
              * @example session.status_idle
              * @example session.usage
@@ -1125,6 +1127,12 @@ export interface components {
             } | {
                 /** @constant */
                 type: "user.interrupt";
+            } | {
+                /** @constant */
+                type: "user.custom_tool_result";
+                /** @description 对应 agent.custom_tool_use 事件 id（须在 requires_action 的 event_ids 中） */
+                tool_use_id: string;
+                output: string;
             } | {
                 /** @constant */
                 type: "user.tool_confirmation";

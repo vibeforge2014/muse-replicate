@@ -16,29 +16,35 @@ import { beginIdempotent, finishIdempotent } from "../plugins/idempotency.js";
 import { parseTimeFilter } from "@mas/core";
 import type { RouteCtx } from "./agents.js";
 
-/** POST events 的状态前置校验（spec §6 / §12.3；TOOL-07/08、EVT-S09）。 */
+/** POST events 的状态前置校验（spec §6 / §12.3；TOOL-07/08、EVT-S09、CT 自定义工具）。 */
 function checkBatchAgainstStatus(
   session: { status: string; stop_reason: Record<string, unknown> | null; archived_at: Date | null },
   events: UserInputEvent[],
-): "user_message" | "tool_confirmation" | "interrupt" {
+): "user_message" | "tool_confirmation" | "custom_tool_result" | "interrupt" {
   if (session.archived_at) throw errConflict("session is archived");
   if (session.status === "terminated") throw errInvalid("session is terminated");
   const requiresAction = session.status === "idle" && session.stop_reason?.type === "requires_action";
   const hasMessage = events.some((e) => e.type === "user.message");
   const hasInterrupt = events.some((e) => e.type === "user.interrupt");
   const hasConfirmation = events.some((e) => e.type === "user.tool_confirmation");
+  const hasCustomResult = events.some((e) => e.type === "user.custom_tool_result");
 
   if (requiresAction) {
     if (hasMessage) throw errInvalid("session is awaiting a tool confirmation; user.message is not accepted now");
-    if (hasInterrupt && hasConfirmation) throw errInvalid("cannot mix user.interrupt with other events");
+    if (hasInterrupt && (hasConfirmation || hasCustomResult)) throw errInvalid("cannot mix user.interrupt with other events");
+    if (hasConfirmation && hasCustomResult) {
+      throw errInvalid("cannot mix user.tool_confirmation with user.custom_tool_result");
+    }
     if (hasInterrupt) return "interrupt";
+    if (hasCustomResult) return "custom_tool_result";
     return "tool_confirmation";
   }
-  if (hasInterrupt && (hasMessage || hasConfirmation)) {
+  if (hasInterrupt && (hasMessage || hasConfirmation || hasCustomResult)) {
     throw errInvalid("cannot mix user.interrupt with other events");
   }
   if (hasInterrupt) return "interrupt";
-  // 非 requires_action 下的 confirmation：404（tool_use 不存在）/ 409（存在但未在等待）由下方 resolution 校验决定（TOOL-10/11）
+  // 非 requires_action 下的 confirmation/custom_tool_result：404（目标不存在）/ 409（未在等待）由下方 resolution 校验决定
+  if (hasCustomResult) return "custom_tool_result";
   return hasConfirmation ? "tool_confirmation" : "user_message";
 }
 
@@ -70,23 +76,26 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
     const interruptExecution =
       kind === "interrupt" && session.stop_reason?.type === "requires_action";
 
-    // tool_confirmation 的 resolution 校验（TOOL-10/11）
+    // tool_confirmation / custom_tool_result 的 resolution 校验（TOOL-10/11、CT-02/03）
     const pendingIds = new Set(
       ((session.stop_reason as { event_ids?: string[] } | null)?.event_ids ?? []).map(String),
     );
     for (const e of events) {
-      if (e.type !== "user.tool_confirmation") continue;
+      if (e.type !== "user.tool_confirmation" && e.type !== "user.custom_tool_result") continue;
+      const isCustom = e.type === "user.custom_tool_result";
+      const expectedType = isCustom ? "agent.custom_tool_use" : "agent.tool_use";
       const target = await ctx.db
         .selectFrom("session_events")
         .select(["id", "type"])
         .where("session_id", "=", id)
         .where("id", "=", e.tool_use_id)
         .executeTakeFirst();
-      if (!target || target.type !== "agent.tool_use") {
-        throw errNotFound(`tool_use ${e.tool_use_id} not found`);
+      if (!target) throw errNotFound(`tool_use ${e.tool_use_id} not found`);
+      if (target.type !== expectedType) {
+        throw errInvalid(`event ${e.tool_use_id} is ${target.type}, not ${expectedType}`);
       }
       if (!pendingIds.has(e.tool_use_id)) {
-        throw errConflict(`tool_use ${e.tool_use_id} is not awaiting confirmation`);
+        throw errConflict(`tool_use ${e.tool_use_id} is not awaiting ${isCustom ? "a custom tool result" : "confirmation"}`);
       }
     }
 
@@ -99,7 +108,13 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       sessionId: id,
       workspaceId: ws,
       events: rows,
-      executionKind: interruptExecution ? "interrupt" : kind === "tool_confirmation" ? "tool_confirmation" : "user_message",
+      executionKind: interruptExecution
+        ? "interrupt"
+        : kind === "tool_confirmation"
+          ? "tool_confirmation"
+          : kind === "custom_tool_result"
+            ? "custom_tool_result"
+            : "user_message",
     });
     const out = { data: admitted.events };
     await finishIdempotent(ctx.db, req, { status: 200, body: out });

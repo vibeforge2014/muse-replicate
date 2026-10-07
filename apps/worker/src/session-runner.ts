@@ -214,17 +214,28 @@ export class SessionRunner {
     await this.materializeResources(sessionId);
     // 3) 按执行类型推进（spec §5.6 kind）
     if (kind === "interrupt") {
-      // requires_action 时的 interrupt：未决审批按 deny 处理（spec §6 / TOOL-09），最终 idle(end_turn)
+      // requires_action 时的 interrupt：未决审批按 deny 处理（spec §6 / TOOL-09），最终 idle(end_turn)；
+      // 未决自定义工具按中断作废（CT-04）
       const pendingIds = ((session.stop_reason as { event_ids?: string[] } | null)?.event_ids ?? []).map(String);
       await append("session.status_running", {});
       for (const pendingId of pendingIds) {
         const fakeItemId = held.toolUseIds.get(pendingId) ?? (await this.lookupSourceEventId(sessionId, pendingId));
-        await this.driver.send(held.handle, {
-          type: "approval_response",
-          sourceEventId: fakeItemId,
-          approved: false,
-          denyMessage: "interrupted",
-        });
+        const target = await this.loadEvent(sessionId, pendingId);
+        if (target?.type === "agent.custom_tool_use") {
+          await this.driver.send(held.handle, {
+            type: "custom_tool_output",
+            sourceEventId: fakeItemId,
+            output: "",
+            interrupted: true,
+          });
+        } else {
+          await this.driver.send(held.handle, {
+            type: "approval_response",
+            sourceEventId: fakeItemId,
+            approved: false,
+            denyMessage: "interrupted",
+          });
+        }
       }
       if (pendingIds.length === 0) {
         await append("session.status_idle", { stop_reason: { type: "end_turn" } });
@@ -255,6 +266,15 @@ export class SessionRunner {
         approved,
         denyMessage: conf?.deny_message as string | undefined,
       });
+      await markDelivered(this.db, executionId, generation, attemptId);
+    } else if (kind === "custom_tool_result") {
+      // 自定义工具结果（CT）：回写 runtime 续轮（事件已由 api 即时定序，spec §7.3 例外）
+      const res = await this.loadEvent(sessionId, inputEventIds[0]!);
+      const toolUseId = String(res?.tool_use_id ?? "");
+      const output = String(res?.output ?? "");
+      const fakeItemId = held.toolUseIds.get(toolUseId) ?? (await this.lookupSourceEventId(sessionId, toolUseId));
+      await append("session.status_running", {});
+      await this.driver.send(held.handle, { type: "custom_tool_output", sourceEventId: fakeItemId, output });
       await markDelivered(this.db, executionId, generation, attemptId);
     }
 
@@ -338,6 +358,25 @@ export class SessionRunner {
           { eventId, sourceEventId: SessionRunner.prefixed("tu", ev.sourceId) },
         );
         return null;
+      }
+      case "custom_tool_use_started": {
+        // 自定义工具调用（CT）：业务方声明、平台外执行的工具
+        const eventId = newId("sevt");
+        held.toolUseIds.set(ev.sourceId, eventId);
+        await append(
+          "agent.custom_tool_use",
+          { name: ev.toolName, input: ev.input },
+          { eventId, sourceEventId: SessionRunner.prefixed("ctu", ev.sourceId) },
+        );
+        return null;
+      }
+      case "custom_tool_output_request": {
+        // turn 挂起等待业务方输出 → idle(requires_action)，event_ids 指向 agent.custom_tool_use（spec §7.3 例外）
+        const toolUseId = held.toolUseIds.get(ev.toolUseSourceId);
+        await append("session.status_idle", {
+          stop_reason: { type: "requires_action", event_ids: toolUseId ? [toolUseId] : [] },
+        });
+        return "awaiting_approval";
       }
       case "tool_result": {
         const toolUseId = held.toolUseIds.get(ev.toolUseSourceId) ?? ev.toolUseSourceId;
@@ -807,14 +846,19 @@ export class SessionRunner {
     return texts.join("\n");
   }
 
-  private async loadEvent(sessionId: string, eventId: string): Promise<Record<string, unknown> | null> {
+  /** 返回事件 payload（含 type 列；interrupt 分支按事件类型区分审批与自定义工具）。 */
+  private async loadEvent(
+    sessionId: string,
+    eventId: string,
+  ): Promise<(Record<string, unknown> & { type?: string }) | null> {
     const row = await this.db
       .selectFrom("session_events")
-      .select(["payload"])
+      .select(["payload", "type"])
       .where("session_id", "=", sessionId)
       .where("id", "=", eventId)
       .executeTakeFirst();
-    return (row?.payload as Record<string, unknown>) ?? null;
+    if (!row) return null;
+    return { ...(row.payload as Record<string, unknown>), type: row.type };
   }
 
   private async lookupSourceEventId(sessionId: string, toolUseEventId: string): Promise<string> {

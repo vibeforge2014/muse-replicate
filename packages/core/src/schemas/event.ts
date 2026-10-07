@@ -6,10 +6,12 @@ export const EVENT_TYPES = [
   "user.message",
   "user.interrupt",
   "user.tool_confirmation",
+  "user.custom_tool_result",
   "agent.message",
   "agent.thinking",
   "agent.tool_use",
   "agent.tool_result",
+  "agent.custom_tool_use",
   "agent.mcp_tool_use",
   "agent.mcp_tool_result",
   "session.status_running",
@@ -93,10 +95,23 @@ export const userToolConfirmationEventSchema = z
     }
   });
 
+/**
+ * 自定义工具结果（custom tools，spec §7.3 例外）：收到即处理——
+ * api 当场定序（返回时 processed_at 已有值），再生成 execution 送回 runtime。
+ */
+export const userCustomToolResultEventSchema = z
+  .object({
+    type: z.literal("user.custom_tool_result"),
+    tool_use_id: z.string().min(3),
+    output: z.string().min(1).max(64_000),
+  })
+  .strict();
+
 export const userInputEventSchema = z.union([
   userMessageEventSchema,
   userInterruptEventSchema,
   userToolConfirmationEventSchema,
+  userCustomToolResultEventSchema,
 ]);
 export type UserInputEvent = z.infer<typeof userInputEventSchema>;
 

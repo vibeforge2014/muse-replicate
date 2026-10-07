@@ -6,6 +6,7 @@
  *   - "run <cmd>"    → bash tool_use + tool_result（模拟执行 echo）
  *   - "out <text>"   → 把 text 写入 outputs/note.txt（模拟沙箱产出，SBX-03/REC-08）
  *   - "ask ..."      → 审批流：tool_use(ask) → 等待 approvalResponse → tool_result
+ *   - "tool <n> <j>" → 自定义工具：custom_tool_use → 等待 customToolOutput → agent.message 续轮
  *   - "sleep <sec>"  → 慢任务（测中断）
  *   - "fail"         → error 通知（可重试）
  *   - "crash"        → 进程直接退出（测 worker 恢复）
@@ -25,6 +26,7 @@ let nextId = 1;
 // 避免事件 source_event_id 唯一约束把新轮产出误判为重放
 const tag = randomUUID().slice(0, 6);
 const pendingApprovals = new Map(); // itemId -> {resolve}
+const pendingCustomTools = new Map(); // itemId -> {resolve, toolName}
 let awaitingInterrupt = null;
 let hasBash = true;
 const emitter = new EventEmitter();
@@ -108,6 +110,15 @@ async function handle(msg) {
       }
       return;
     }
+    case "item/customToolOutput": {
+      // 业务方的 user.custom_tool_result（或 requires_action 中断时的作废信号）
+      const p = pendingCustomTools.get(params.itemId);
+      if (p) {
+        pendingCustomTools.delete(params.itemId);
+        p.resolve(params);
+      }
+      return;
+    }
     default:
       if (id !== undefined) {
         send({ jsonrpc: "2.0", id, error: { code: -32601, message: `unknown method ${method}` } });
@@ -182,6 +193,36 @@ async function runTurn(params) {
     }
     persist();
     notify("turn/completed", { reason: "completed" });
+    return;
+  }
+  if (text.startsWith("tool ")) {
+    // 自定义工具（CT）：custom_tool_use → 挂起等待业务方输出 → 收到后 agent.message 续轮
+    const rest = text.slice(5).trim();
+    const sp = rest.indexOf(" ");
+    const toolName = sp === -1 ? rest : rest.slice(0, sp);
+    const argRaw = sp === -1 ? "{}" : rest.slice(sp + 1);
+    let input;
+    try {
+      input = JSON.parse(argRaw);
+    } catch {
+      input = { raw: argRaw };
+    }
+    const itemId = `itm_ct_${tag}_${nextId++}`;
+    notify("item/started", { itemId, itemType: "customToolCall", toolName, input });
+    notify("item/awaitingCustomToolOutput", { itemId, toolName });
+    const response = await new Promise((resolve) => pendingCustomTools.set(itemId, { resolve, toolName }));
+    history.push({ role: "user", text });
+    let outcome;
+    if (response.interrupted) {
+      outcome = `custom tool ${toolName} aborted by interrupt`;
+    } else {
+      outcome = `custom tool ${toolName} result: ${String(response.output ?? "")}`;
+    }
+    notify("item/completed", { itemId, itemType: "customToolCall", toolName });
+    notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: outcome });
+    history.push({ role: "agent", text: outcome });
+    persist();
+    notify("turn/completed", { reason: response.interrupted ? "interrupted" : "completed" });
     return;
   }
   if (text.startsWith("memwrite ")) {

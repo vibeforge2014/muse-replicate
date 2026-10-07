@@ -118,7 +118,7 @@ export interface AdmitInput {
   sessionId: string;
   workspaceId: string;
   events: { id: string; type: string; payload: Record<string, unknown> }[];
-  executionKind: "user_message" | "tool_confirmation" | "interrupt";
+  executionKind: "user_message" | "tool_confirmation" | "custom_tool_result" | "interrupt";
   leaseSeconds?: number;
   deadlineHours?: number;
 }
@@ -181,6 +181,19 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
         await assignSeqAndProcessedAt(tx, input.sessionId, interruptIds, "normal");
       }
     }
+    // user.custom_tool_result：收到即处理（spec §7.3 例外）——api 当场定序，返回时 processed_at 已有值
+    const immediateIds = input.events.filter((e) => e.type === "user.custom_tool_result").map((e) => e.id);
+    let immediateProcessedAt = new Map<string, string>();
+    if (immediateIds.length > 0) {
+      await assignSeqAndProcessedAt(tx, input.sessionId, immediateIds, "normal");
+      const rows = await tx
+        .selectFrom("session_events")
+        .select(["id", "processed_at"])
+        .where("session_id", "=", input.sessionId)
+        .where("id", "in", immediateIds)
+        .execute();
+      immediateProcessedAt = new Map(rows.map((r) => [r.id, r.processed_at ? r.processed_at.toISOString() : ""]));
+    }
 
     let interruptAccepted = false;
     if (hasInterrupt) {
@@ -240,7 +253,7 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
     const events: SessionEventJson[] = input.events.map((e) => ({
       id: e.id,
       type: e.type as SessionEventJson["type"],
-      processed_at: null,
+      processed_at: immediateProcessedAt.get(e.id) ?? null,
       ...e.payload,
     }));
     return { events, executionId, interruptAccepted };

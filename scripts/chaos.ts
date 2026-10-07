@@ -14,7 +14,19 @@ const db = createDb();
 await runMigrations(db.pool);
 const boot = await bootstrap(db.db);
 const ws = (await db.db.selectFrom("workspaces").select(["id"]).limit(1).executeTakeFirst())!.id;
-const envId = (await db.db.selectFrom("environments").select(["id"]).limit(1).executeTakeFirst())!.id;
+// 自举 environment：门禁不依赖集成套件的残留数据（套件可能以清库收尾）
+let envRow = await db.db.selectFrom("environments").select(["id"]).limit(1).executeTakeFirst();
+if (!envRow) {
+  const envId = `env_chaos_${Date.now().toString(36)}`;
+  await db.db.insertInto("environments").values({
+    id: envId,
+    workspace_id: ws,
+    name: "chaos-lane",
+    config: { type: "cloud" },
+  }).execute();
+  envRow = { id: envId };
+}
+const envId = envRow.id;
 const agent = { system: null, model: { id: "glm-5.3-flash" }, tools: [] };
 
 let failed = 0;

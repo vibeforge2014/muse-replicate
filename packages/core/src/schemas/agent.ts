@@ -68,6 +68,16 @@ const toolConfigSchema = z.union([
         .optional(),
     })
     .strict(),
+  // 自定义工具（spec Q5 / 二期 dynamicTools 的平台侧形态）：业务方自持执行体。
+  // agent 调用时产生 agent.custom_tool_use + requires_action，业务方回 user.custom_tool_result 续轮。
+  z
+    .object({
+      type: z.literal("custom"),
+      name: z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/, "custom tool name must match [a-zA-Z0-9_-]{1,128}"),
+      description: z.string().max(2_048).optional(),
+      input_schema: z.record(z.string(), z.unknown()),
+    })
+    .strict(),
 ]);
 
 export type ToolConfig = z.infer<typeof toolConfigSchema>;
@@ -197,6 +207,9 @@ function validateTools(
 /** 规范化：tools 数组每个 toolset 补全 default_config 与 configs（AGT-02）。 */
 export function normalizeAgentTools(tools: ToolConfig[]): ToolConfig[] {
   return tools.map((t) => {
+    if (t.type === "custom") {
+      return { type: "custom" as const, name: t.name, ...(t.description ? { description: t.description } : {}), input_schema: t.input_schema };
+    }
     if (t.type === "mcp_toolset") {
       return {
         type: "mcp_toolset" as const,

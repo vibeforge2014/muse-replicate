@@ -5,6 +5,7 @@ import { errInvalid, errNotFound, newId } from "@mas/core";
 import type { Database, FileRow } from "@mas/db";
 import { FsSnapshotStore } from "@mas/db";
 import type { RouteCtx } from "./agents.js";
+import { withIdempotency } from "../plugins/idempotent-route.js";
 
 /**
  * Files API（spec §5.5 / §11.4）：org 级上传与 session 输出共用 files 表；
@@ -76,26 +77,29 @@ export function registerFileRoutes(app: FastifyInstance, ctx: RouteCtx): void {
     }
     const content = Buffer.concat(bytes);
     const sha256 = createHash("sha256").update(content).digest("hex");
-    const id = newId("file");
     const mime = part.mimetype?.trim() || "application/octet-stream";
-    const objectKey = `files/${ws}/${id}`;
-    await store.put(objectKey, content);
-
-    await ctx.db
-      .insertInto("files")
-      .values({
-        id,
-        workspace_id: ws,
-        scope_type: "org",
-        scope_id: null,
-        filename,
-        mime,
-        size: content.length,
-        sha256,
-        object_key: objectKey,
-      })
-      .execute();
-    return fileJson(await getFileRow(ctx, ws, id));
+    // multipart 幂等（偏差 #10）：指纹 = 文件名 + 内容哈希 + mime，重放不重复登记 File
+    const fingerprint = `multipart file filename=${filename} sha256=${sha256} mime=${mime}`;
+    return withIdempotency(ctx.db, req, reply, async () => {
+      const id = newId("file");
+      const objectKey = `files/${ws}/${id}`;
+      await store.put(objectKey, content);
+      await ctx.db
+        .insertInto("files")
+        .values({
+          id,
+          workspace_id: ws,
+          scope_type: "org",
+          scope_id: null,
+          filename,
+          mime,
+          size: content.length,
+          sha256,
+          object_key: objectKey,
+        })
+        .execute();
+      return fileJson(await getFileRow(ctx, ws, id));
+    }, fingerprint);
   });
 
   app.get("/v1/files", async (req) => {

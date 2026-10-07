@@ -23,6 +23,7 @@ export interface RuntimeStartInput {
 export type RuntimeCommand =
   | { type: "user_message"; text: string }
   | { type: "approval_response"; sourceEventId: string; approved: boolean; denyMessage?: string }
+  | { type: "custom_tool_output"; sourceEventId: string; output: string; interrupted?: boolean }
   | { type: "interrupt" };
 
 /** 归一化 runtime 事件（worker 把它映射为对外事件，spec §12.1）。 */
@@ -39,6 +40,8 @@ export type NormalizedRuntimeEvent =
     }
   | { kind: "tool_result"; sourceId: string; toolUseSourceId: string; content: string; isError: boolean }
   | { kind: "approval_request"; sourceId: string; toolUseSourceId: string; toolName: string }
+  | { kind: "custom_tool_use_started"; sourceId: string; toolName: string; input: unknown }
+  | { kind: "custom_tool_output_request"; sourceId: string; toolUseSourceId: string; toolName: string }
   | { kind: "turn_completed"; sourceId: string; reason: "completed" | "interrupted" }
   | { kind: "error"; sourceId: string; message: string; retryable: boolean };
 

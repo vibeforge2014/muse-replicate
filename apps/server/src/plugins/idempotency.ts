@@ -18,13 +18,19 @@ export interface IdempotencyOutcome {
 /**
  * Idempotency-Key：24h 内同 key 同 body 返回首次响应；同 key 不同 body 409（spec §11.1 / REC-07）。
  * 返回 replayed=true 时路由直接回放 outcome.response。
+ * fingerprint：multipart 等非 JSON body 场景由路由解析后显式给出（偏差 #10），
+ * 缺省用 JSON body 计算。
  */
-export async function beginIdempotent(db: Kysely<Database>, req: FastifyRequest): Promise<IdempotencyOutcome> {
+export async function beginIdempotent(
+  db: Kysely<Database>,
+  req: FastifyRequest,
+  fingerprint?: string,
+): Promise<IdempotencyOutcome> {
   const key = req.headers["idempotency-key"];
   if (typeof key !== "string" || !key) return { replayed: false };
   if (key.length > 256) throw new MasError("invalid_request_error", "Idempotency-Key too long");
   const workspaceId = req.mas.auth!.workspaceId;
-  const requestHash = sha256hex(`${req.method} ${req.url} ${JSON.stringify(req.body ?? null)}`);
+  const requestHash = sha256hex(fingerprint ?? `${req.method} ${req.url} ${JSON.stringify(req.body ?? null)}`);
   const existing = await db
     .selectFrom("idempotency_keys")
     .selectAll()
@@ -53,11 +59,12 @@ export async function finishIdempotent(
   db: Kysely<Database>,
   req: FastifyRequest,
   response: StoredResponse,
+  fingerprint?: string,
 ): Promise<void> {
   const key = req.headers["idempotency-key"];
   if (typeof key !== "string" || !key) return;
   const workspaceId = req.mas.auth!.workspaceId;
-  const requestHash = sha256hex(`${req.method} ${req.url} ${JSON.stringify(req.body ?? null)}`);
+  const requestHash = sha256hex(fingerprint ?? `${req.method} ${req.url} ${JSON.stringify(req.body ?? null)}`);
   await db
     .updateTable("idempotency_keys")
     .set({ response: response as unknown as Record<string, unknown> })

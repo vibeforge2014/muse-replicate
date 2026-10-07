@@ -51,6 +51,14 @@ function normalize(method: string, p: Record<string, unknown>): NormalizedRuntim
           evaluatedPermission: "allow",
         };
       }
+      if (itemType === "customToolCall") {
+        return {
+          kind: "custom_tool_use_started",
+          sourceId: sid(),
+          toolName: String(p.toolName ?? "custom"),
+          input: p.input ?? {},
+        };
+      }
       return null;
     }
     case "item/completed": {
@@ -75,6 +83,14 @@ function normalize(method: string, p: Record<string, unknown>): NormalizedRuntim
         sourceId: `appr_${p.itemId}`,
         toolUseSourceId: String(p.itemId ?? ""),
         toolName: "bash",
+      };
+    case "item/awaitingCustomToolOutput":
+      // 自定义工具：turn 挂起等待业务方回 user.custom_tool_result（spec §7.3 例外）
+      return {
+        kind: "custom_tool_output_request",
+        sourceId: `cto_${p.itemId}`,
+        toolUseSourceId: String(p.itemId ?? ""),
+        toolName: String(p.toolName ?? "custom"),
       };
     case "turn/completed":
       return {
@@ -206,6 +222,13 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
           itemId: command.sourceEventId,
           approved: command.approved,
           denyMessage: command.denyMessage,
+        });
+        return;
+      case "custom_tool_output":
+        h.notify("item/customToolOutput", {
+          itemId: command.sourceEventId,
+          output: command.output,
+          interrupted: command.interrupted ?? false,
         });
         return;
       case "interrupt":

@@ -1,8 +1,10 @@
+import { createHash } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { errInvalid } from "@mas/core";
 import type { Database, SkillView, SkillVersionView } from "@mas/db";
 import { addSkillVersion, createSkill, deleteSkill, getSkill, getSkillVersion, InvalidSkillZipError, normalizeSkillZip } from "@mas/db";
 import type { RouteCtx } from "./agents.js";
+import { withIdempotency } from "../plugins/idempotent-route.js";
 import { contentStore } from "./files.js";
 
 /**
@@ -93,15 +95,19 @@ export function registerSkillRoutes(app: FastifyInstance, ctx: RouteCtx): void {
     const dir = upload.directory ?? normalized.rootDirectory ?? "skill";
     const invalid = validateDirectory(dir);
     if (invalid) throw errInvalid(invalid);
-    const stored = await createSkill(db, contentStore(), {
-      workspaceId: ws,
-      directory: dir,
-      description: upload.description,
-      files: normalized.files,
-    });
-    reply.code(201);
-    // version 字段在前，skill 的 id 在后（顶层 id 是 skill id）
-    return { ...versionJson(stored.version), ...skillJson(stored.skill) };
+    // multipart 幂等（偏差 #10）：指纹 = 目录 + 描述 + 规范化文件集
+    const fingerprint = `multipart skill directory=${dir} description=${upload.description ?? ""} files=${JSON.stringify(normalized.files.map((f) => [f.path, createHash("sha256").update(f.content).digest("hex")]))}`;
+    return withIdempotency(db, req, reply, async () => {
+      const stored = await createSkill(db, contentStore(), {
+        workspaceId: ws,
+        directory: dir,
+        description: upload.description,
+        files: normalized.files,
+      });
+      reply.code(201);
+      // version 字段在前，skill 的 id 在后（顶层 id 是 skill id）
+      return { ...versionJson(stored.version), ...skillJson(stored.skill) };
+    }, fingerprint);
   });
 
   // ---- 列表 / 单个（SKL-07）----
@@ -148,9 +154,12 @@ export function registerSkillRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       if (e instanceof InvalidSkillZipError) throw errInvalid(e.message);
       throw e;
     }
-    const stored = await addSkillVersion(db, contentStore(), { workspaceId: ws, skillId: id, files: normalized.files });
-    reply.code(201);
-    return versionJson(stored.version);
+    const fingerprint = `multipart skill-version skill=${id} files=${JSON.stringify(normalized.files.map((f) => [f.path, createHash("sha256").update(f.content).digest("hex")]))}`;
+    return withIdempotency(db, req, reply, async () => {
+      const stored = await addSkillVersion(db, contentStore(), { workspaceId: ws, skillId: id, files: normalized.files });
+      reply.code(201);
+      return versionJson(stored.version);
+    }, fingerprint);
   });
 
   // ---- 下载版本 zip（SKL-03/04）----

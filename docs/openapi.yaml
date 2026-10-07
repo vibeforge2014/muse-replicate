@@ -1332,7 +1332,7 @@ components:
       type: object
       additionalProperties: true
       required: [type]
-      description: 内置工具集（agent_toolset_20260401/20260601 的 default_config/configs）或内置/自定义工具声明
+      description: 工具声明——内置工具集（agent_toolset_*）、mcp_toolset、或自定义工具（type=custom：name/description/input_schema，由业务方实现执行体，经 user.custom_tool_result 回传）
       properties:
         type: { type: string }
     McpServer:
@@ -1525,7 +1525,7 @@ components:
       required: [id, type]
       properties:
         id: { type: string }
-        type: { type: string, examples: [user.message, agent.message, session.status_running, session.status_idle, session.usage] }
+        type: { type: string, examples: [user.message, agent.message, agent.custom_tool_use, user.custom_tool_result, session.status_running, session.status_idle, session.usage] }
         seq: { type: [integer, "null"] }
         processed_at: { type: [string, "null"], format: date-time }
         received_at: { $ref: "#/components/schemas/Timestamp" }
@@ -1559,6 +1559,13 @@ components:
                 required: [type]
                 properties:
                   type: { const: user.interrupt }
+              - type: object
+                required: [type, tool_use_id, output]
+                description: 自定义工具结果（spec §7.3 例外：收到即处理，返回时 processed_at 已有值）
+                properties:
+                  type: { const: user.custom_tool_result }
+                  tool_use_id: { type: string, description: 对应 agent.custom_tool_use 事件 id（须在 requires_action 的 event_ids 中） }
+                  output: { type: string, minLength: 1, maxLength: 64000 }
               - type: object
                 required: [type, tool_use_id, result]
                 properties:

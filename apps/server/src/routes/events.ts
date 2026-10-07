@@ -17,11 +17,11 @@ import { requestTraceparent } from "../plugins/context.js";
 import { parseTimeFilter } from "@mas/core";
 import type { RouteCtx } from "./agents.js";
 
-/** POST events 的状态前置校验（spec §6 / §12.3；TOOL-07/08、EVT-S09、CT 自定义工具）。 */
+/** POST events 的状态前置校验（spec §6 / §12.3；TOOL-07/08、EVT-S09、CT 自定义工具、§7.3 例外类）。 */
 function checkBatchAgainstStatus(
   session: { status: string; stop_reason: Record<string, unknown> | null; archived_at: Date | null },
   events: UserInputEvent[],
-): "user_message" | "tool_confirmation" | "custom_tool_result" | "interrupt" {
+): "user_message" | "tool_confirmation" | "custom_tool_result" | "interrupt" | "define_outcome" {
   if (session.archived_at) throw errConflict("session is archived");
   if (session.status === "terminated") throw errInvalid("session is terminated");
   const requiresAction = session.status === "idle" && session.stop_reason?.type === "requires_action";
@@ -29,6 +29,12 @@ function checkBatchAgainstStatus(
   const hasInterrupt = events.some((e) => e.type === "user.interrupt");
   const hasConfirmation = events.some((e) => e.type === "user.tool_confirmation");
   const hasCustomResult = events.some((e) => e.type === "user.custom_tool_result");
+  const hasOutcome = events.some((e) => e.type === "user.define_outcome");
+
+  // define_outcome 与 interrupt 互斥；与其余例外类也不混批（避免歧义 kind）
+  if (hasOutcome && (hasInterrupt || hasConfirmation || hasCustomResult)) {
+    throw errInvalid("cannot mix user.define_outcome with interrupt/confirmation/custom_tool_result events");
+  }
 
   if (requiresAction) {
     if (hasMessage) throw errInvalid("session is awaiting a tool confirmation; user.message is not accepted now");
@@ -38,7 +44,8 @@ function checkBatchAgainstStatus(
     }
     if (hasInterrupt) return "interrupt";
     if (hasCustomResult) return "custom_tool_result";
-    return "tool_confirmation";
+    // define_outcome 无 runtime 语义：requires_action 下同样收下（当场定序）
+    return hasConfirmation ? "tool_confirmation" : "define_outcome";
   }
   if (hasInterrupt && (hasMessage || hasConfirmation || hasCustomResult)) {
     throw errInvalid("cannot mix user.interrupt with other events");
@@ -46,7 +53,7 @@ function checkBatchAgainstStatus(
   if (hasInterrupt) return "interrupt";
   // 非 requires_action 下的 confirmation/custom_tool_result：404（目标不存在）/ 409（未在等待）由下方 resolution 校验决定
   if (hasCustomResult) return "custom_tool_result";
-  return hasConfirmation ? "tool_confirmation" : "user_message";
+  return hasConfirmation ? "tool_confirmation" : hasMessage ? "user_message" : "define_outcome";
 }
 
 export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
@@ -117,7 +124,9 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
           ? "tool_confirmation"
           : kind === "custom_tool_result"
             ? "custom_tool_result"
-            : "user_message",
+            : kind === "define_outcome"
+              ? "define_outcome"
+              : "user_message",
     });
     const out = { data: admitted.events };
     await finishIdempotent(ctx.db, req, { status: 200, body: out });

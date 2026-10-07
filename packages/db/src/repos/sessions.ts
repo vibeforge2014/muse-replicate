@@ -118,7 +118,7 @@ export interface AdmitInput {
   sessionId: string;
   workspaceId: string;
   events: { id: string; type: string; payload: Record<string, unknown> }[];
-  executionKind: "user_message" | "tool_confirmation" | "custom_tool_result" | "interrupt";
+  executionKind: "user_message" | "tool_confirmation" | "custom_tool_result" | "interrupt" | "define_outcome";
   leaseSeconds?: number;
   deadlineHours?: number;
   /** api 入口请求的 W3C traceparent：跟随 command（execution）供 worker 接续链路（spec §16）。 */
@@ -183,8 +183,11 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
         await assignSeqAndProcessedAt(tx, input.sessionId, interruptIds, "normal");
       }
     }
-    // user.custom_tool_result：收到即处理（spec §7.3 例外）——api 当场定序，返回时 processed_at 已有值
-    const immediateIds = input.events.filter((e) => e.type === "user.custom_tool_result").map((e) => e.id);
+    // user.custom_tool_result / user.define_outcome：收到即处理（spec §7.3 例外）——
+    // api 当场定序，返回时 processed_at 已有值
+    const immediateIds = input.events
+      .filter((e) => e.type === "user.custom_tool_result" || e.type === "user.define_outcome")
+      .map((e) => e.id);
     let immediateProcessedAt = new Map<string, string>();
     if (immediateIds.length > 0) {
       await assignSeqAndProcessedAt(tx, input.sessionId, immediateIds, "normal");
@@ -225,20 +228,28 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
       interruptAccepted = active.length > 0 || cancelled.length > 0;
     }
 
+    // define_outcome 不进 execution（无 runtime 语义，已当场定序）：
+    // user_message 批次的 input_event_ids 只含真正的 user.message
+    const runtimeBoundIds = input.events
+      .filter((e) => e.type !== "user.define_outcome")
+      .map((e) => e.id);
+
     if (!hasInterrupt || input.executionKind === "interrupt") {
-      // requires_action 时的 interrupt：生成 interrupt 执行，由 worker 作废未决审批（TOOL-09）
-      await tx.insertInto("session_executions").values({
-        id: executionId,
-        workspace_id: input.workspaceId,
-        session_id: input.sessionId,
-        lane_id: "main",
-        kind: input.executionKind,
-        input_event_ids: input.events.map((e) => e.id),
-        input_fingerprint: fingerprintOf(input.events),
-        state: "queued",
-        deadline_at: new Date(Date.now() + deadlineHours * 3600_000),
-        traceparent: input.traceparent ?? null,
-      }).execute();
+      if (runtimeBoundIds.length > 0) {
+        // requires_action 时的 interrupt：生成 interrupt 执行，由 worker 作废未决审批（TOOL-09）
+        await tx.insertInto("session_executions").values({
+          id: executionId,
+          workspace_id: input.workspaceId,
+          session_id: input.sessionId,
+          lane_id: "main",
+          kind: input.executionKind,
+          input_event_ids: runtimeBoundIds,
+          input_fingerprint: fingerprintOf(input.events),
+          state: "queued",
+          deadline_at: new Date(Date.now() + deadlineHours * 3600_000),
+          traceparent: input.traceparent ?? null,
+        }).execute();
+      }
     } else if (!interruptAccepted) {
       // idle 时单独的 interrupt：没有活跃 execution → 直接定序写入历史（EVT-S09）
       for (const e of input.events.filter((e) => e.type === "user.interrupt")) {

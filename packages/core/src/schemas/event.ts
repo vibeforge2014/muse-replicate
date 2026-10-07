@@ -7,6 +7,7 @@ export const EVENT_TYPES = [
   "user.interrupt",
   "user.tool_confirmation",
   "user.custom_tool_result",
+  "user.define_outcome",
   "agent.message",
   "agent.thinking",
   "agent.tool_use",
@@ -107,11 +108,24 @@ export const userCustomToolResultEventSchema = z
   })
   .strict();
 
+/**
+ * `user.define_outcome`（spec §7.3 例外类）：收到即处理——api 当场定序，返回时
+ * processed_at 已有值。payload 语义 spec 未定义（test-case-plan PRB-01 只做 P 级
+ * 探测），故按不透明对象透传存档，不触发 execution / runtime。
+ */
+export const userDefineOutcomeEventSchema = z
+  .object({
+    type: z.literal("user.define_outcome"),
+    outcome: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+
 export const userInputEventSchema = z.union([
   userMessageEventSchema,
   userInterruptEventSchema,
   userToolConfirmationEventSchema,
   userCustomToolResultEventSchema,
+  userDefineOutcomeEventSchema,
 ]);
 export type UserInputEvent = z.infer<typeof userInputEventSchema>;
 

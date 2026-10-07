@@ -10,6 +10,7 @@
 [![OpenAPI](https://img.shields.io/badge/API-OpenAPI_3.1-6BA539?logo=openapiinitiative&logoColor=white)](docs/openapi.yaml)
 [![tests](https://img.shields.io/badge/tests-149%20passed-brightgreen)](#测试与验证)
 [![chaos](https://img.shields.io/badge/chaos%20gate-200%2F200-brightgreen)](#测试与验证)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 [快速开始](#快速开始) · [SDK 示例](#typescript-sdk) · [API 概览](#api-概览) · [架构](#架构) · [设计文档](docs/DESIGN.md)
 
@@ -248,3 +249,7 @@ model-gateway → 混沌门禁 → Memory Store / Skills / Deployments / Webhook
 OTel 链路与压测、multiagent lanes、custom tools、outcomes。
 
 细粒度状态与已知偏差（14 项务实取舍）见 [docs/DESIGN.md](docs/DESIGN.md#与规格的已知偏差务实取舍)。
+
+## License
+
+[Apache-2.0](LICENSE) © 2026 zhen qian

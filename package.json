@@ -2,6 +2,7 @@
   "name": "muse-replicate",
   "private": true,
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "企业私有化 Managed Agents 平台（Meta Muse 复刻）— spec/plan 见 *.md",
   "type": "module",
   "packageManager": "pnpm@10.33.0",

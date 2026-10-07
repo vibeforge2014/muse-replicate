@@ -1,6 +1,7 @@
 {
   "name": "@mas/runtime",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -8,6 +9,11 @@
     ".": "./src/index.ts",
     "./fake-codex.mjs": "./src/fake-codex.mjs"
   },
-  "scripts": { "test": "vitest run --root ." },
-  "dependencies": { "@mas/core": "workspace:*", "zod": "^3.24.0" }
+  "scripts": {
+    "test": "vitest run --root ."
+  },
+  "dependencies": {
+    "@mas/core": "workspace:*",
+    "zod": "^3.24.0"
+  }
 }

@@ -41,7 +41,7 @@ describe("PG 限流（RL-PG）", () => {
     }
   });
 
-  test("RL-PG-02 HTTP 层：pg 后端 app 并发读触发 429 + 标准头部，随后恢复", async () => {
+  test("RL-PG-02 HTTP 层：pg 后端 app 并发写触发 429 + 标准头部，随后恢复", async () => {
     // 独立 app 实例：MAS_RATELIMIT_BURST=4（只影响该进程的模块配置）
     const prevBurst = process.env.MAS_RATELIMIT_BURST;
     const prevBackend = process.env.MAS_RATELIMIT_BACKEND;
@@ -53,27 +53,36 @@ describe("PG 限流（RL-PG）", () => {
       const base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
       const key = env.key;
 
-      // 并发 12 个读：burst=4 + 少量 refill → 大部分 429
+      // 并发 12 个写：走 write 桶（10 枚/s = 100ms/枚，慢盘 fsync 也追不平补满）。
+      // 用必失败的 POST body（400 在限流之后，令牌照扣），只需断言 429 出现且带标准头部。
       const rs = await Promise.all(
         Array.from({ length: 12 }, () =>
-          fetch(`${base}/v1/agents`, { headers: { authorization: `Bearer ${key}` } }),
+          fetch(`${base}/v1/agents`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+            body: JSON.stringify({}),
+          }),
         ),
       );
-      const ok = rs.filter((r) => r.status === 200).length;
-      const limited = rs.filter((r) => r.status === 429).length;
-      expect(limited).toBeGreaterThan(0);
-      expect(ok + limited).toBe(12);
-      const limitedResp = rs.find((r) => r.status === 429)!;
+      const limited = rs.filter((r) => r.status === 429);
+      const allowed = rs.filter((r) => r.status !== 429);
+      expect(allowed.every((r) => r.status === 400)).toBe(true); // 非 429 皆为校验失败的 400
+      expect(limited.length).toBeGreaterThan(0);
+      const limitedResp = limited[0]!;
       expect(limitedResp.headers.get("ratelimit-remaining")).toBe("0");
       expect(limitedResp.headers.get("retry-after")).toMatch(/^\d+$/);
       const body = (await limitedResp.json()) as { type: string; error: { type: string } };
       expect(body.type).toBe("error");
       expect(body.error.type).toBe("rate_limit_error");
 
-      // 恢复：等 refill（read perSecond=50 → 20ms/枚）
+      // 恢复：等 refill（write perSecond=10 → 100ms/枚）
       await new Promise((res) => setTimeout(res, 300));
-      const again = await fetch(`${base}/v1/agents`, { headers: { authorization: `Bearer ${key}` } });
-      expect(again.status).toBe(200);
+      const again = await fetch(`${base}/v1/agents`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(again.status).toBe(400); // 限流恢复（非 429），回到校验失败
       await app.close();
     } finally {
       if (prevBurst === undefined) delete process.env.MAS_RATELIMIT_BURST;

@@ -58,6 +58,7 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_OBJECT_STORE` | `fs` | 对象存储后端：`fs`=本地目录（单机）；`s3`=S3 兼容（MinIO/S3，SigV4 手写签名零依赖）。key 布局两种后端一致，可无损切换 |
 | `MAS_S3_ENDPOINT` / `MAS_S3_REGION` | – / `us-east-1` | S3 端点（path-style，如 `http://minio.mas.svc.cluster.local:9000`）与区域 |
 | `MAS_S3_ACCESS_KEY` / `MAS_S3_SECRET_KEY` / `MAS_S3_BUCKET` | – | S3 凭据与桶（`MAS_OBJECT_STORE=s3` 时必填，桶不存在自动创建）。put 走条件写（If-None-Match，MinIO ≥2024-08 / AWS S3），putIfAbsent 按 etag(md5) 比对 |
+| `MAS_SANDBOX_PROVIDER` | `fake` | 沙箱 provider：`fake`=本机目录；`docker`=宿主 docker；`k8s`=集群内沙箱 Pod（in-cluster SA 或 MAS_K8S_API/TOKEN/CA、MAS_K8S_NODE_SELECTOR、MAS_K8S_PVC/MAS_K8S_PVC_MOUNT；deploy/k8s/56-sandbox-rbac.yaml 配套） |
 | `MAS_RUNTIME_DRIVER` | `fake` | worker 的 runtime driver：`fake`=FakeCodexDriver（脚本化假 runtime，零额度消耗）；`codex`=真实 codex app-server（CodexDriver） |
 | `MAS_CODEX_BIN` | `codex`（PATH） | 真实 driver 的 codex 可执行文件路径（如 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`） |
 | `MAS_CODEX_AUTH_FILE` | `~/.codex/auth.json` | 每会话 CODEX_HOME 复制的登录凭据来源（存在才复制；机密绝不进 checkpoint 归档） |

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test } from "vitest";
 import { FsSnapshotStore, objectStoreFromEnv, S3SnapshotStore, type SnapshotStore } from "../packages/db/src/index.ts";
 
 /**
@@ -46,8 +46,13 @@ describe("objectStoreFromEnv 选择", () => {
 });
 
 describe.skipIf(!s3Ok)("S3SnapshotStore 真实后端（MinIO）", () => {
-  const store: SnapshotStore = newStore();
+  // describe 体即使 skip 也会执行：延迟构造，避免无 env 时读 undefined
+  let store: SnapshotStore;
   const prefix = `s3-test/${Date.now().toString(36)}`;
+
+  beforeAll(() => {
+    store = newStore();
+  });
 
   test("ensureBucket 幂等 + put/get/delete 回环（二进制、斜杠 key）", async () => {
     const bytes = Buffer.from([0, 1, 2, 255, 254, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);

@@ -1,0 +1,72 @@
+# K8s SandboxProvider 配套（packages/sandbox/src/k8s-provider.ts）：
+# - mas-sandboxes PVC：worker 与沙箱 Pod 共享工作区（worker TMPDIR 指到挂载点，
+#   会话目录即 PVC 子目录；沙箱 Pod 以 subPath 绑定 /session/.codex 等）
+# - mas-worker ServiceAccount：沙箱 Pod 增删查 + NetworkPolicy 下发
+# - runsc RuntimeClass：节点 containerd 注册了 gVisor runsc 后创建（见 README）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mas-sandboxes
+  namespace: mas
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mas-worker
+  namespace: mas
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mas-worker-sandbox
+  namespace: mas
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, delete]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies]
+    verbs: [create, get]
+---
+# RuntimeClass 为 cluster-scoped：只读放行（沙箱能力探测）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mas-worker-runtimeclass-read
+rules:
+  - apiGroups: ["node.k8s.io"]
+    resources: [runtimeclasses]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mas-worker-runtimeclass-read
+subjects:
+  - kind: ServiceAccount
+    name: mas-worker
+    namespace: mas
+roleRef:
+  kind: ClusterRole
+  name: mas-worker-runtimeclass-read
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mas-worker-sandbox
+  namespace: mas
+subjects:
+  - kind: ServiceAccount
+    name: mas-worker
+    namespace: mas
+roleRef:
+  kind: Role
+  name: mas-worker-sandbox
+  apiGroup: rbac.authorization.k8s.io

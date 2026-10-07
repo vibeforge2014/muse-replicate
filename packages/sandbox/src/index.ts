@@ -422,3 +422,5 @@ export async function markOrphanAttempt(db: Kysely<Database>, id: number, ok: bo
 export function resetFakeSandboxHome(sessionId: string): void {
   rmSync(join(tmpdir(), "mas-fake-codex", sessionId), { recursive: true, force: true });
 }
+
+export * from "./k8s-provider.js";

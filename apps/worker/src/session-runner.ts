@@ -30,7 +30,7 @@ import {
   type SnapshotStore,
 } from "@mas/db";
 import {
-  FakeCodexDriver,
+  type AgentRuntimeDriver,
   type NormalizedRuntimeEvent,
   type RuntimeHandle,
 } from "@mas/runtime";
@@ -40,6 +40,19 @@ const LEASE_SECONDS = 30;
 const RENEW_INTERVAL_MS = 10_000;
 const TICK_MS = 300;
 
+/**
+ * checkpoint 归档排除清单（真实 codex 的 CODEX_HOME 在会话 home 下）：
+ *  - tmp/arg0 下有 codex 运行时解出的 241MB 级二进制包装器（打进归档会撑爆内存）；
+ *  - cache/plugins/skills/models_cache/logs 均可由 codex 重建；
+ *  - auth.json 是机密，绝不能落快照存储（restore 后由 driver 重新复制）。
+ */
+const CODEX_JUNK = [".codex/tmp/", ".codex/cache/", ".codex/plugins/", ".codex/skills/", ".codex/log/"];
+const excludeFromCheckpoint = (rel: string): boolean =>
+  rel === ".codex/auth.json" ||
+  rel === ".codex/models_cache.json" ||
+  rel === ".DS_Store" ||
+  CODEX_JUNK.some((p) => rel.startsWith(p));
+
 interface HeldRuntime {
   handle: RuntimeHandle;
   /** fake itemId → sevt id（审批与 tool_result 关联）。 */
@@ -48,7 +61,7 @@ interface HeldRuntime {
 
 /**
  * SessionRunner：持租约驱动一个会话的执行（spec §8、§7.1）。
- * MVP 用 FakeCodexDriver；真实部署替换为 codex app-server driver，接口不变。
+ * driver 由 MAS_RUNTIME_DRIVER 选择（fake / codex app-server），接口统一（spec §8.1）。
  */
 export interface RunnerFaults {
   /** 在 checkpoint 候选上传后、CAS 发布前模拟 worker 崩溃（REC-03）。 */
@@ -69,7 +82,7 @@ export class SessionRunner {
 
   constructor(
     private db: Kysely<Database>,
-    private driver: FakeCodexDriver,
+    private driver: AgentRuntimeDriver,
     private workerId = `worker_${process.pid}`,
     private store: SnapshotStore = new FsSnapshotStore(process.env.MAS_SNAPSHOT_DIR ?? "/tmp/mas-snapshots"),
     /** 沙箱 provider（或其声明的隔离等级字符串；Fake provider 兜底）。 */
@@ -446,7 +459,8 @@ export class SessionRunner {
     const existing = this.runtimes.get(sessionId);
     if (existing) return existing;
 
-    const digest = session.codex_version_digest ?? FAKE_CODEX_DIGEST;
+    // 真实 driver 提供版本指纹（CLI 升级 → Level 0）；fake 沿用库内常量
+    const digest = this.driver.versionDigest ?? session.codex_version_digest ?? FAKE_CODEX_DIGEST;
     const active = session.active_workspace_checkpoint as unknown as CheckpointManifest | null;
     let resumeThreadId: string | undefined;
     let replayHistory: { role: "user" | "agent"; text: string }[] | undefined;
@@ -645,6 +659,7 @@ export class SessionRunner {
       sourceDir: home,
       codexVersionDigest: digest,
       threadId: s.codex_thread_id ?? "",
+      exclude: excludeFromCheckpoint,
     });
   }
 

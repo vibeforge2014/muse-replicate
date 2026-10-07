@@ -53,6 +53,8 @@ export interface RuntimeHandle {
 
 export interface AgentRuntimeDriver {
   readonly kind: string;
+  /** runtime 版本指纹（真实 driver 提供；变化 → Level 0 语义恢复，spec §8.7）。 */
+  readonly versionDigest?: string;
   start(input: RuntimeStartInput): Promise<RuntimeHandle>;
   send(handle: RuntimeHandle, command: RuntimeCommand): Promise<void>;
   /** 事件流（多播到当前订阅者；重复消费由 worker 去重）。 */

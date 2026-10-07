@@ -55,6 +55,10 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_WARM_POOL_MIN` | `0`（关） | worker 预热池保温数量（spec §9.3）：>0 时沙箱 create 走快路径（预建空沙箱 attach 迟绑定），池空直落冷创建；关停时自动 drain 池内沙箱 |
 | `MAS_RATELIMIT_BACKEND` | `memory` | 限流后端：`memory`=单进程令牌桶（零开销，单实例部署）；`pg`=`rate_limit_buckets` 行锁令牌桶（事务 + FOR UPDATE 串行化并发，elapsed 由 DB 时钟计算——多实例时钟偏移免疫，`MAS_RATELIMIT_BURST` 只在测试/本地放宽）；DB 故障时 **fail-open**（可用性优先，warn 日志可观察） |
 | `MAS_RATELIMIT_BURST` / `MAS_RATELIMIT_PER_MIN` | – | 限流令牌桶（仅测试/本地放宽用；生产走 spec §11.1 默认值） |
+| `MAS_RUNTIME_DRIVER` | `fake` | worker 的 runtime driver：`fake`=FakeCodexDriver（脚本化假 runtime，零额度消耗）；`codex`=真实 codex app-server（CodexDriver） |
+| `MAS_CODEX_BIN` | `codex`（PATH） | 真实 driver 的 codex 可执行文件路径（如 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`） |
+| `MAS_CODEX_AUTH_FILE` | `~/.codex/auth.json` | 每会话 CODEX_HOME 复制的登录凭据来源（存在才复制；机密绝不进 checkpoint 归档） |
+| `HTTPS_PROXY` / `HTTP_PROXY` | – | codex 后端（chatgpt.com）可达性；受限网络下 worker 进程需可出站代理 |
 
 ## 2. 备份与恢复
 
@@ -70,6 +74,9 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 1. 新版本 digest 变化 → 存量会话恢复时自动走 Level 0 语义恢复，并写
    `session.error{type:"runtime_upgraded", retry_status:"retrying"}`（spec §8.7，REC-10 已验收）。
 2. 回滚：把 worker 的 runtime 版本回退即可，水位线一致的会话继续 Level 1 原生恢复。
+3. 真实 driver（`MAS_RUNTIME_DRIVER=codex`）：digest 取 `codex --version`（`codex@<ver>`），CLI 升级同样触发上述降级。
+   真实 E2E 需显式开启（消耗登录账号额度）：
+   `MAS_CODEX_E2E=1 MAS_CODEX_BIN=<codex> [MAS_CODEX_MODEL=gpt-6.1-sol] [HTTPS_PROXY=...] npx vitest run tests/codex-driver-e2e.test.ts`。
 
 ## 4. 常见故障排查
 

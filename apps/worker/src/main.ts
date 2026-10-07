@@ -1,8 +1,8 @@
 import { Client } from "pg";
 import { createDb, runMigrations, sessionsWithWork } from "@mas/db";
-import { FakeCodexDriver } from "@mas/runtime";
 import { FakeSandboxProvider, WarmPoolProvider, type SandboxProvider } from "@mas/sandbox";
 import { SessionRunner } from "./session-runner.js";
+import { driverFromEnv } from "./driver.js";
 
 /**
  * session-worker 主循环（spec §4.1）：
@@ -12,7 +12,7 @@ import { SessionRunner } from "./session-runner.js";
 async function main() {
   const db = createDb();
   await runMigrations(db.pool);
-  const driver = new FakeCodexDriver();
+  const driver = driverFromEnv();
   // warm pool（spec §9.3 二期）：MAS_WARM_POOL_MIN>0 时包装 provider 预建空沙箱
   const warmMin = Math.max(0, Number(process.env.MAS_WARM_POOL_MIN ?? 0) || 0);
   const provider: SandboxProvider | undefined = warmMin > 0

@@ -42,12 +42,13 @@
 | Deployments（M6 W12） | ✅ | 5 字段 cron（自研引擎：≥5min 间隔、必须有未来触发点、时区固定 Asia/Shanghai）+ manual-only；agent 版本创建时固定；手动 run 202 → 调度器建会话投首轮 → 跟随 session 收尾；pause 不拦手动 run、归档幂等且拒 run；环境归档 → run 失败带 error；归档 agent 联动归档其 deployments；runs 过滤（deployment_id/has_error/trigger_type/created_at，limit 50）（DEP-01~09） |
 | Webhooks（M6 W13） | ✅ | 订阅会话事件 → outbox（webhook_deliveries）→ Standard Webhooks 签名投递（webhook-id/timestamp/signature v1 HMAC-SHA256）；非 2xx 指数退避重试（2^n 秒，6 次后 failed）；events 订阅过滤；secret（whsec_）仅创建时回显；投递状态 API 可观察 |
 | Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试；`out <text>` 模拟沙箱产出、`tool <n> <j>` 模拟自定义工具调用 |
+| 真实 Codex runtime（偏差 #1 收尾） | ✅ | `CodexDriver`：驱动真实 `codex app-server`（v2 协议，0.160+）。每会话独立 CODEX_HOME（`<home>/.codex`，rollout 随 checkpoint 持久化，Level 1 原生 resume 已实测）；thread/start{cwd,model,baseInstructions,approvalPolicy,sandbox}、turn/start、item/*→归一化事件、server→client 审批（itemId 关联，回 `{decision:accept\|decline}`）与动态工具（callId，回 `{contentItems,success}`）、turn/interrupt{threadId,turnId}；`versionDigest`（`codex --version`）驱动 §8.7 升级降级。worker `MAS_RUNTIME_DRIVER=codex` + `MAS_CODEX_BIN`/`MAS_CODEX_AUTH_FILE` 切换；E2E 门禁 `MAS_CODEX_E2E=1`（消耗登录账号额度，默认 skip）。checkpoint 归档排除 `.codex/{tmp,cache,plugins,skills,log}/`、`auth.json`（机密不入快照，restore 后由 driver 重新复制）与 241MB 级 arg0 包装器 |
 | Custom tools（二期 PoC） | ✅ | agent.tools 声明 `{type:"custom", name, input_schema}`（normalizeAgentTools 保留）→ runtime 调用产生 `agent.custom_tool_use` + idle(requires_action) → 业务方回 `user.custom_tool_result`（§7.3 例外：api 即时定序，响应即带 processed_at）→ worker kind=custom_tool_result 经 `item/customToolOutput` 续轮；requires_action 中断时未决 custom tool 作废（CT-01~05） |
 | multipart 幂等（偏差 #10 收尾） | ✅ | files / skills / skills-versions 上传接入 Idempotency-Key：路由解析 multipart 后以显式指纹（文件名+内容 sha256+字段 / 规范化文件集哈希）参与同 key 同 body 判定（IDEM-M-01/02） |
 | OpenAPI 3.1 规范 + TS SDK（plan 5.7） | ✅ | [docs/openapi.yaml](docs/openapi.yaml)：74 条 /v1 路由（与 fastify 注册表零漂移，双向断言）、BigModel 方言 headers（zai-version/zai-beta）、Bearer/x-api-key 双鉴权、统一错误信封；`pnpm gen:sdk` 生成类型 + `@mas/sdk` MasClient（错误信封→MasApiError、幂等键、multipart、SSE/二进制下载） |
 | Warm pool（M6 W13 最小实现） | ✅ | `WarmPoolProvider` 装饰器：预建 N 个空沙箱，create 快路径迟绑定（`attach`）+ 池空直落冷创建 + 串行后台补池（防过填/风暴）；worker `MAS_WARM_POOL_MIN` 开关；Fake provider 的 attach = §9.2 目录重物化（真实 provider 需挂会话卷，K8s CRD 二期） |
 
-未实现（按 plan 后续里程碑）：egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、OTel 链路 / Grafana 看板 / k6 性能压测（M5 5.2/5.3 的重型件，需专门基础设施）、K8s agent-sandbox CRD（provider 侧）/ multiagent lanes / outcomes（M6 后续与二期）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
+未实现（按 plan 后续里程碑）：egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、OTel 链路 / Grafana 看板 / k6 性能压测（M5 5.2/5.3 的重型件，需专门基础设施）、K8s agent-sandbox CRD（provider 侧）/ multiagent lanes / outcomes（M6 后续与二期）、真实 driver 进沙箱运行。runtime 层 `AgentRuntimeDriver` 双实现：FakeCodexDriver（默认，测试）与 CodexDriver（真实 codex app-server，`MAS_RUNTIME_DRIVER=codex`）。
 
 ## 关键设计落地（与 spec 章节映射）
 
@@ -74,7 +75,7 @@
 
 ## 与规格的已知偏差（务实取舍）
 
-1. runtime 为 FakeCodexDriver（本机子进程 + `/tmp` rollout），非沙箱内 `codex app-server`；协议形态一致（initialize/thread/start/turn/start/item/*/turn/completed），替换真实 driver 不动 worker。
+1. ~~runtime 为 FakeCodexDriver（本机子进程 + `/tmp` rollout），非沙箱内 `codex app-server`；协议形态一致（initialize/thread/start/turn/start/item/*/turn/completed），替换真实 driver 不动 worker。~~ 已收尾：`CodexDriver` 驱动真实 `codex app-server`（`MAS_RUNTIME_DRIVER=codex`），协议/恢复/审批/动态工具全链路映射，E2E 已实测（见上表）；测试默认仍走 FakeCodexDriver（零额度消耗）。沙箱内运行（driver 经 SandboxProvider 进容器）仍属后续（当前真实 driver 与 fake 同样在本机子进程内运行）。
 2. api 在 `requires_action` 等状态下可能从快照读 stop_reason 而非事件推导（物化视图已同步维护）。
 3. ~~限流为单进程内存令牌桶；多实例部署需换 PG/Redis（spec §13.4 预留）~~ 已收尾：`MAS_RATELIMIT_BACKEND=pg` 切换为 `rate_limit_buckets` 行锁令牌桶（事务内 FOR UPDATE 串行化、elapsed 由 DB 时钟计算——多实例时钟偏移免疫、DB 故障 fail-open）；默认仍为 memory（单实例零开销）。
 4. checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。
@@ -91,4 +92,4 @@
 
 ## 后续路线（按 plan.md）
 
-M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 139/139 绿）→ M6 W11-W13 已完成：Memory Store、Skills、Deployments、Webhooks → plan 5.7 已完成：OpenAPI 3.1 规范 + @mas/sdk（74 路由零漂移）、warm pool 最小实现（FakeSandboxProvider 预热池 + attach 迟绑定，MAS_WARM_POOL_MIN 开关）→ custom tools 端到端（CT-01~05）+ multipart 幂等收尾（偏差 #10 关闭）→ PG 限流后端（偏差 #3 关闭，RL-PG-01~03，159 测试全绿）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、K8s CRD provider / multiagent lanes / outcomes。
+M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 139/139 绿）→ M6 W11-W13 已完成：Memory Store、Skills、Deployments、Webhooks → plan 5.7 已完成：OpenAPI 3.1 规范 + @mas/sdk（74 路由零漂移）、warm pool 最小实现（FakeSandboxProvider 预热池 + attach 迟绑定，MAS_WARM_POOL_MIN 开关）→ custom tools 端到端（CT-01~05）+ multipart 幂等收尾（偏差 #10 关闭）→ PG 限流后端（偏差 #3 关闭，RL-PG-01~03，159 测试全绿）→ 真实 CodexDriver（偏差 #1 收尾：协议映射 + Level 1 resume + 审批/动态工具 + checkpoint 机密/巨型文件排除，E2E 门禁 MAS_CODEX_E2E=1）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、K8s CRD provider / multiagent lanes / outcomes、driver 进沙箱。

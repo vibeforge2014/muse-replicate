@@ -91,6 +91,9 @@ export interface CommitCheckpointInput {
   codexVersionDigest: string;
   threadId: string;
   keep?: number;
+  /** 归档排除谓词（相对路径，目录以 / 结尾；排除目录即排除整棵子树）。真实 codex 的
+   *  CODEX_HOME 含 241MB×N 的 tmp/arg0 包装器与 auth.json 机密，绝不能进快照。 */
+  exclude?: (relPath: string) => boolean;
 }
 
 export interface CommitCheckpointResult {
@@ -100,14 +103,16 @@ export interface CommitCheckpointResult {
 }
 
 /** 把目录打包为归档字节（json.gz/v1：{files:[{name,data(base64)}]}，递归子目录）。 */
-function packDir(sourceDir: string): Buffer {
+function packDir(sourceDir: string, exclude?: (relPath: string) => boolean): Buffer {
   const files: { name: string; data: string }[] = [];
   const walk = (dir: string, prefix: string) => {
     if (!existsSync(dir)) return;
     for (const name of readdirSync(dir).sort()) {
       const p = join(dir, name);
-      if (statSync(p).isDirectory()) walk(p, `${prefix}${name}/`);
-      else files.push({ name: `${prefix}${name}`, data: readFileSync(p).toString("base64") });
+      const rel = `${prefix}${name}`;
+      if (exclude?.(statSync(p).isDirectory() ? `${rel}/` : rel)) continue;
+      if (statSync(p).isDirectory()) walk(p, `${rel}/`);
+      else files.push({ name: rel, data: readFileSync(p).toString("base64") });
     }
   };
   walk(sourceDir, "");
@@ -134,7 +139,7 @@ function unpackDir(bytes: Buffer, targetDir: string): void {
 
 export async function commitCheckpoint(input: CommitCheckpointInput): Promise<CommitCheckpointResult> {
   const checkpointId = `ckp_${ulid()}`;
-  const archive = packDir(input.sourceDir);
+  const archive = packDir(input.sourceDir, input.exclude);
   const sha256 = createHash("sha256").update(archive).digest("hex");
   const manifest: CheckpointManifest = {
     checkpoint_id: checkpointId,

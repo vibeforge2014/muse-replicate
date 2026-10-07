@@ -284,42 +284,67 @@ function docker(args: string[], timeoutMs = 30_000): Promise<string> {
 
 /**
  * Docker+runsc（spec §9.1）：internal 网络、CapDrop ALL、no-new-privileges、
- * 资源限额。MVP 通过 docker CLI 驱动（无 dockerode 依赖）；
- * 仅在具备 Docker + runsc runtime 的宿主上可用（macOS 开发机不可用）。
+ * 资源限额。MVP 通过 docker CLI 驱动（无 dockerode 依赖）。
+ * runsc 可用性探测缓存：宿主没有 runsc（如 DSM 等未开 userns 的内核）时
+ * create 以默认 runc 运行、capabilities 如实上报 runc（§9.0 禁止虚报）。
  */
 export class DockerProvider implements SandboxProvider {
   readonly kind = "docker";
+  private runscAvailable: boolean | undefined;
   constructor(
     readonly image: string,
-    readonly opts: { memory?: string; pidsLimit?: number; nanoCpus?: number; network?: string } = {},
+    readonly opts: { memory?: string; pidsLimit?: number; nanoCpus?: string | number; network?: string } = {},
   ) {}
 
+  /** runsc 探测（缓存；docker 不可达按无 runsc 处理）。 */
+  private async hasRunsc(): Promise<boolean> {
+    if (this.runscAvailable === undefined) {
+      try {
+        const runtimes = JSON.parse(await docker(["info", "--format", "{{json .Runtimes}}"], 5000)) as Record<string, unknown>;
+        this.runscAvailable = "runsc" in (runtimes ?? {});
+      } catch {
+        this.runscAvailable = false;
+      }
+    }
+    return this.runscAvailable;
+  }
+
   async capabilities(): Promise<ProviderCapabilities> {
-    // runsc runtime 可用性探测；探测失败按 runc 上报（§9.0 禁止虚报能力）
+    // 隔离等级如实上报；egress 由 internal 网络拓扑保证（§9.1：无外路由）
+    return {
+      isolation: (await this.hasRunsc()) ? "gvisor" : "runc",
+      persistentWorkspace: true,
+      egress: "enforced",
+    };
+  }
+
+  /** 目标网络不存在时建为 internal（无默认网关）；并发竞争容忍已存在。 */
+  private async ensureNetwork(name: string): Promise<void> {
+    if (name === "host" || name === "none" || name === "bridge") return;
     try {
-      const info = JSON.parse(await docker(["info", "--format", "{{json .Runtimes}}"], 5000)) as Record<string, unknown>;
-      const hasRunsc = "runsc" in (info ?? {});
-      return {
-        isolation: hasRunsc ? "gvisor" : "runc",
-        persistentWorkspace: true,
-        egress: "enforced",
-      };
+      await docker(["network", "inspect", name], 5000);
     } catch {
-      return { isolation: "runc", persistentWorkspace: true, egress: "advisory" };
+      await docker(["network", "create", "--internal", name], 15_000).catch(() => undefined);
     }
   }
 
   async create(spec: SandboxSpec): Promise<SandboxHandle> {
     const sandboxId = `sbx_docker_${randomUUID().slice(0, 12)}`;
+    const network = this.opts.network ?? "sandbox-net";
+    const useRunsc = await this.hasRunsc();
+    await this.ensureNetwork(network);
+    // 防御性物化宿主侧目录（bind mount 要求存在；契约上 worker 已物化，这里兜底）
+    mkdirSync(spec.outputsDir, { recursive: true });
+    for (const m of spec.mounts) mkdirSync(m.hostPath, { recursive: true });
     const args = [
       "run", "-d", "--name", sandboxId,
-      "--runtime", "runsc",
-      "--network", this.opts.network ?? "sandbox-net", // internal 网络：无默认网关
+      ...(useRunsc ? ["--runtime", "runsc"] : []),
+      "--network", network,
       "--cap-drop", "ALL",
       "--security-opt", "no-new-privileges",
       "--pids-limit", String(this.opts.pidsLimit ?? 512),
       "--memory", this.opts.memory ?? "2g",
-      ...(this.opts.nanoCpus ? ["--cpus", String(this.opts.nanoCpus / 1e9)] : []),
+      ...(this.opts.nanoCpus ? ["--cpus", String(Number(this.opts.nanoCpus) / 1e9)] : []),
       "-v", `${spec.codexHome}:/session/.codex`,
       "-v", `${spec.outputsDir}:/mnt/session/outputs`,
       ...spec.mounts.flatMap((m) => ["-v", `${m.hostPath}:/mnt/session/uploads/${m.mountPath}:ro`]),

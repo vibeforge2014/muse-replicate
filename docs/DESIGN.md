@@ -80,7 +80,7 @@
 4. checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。
 5. File 内容与 output 对象存本地 FS（`MAS_FILES_DIR`，默认 `/tmp/mas-files`）而非 MinIO；Key 布局与 spec 一致（`files/{org}/{file_id}`、`outputs/{session}/{sha256}`），换 S3 实现即可。
 6. egress-proxy MVP 只处理 HTTP 绝对 URI 形态（无 CONNECT/TLS 终止）；真实部署需镜像预置企业 CA、代理按 SNI 签发证书（§10.1）。worker 侧 prepare/attach/revoke 生命周期接线随真实沙箱宿主落地。
-7. DockerProvider 通过 docker CLI 驱动（非 dockerode），且未在 runsc 宿主上验证（macOS 开发机不可用）；结构按 §9.1 硬编码全部隔离参数。
+7. DockerProvider 通过 docker CLI 驱动（非 dockerode）。已在真实 Docker 宿主（Synology DSM，docker 24，无 runsc）实测全生命周期（create 隔离参数/挂载/internal 网络、pause/resume、destroy，tests/docker-provider.test.ts，宿主不可达自动 skip）；runsc 探测缓存化——宿主无 runsc 时 create 走默认 runc、capabilities 如实上报 `runc`（§9.0 不虚报），gVisor 路径仍待标准内核宿主验证（DSM 内核未开 user namespaces，gVisor 不可用）。DSM 宿主可能静默丢弃 pids-limit（未挂 pids cgroup 控制器），属内核能力差异。
 8. 沙箱能力协商目前 FakeSandboxProvider 为声明式（`MAS_SANDBOX_ISOLATION`/构造参数），DockerProvider 已按 runsc 探测如实上报。
 9. agent 事件 `span.model_request_*`/`session.usage` 经 model-gateway 落账（§10.3：网关在响应完成时以 API 身份回写 span 与累计 usage，并物化 `sessions.usage`）；FakeCodexDriver 不调用模型，计量验收用例直接驱动 gateway。指标端点为单进程聚合，多实例部署需加 Prometheus 联邦或 pushgateway。
 10. ~~文件上传（multipart）暂未接 Idempotency-Key~~ 已收尾：路由解析 multipart 后用显式指纹（文件名+内容 sha256+表单字段）代替原始流哈希，同 key 同内容回放、异内容 409（IDEM-M）。

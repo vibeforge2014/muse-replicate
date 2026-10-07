@@ -1,166 +1,250 @@
-# muse-replicate — 企业私有化 Managed Agents 平台（MVP）
+<div align="center">
 
-对 `spec.md`（后端架构规格）的参考实现，按 `plan.md` 的里程碑推进，验收用例来自 `test-case-plan.md`（BigModel Managed Agents 方言子集）。
+# muse-replicate
 
-目标：在企业内网部署一个托管 Agent 运行平台 —— 业务方通过 HTTP API 创建 Agent、启动会话，平台在隔离运行时中执行长时任务，通过 SSE 推送进度；事件日志是唯一事实来源（spec §1.2）。
+**自托管的企业级 Managed Agents 平台** —— 版本化 Agent、事件溯源会话引擎、
+沙箱隔离执行、凭据安全出站、Memory / Skills / 定时调度 / Webhooks，一套 API 全搞定。
 
-## 当前实现范围（对应 plan.md M1–M5 已落地部分 + M3 3.9 混沌车道）
+[![Node](https://img.shields.io/badge/node-%E2%89%A522-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![OpenAPI](https://img.shields.io/badge/API-OpenAPI_3.1-6BA539?logo=openapiinitiative&logoColor=white)](docs/openapi.yaml)
+[![tests](https://img.shields.io/badge/tests-149%20passed-brightgreen)](#测试与验证)
+[![chaos](https://img.shields.io/badge/chaos%20gate-200%2F200-brightgreen)](#测试与验证)
 
-| 能力 | 状态 | 说明 |
-| --- | --- | --- |
-| Monorepo（pnpm workspace + TS strict + vitest） | ✅ | 5 个包：core / db / runtime / server / worker |
-| Agent 版本化 CRUD | ✅ | 乐观锁、无变化不升版、metadata 合并、归档幂等（AGT-01~25） |
-| Environment CRUD | ✅ | networking/packages 校验、规范化、归档/删除引用检查（ENV-01~14） |
-| Session 生命周期 | ✅ | 三种 agent 引用形态、快照固化、initial_events、归档/删除前置条件（SES-01~29） |
-| 事件准入与排序 | ✅ | 排队事件（`processed_at=null`）+ 处理时定序（seq 单调、会话内唯一）（§7.3 / EVT-S/L） |
-| session_executions 队列 | ✅ | claim（FOR UPDATE SKIP LOCKED）+ generation fencing + renew + settle-before-renew（§5.6/§7.1） |
-| Worker 事件循环 | ✅ | 归一化事件映射（§12.1）、状态物化、interrupt 持久化（§6） |
-| 审批流 | ✅ | `always_ask` → `requires_action` → `user.tool_confirmation`（TOOL-04~11） |
-| 持久化中断 | ✅ | running 中断 / requires_action 作废未决审批（TOOL-09/15） |
-| SSE 实时流 | ✅ | LISTEN/NOTIFY、15s 心跳、Last-Event-ID 回补、只推实时、session.deleted 关闭（§11.5 / EVT-R） |
-| 鉴权 / 错误信封 / request-id / 限流 | ✅ | 方言检测（zai-* / anthropic-*），BigModel 409 → invalid_request_error（§11.1） |
-| Checkpoint 提交协议 | ✅ | 轮末不可变候选（json.gz/v1）+ sha256 校验 + fence CAS 发布 + GC keep=3（§9.4） |
-| 水位线恢复 | ✅ | 水位线+digest 一致 → Level 1 原生 resume；不一致 → Level 0 语义重放（仅 user/agent 消息）+ `runtime.recovered` 内部事件（§14.2.1 / REC-01~06） |
-| Worker 接管语义 | ✅ | 已 delivered 的过期租约不重放用户消息（terminal error）；持久化中断被接管方遵守（REC-01/02） |
-| 毒任务回收 | ✅ | attempt 耗尽 + 租约过期 → failed + `session.error(exhausted)` + idle(retries_exhausted)（REC-06） |
-| Idempotency-Key | ✅ | POST events：同 key 同 body 回放首次响应、异 body 409 idempotency_conflict（REC-07） |
-| Vaults / Credentials | ✅ | 信封加密（AES-256-GCM 双层，主密钥 `MAS_MASTER_KEY`）、API 永不回显（`***`+末 4 位）、轮换语义、归档（VLT-01~04/09） |
-| Files API | ✅ | multipart 上传、sha256 校验、before_id/after_id 分页、下载/删除（FILE-01~05） |
-| Session Resource 挂载 | ✅ | 创建/运行中挂载、worker 每轮物化到沙箱 uploads（只读语义）、卸载即消失（RES-01/02/06、SES-28） |
-| 输出清单 | ✅ | 轮末枚举 outputs → sha256 内容寻址上传 → fence CAS 发布 manifest → `(session,path,sha256)` 去重登记 File（§5.5 / REC-08） |
-| 能力协商 fail closed | ✅ | env.isolation 要求 vs provider 实际等级，不满足 → terminated + capability_unsatisfied，禁止降级（REC-09） |
-| digest 下线降级 | ✅ | 原 codex digest 不一致 → 强制 Level 0 + `runtime_upgraded`（retrying），会话可继续（REC-10） |
-| SandboxProvider 抽象 | ✅ | capabilities 协商 + create/pause/resume/destroy 生命周期 + sandbox_orphans 登记/reconcile（§9.0/§9.3）；FakeSandboxProvider（开发/测试）与 DockerProvider（runsc + CapDrop ALL + no-new-privileges + internal 网络 + 资源限额，§9.1） |
-| egress-proxy | ✅ | 出站授权 token（HMAC，绑定 fence，exp≤租约×2）、fence 4s 缓存校验、平台黑名单、limited/unrestricted 主机策略、凭据注入（剥离竞争头 + 占位符替换）、403 + x-mas-denied-host + `session.error{egress_denied}` 限频（§10.2/§10.4） |
-| 幂等全量（M5） | ✅ | POST agents/environments/sessions/vaults/credentials/events 全部支持 Idempotency-Key（同 key 同 body 回放、异 body 409） |
-| 指标与调试（M5） | ✅ | `GET /internal/metrics`（Prometheus 文本：请求计数/延迟/会话 gauge/SSE 连接/egress 拒绝）；`GET /internal/sessions/:id/debug`（内部事件 + runtime/checkpoint/output 全景）；`MAS_INTERNAL_TOKEN` 门禁 |
-| 运维手册（M5） | ✅ | [docs/OPS.md](docs/OPS.md)：部署形态、备份恢复、runtime 升级、故障排查表、告警建议 |
-| model-gateway（§10.3） | ✅ | Responses API 兼容 `POST /v1/responses`（流式 SSE 透传）；会话 token（`masmt_v1`，HMAC）鉴权后转发上游并注入真实 API key；从非流式/流式 `response.completed` 提取 usage 回写 `span.model_request_start/end{model_usage}` + 累计 `session.usage`；`mas_model_tokens_total{model,kind}` 指标 |
-| 确定性混沌车道（M3 3.9） | ✅ | 种子化（mulberry32）3 owner 并发真实 db 函数（claim/renew/append/checkpoint/output/settle + 双收/租约强过期/陈旧 fence 写）；六不变量逐步断言；`pnpm test:chaos [N]` 发布门禁（spec §17.2），种子固定可复现 |
-| Memory Store（M6 W11） | ✅ | 版本化键值树：store/memory/version 三表、precondition（content_sha256）更新、历史版本 redact、path_prefix/depth/view=full 列表（memory_prefix 元素）；会话挂载物化到 `/mnt/memory/<slug>`——read_only chmod 只读、read_write 轮末 diff 回写新版本（MEM-01~08 / SES-10） |
-| Skills（M6 W12） | ✅ | multipart zip 上传 → 规范化（剥公共根、越界剔除、200 文件上限静默截断）→ 版本化存储与下载；目录名冲突 409 `skill_directory_conflict`；agent.skills 引用（归档版本保留引用，删除受 409 保护）；会话挂载物化到 `/workspace/skills/<dir>/`（只读）；bootstrap 播种 source=zai 内置（SKL-01~07） |
-| Deployments（M6 W12） | ✅ | 5 字段 cron（自研引擎：≥5min 间隔、必须有未来触发点、时区固定 Asia/Shanghai）+ manual-only；agent 版本创建时固定；手动 run 202 → 调度器建会话投首轮 → 跟随 session 收尾；pause 不拦手动 run、归档幂等且拒 run；环境归档 → run 失败带 error；归档 agent 联动归档其 deployments；runs 过滤（deployment_id/has_error/trigger_type/created_at，limit 50）（DEP-01~09） |
-| Webhooks（M6 W13） | ✅ | 订阅会话事件 → outbox（webhook_deliveries）→ Standard Webhooks 签名投递（webhook-id/timestamp/signature v1 HMAC-SHA256）；非 2xx 指数退避重试（2^n 秒，6 次后 failed）；events 订阅过滤；secret（whsec_）仅创建时回显；投递状态 API 可观察 |
-| Fake Codex runtime | ✅ | JSON-RPC over stdio 的脚本化假 app-server（plan 1.9），支撑全部集成测试；`out <text>` 模拟沙箱产出 |
-| OpenAPI 3.1 规范 + TS SDK（plan 5.7） | ✅ | [docs/openapi.yaml](docs/openapi.yaml)：74 条 /v1 路由（与 fastify 注册表零漂移，双向断言）、BigModel 方言 headers（zai-version/zai-beta）、Bearer/x-api-key 双鉴权、统一错误信封；`pnpm gen:sdk` 生成类型 + `@mas/sdk` MasClient（错误信封→MasApiError、幂等键、multipart、SSE/二进制下载） |
-| Warm pool（M6 W13 最小实现） | ✅ | `WarmPoolProvider` 装饰器：预建 N 个空沙箱，create 快路径迟绑定（`attach`）+ 池空直落冷创建 + 串行后台补池（防过填/风暴）；worker `MAS_WARM_POOL_MIN` 开关；Fake provider 的 attach = §9.2 目录重物化（真实 provider 需挂会话卷，K8s CRD 二期） |
+[快速开始](#快速开始) · [SDK 示例](#typescript-sdk) · [API 概览](#api-概览) · [架构](#架构) · [设计文档](docs/DESIGN.md)
 
-未实现（按 plan 后续里程碑）：egress 的 HTTPS/TLS 终止与 worker 侧 prepare/attach/revoke 全生命周期接线（真实沙箱宿主接入时落）、OpenSandbox provider、OTel 链路 / Grafana 看板 / k6 性能压测（M5 5.2/5.3 的重型件，需专门基础设施）、K8s agent-sandbox CRD（provider 侧）/ multiagent lanes / custom tools / outcomes（M6 后续与二期）。当前 runtime 用 `FakeCodexDriver`（本机子进程）替代沙箱内的 `codex app-server`，`AgentRuntimeDriver` 接口与 spec §8.1 一致，可替换。
+</div>
+
+---
+
+## 这是什么
+
+muse-replicate 是一个**私有化部署**的 Managed Agents 平台参考实现（对标 BigModel Managed Agents /
+OpenAI Agents 托管形态）：业务方通过 HTTP API 定义 Agent、发起会话，平台在**隔离沙箱**中执行长时任务，
+实时推送事件流（SSE），并把会话状态、产出文件、token 用量全部落账可查。
+
+它不是玩具——以下问题都被认真设计并经过测试与混沌验证：
+
+- **可靠性**：事件日志是唯一事实来源；execution 级 fencing 防双写；worker 崩溃后按 checkpoint /
+  水位线自动恢复（Level 1 原生 resume / Level 0 语义重放）；毒任务自动回收。
+- **安全性**：凭据 AES-256-GCM 双层信封加密、API 永不回显；沙箱出站走 egress-proxy（token 绑定
+  fence + 主机策略 + 凭据注入）；模型调用经 model-gateway 注入上游 key，会话侧只见短期 token。
+- **可替换性**：沙箱（`SandboxProvider`）、运行时（`AgentRuntimeDriver`）、快照存储
+  （`SnapshotStore`）全部接口化——默认 Fake 实现支撑全套集成测试，接真实基础设施换实现即可。
+
+## 核心能力
+
+| 领域 | 能力 |
+| --- | --- |
+| **Agent 管理** | 版本化 CRUD（乐观锁、无变化不升版、metadata 按键合并）、归档联动、内置/自定义工具集与 MCP server 配置 |
+| **会话引擎** | 三种 agent 引用形态（id / id+version / overrides）+ 快照固化；排队事件与处理时定序（seq 单调）；审批流（`requires_action` → `user.tool_confirmation`）；持久化中断（interrupt 是状态不是信号） |
+| **可靠性** | `FOR UPDATE SKIP LOCKED` 抢占 + 30s 租约 + generation fencing；轮末不可变 checkpoint（sha256 校验 + fence CAS 发布）；水位线恢复与接管语义；`Idempotency-Key` 全量 POST 支持 |
+| **实时** | SSE 事件流（LISTEN/NOTIFY、15s 心跳、Last-Event-ID 回补、会话删除自动关闭） |
+| **安全** | Vault / Credentials（信封加密、轮换、脱敏回显）；egress-proxy（出站 token 绑定执行 fence、平台黑名单、limited/unrestricted 网络策略、竞争头剥离与凭据注入、拒绝可观察）；model-gateway（会话 token 鉴权、上游 key 注入、流式 usage 计量落账） |
+| **资源体系** | Files（multipart 上传 + sha256 + 游标分页）；会话资源挂载（file / memory / skill，运行中可增删，worker 每轮物化）；轮末输出内容寻址收集 + manifest CAS 发布 |
+| **Memory Store** | 版本化键值树（store → memory → version）；`precondition`（content_sha256）乐观并发；历史版本 redact；`path_prefix` / `depth` 折叠列表；会话挂载到 `/mnt/memory/<slug>`（只读强约束 / 可写轮末 diff 回写） |
+| **Skills** | zip 上传规范化（剥公共根、越界剔除、文件数上限）；内容寻址版本化存储；agent 引用闭环保护；挂载到 `/workspace/skills/<dir>/`（只读）；内置 skill 播种 |
+| **Deployments** | 5 字段 cron 定时调度（自研引擎：间隔 ≥5min、时区固定 Asia/Shanghai）+ 手动 run；agent 版本创建时固定；`upcoming_runs_at` 实时计算；暂停 / 归档语义完整 |
+| **Webhooks** | outbox 投递 + Standard Webhooks v1 签名（HMAC-SHA256）；指数退避重试（6 次上限）；事件订阅过滤；投递状态可查询 |
+| **开发者体验** | OpenAPI 3.1 规范（与路由零漂移，双向断言守护）+ `@mas/sdk` TypeScript SDK；统一错误信封与 request-id；BigModel / Anthropic 方言自适应 |
+| **运维** | `/internal/metrics`（Prometheus 文本）+ 会话级 debug 全景端点；docker-compose 一键起；确定性混沌门禁（200 种子并发注入） |
+
+> 当前沙箱运行时为 FakeCodexDriver（本机子进程），Docker+runsc provider 已实现待真实宿主验证；
+> OpenSandbox / K8s CRD 在路线图上。详见[实现状态](docs/DESIGN.md#能力矩阵验收编号对照)。
+
+## 架构
+
+```mermaid
+flowchart LR
+    client["业务方<br/>curl / @mas/sdk"] -->|"Bearer / x-api-key<br/>+ 方言 headers"| api["API Server (Fastify)<br/>/v1 路由 · SSE · 幂等 · 限流<br/>deployment / webhook 调度器"]
+    api <-->|"Kysely"| pg[("PostgreSQL<br/>session_events 事件日志 = 事实来源<br/>session_executions 队列 / fencing")]
+    pg -->|"LISTEN / NOTIFY"| worker["Session Worker<br/>租约 + renew + settle<br/>checkpoint / 输出收集 / 恢复"]
+    worker --> sbx["SandboxProvider<br/>Fake / Docker+runsc / WarmPool<br/>(capabilities 协商 fail-closed)"]
+    sbx --> rt["Codex Runtime<br/>AgentRuntimeDriver<br/>(JSON-RPC stdio)"]
+    rt -->|"http_proxy + 出站 token<br/>(绑定 execution fence)"| egress["egress-proxy<br/>主机策略 · 黑名单<br/>凭据注入"]
+    egress --> ext["外部 API"]
+    rt -->|"会话 token (masmt_v1)"| gw["model-gateway<br/>上游 key 注入<br/>流式 usage 计量"]
+    gw --> llm["上游 LLM<br/>(Responses API 兼容)"]
+```
 
 ## 快速开始
 
-需要：Node ≥ 22、pnpm ≥ 10、PostgreSQL（任意 16/17 实例，或用 docker compose）。
+前置：Node ≥ 22、pnpm ≥ 10、PostgreSQL 16+。
 
 ```bash
+git clone https://github.com/vibeforge2014/muse-replicate.git
+cd muse-replicate
 pnpm install
 
-# 方式一：docker compose（起 postgres + server + worker）
-docker compose -f deploy/compose/docker-compose.yml up --build
-
-# 方式二：本地开发（本仓库开发时用的是 5433 端口的本地实例）
+# 1) 建表（指向任意 PG 实例）
 export DATABASE_URL=postgres://<user>@localhost:5432/<db>
-pnpm --filter @mas/db migrate      # 建表
-pnpm dev:server                    # api（首次启动自动 bootstrap 并打印 API key）
-pnpm dev:worker                    # session-worker（另开终端）
-pnpm --filter @mas/egress-proxy start   # egress-proxy（默认 127.0.0.1:8081；MAS_EGRESS_SECRET 签发/验签）
-pnpm --filter @mas/model-gateway start  # model-gateway（默认 127.0.0.1:8082；MAS_GATEWAY_SECRET / MAS_UPSTREAM_BASE_URL / MAS_UPSTREAM_API_KEY）
-```
+pnpm --filter @mas/db migrate
 
-冒烟：
+# 2) 起服务（首次启动自动 bootstrap 工作区并打印 API key）
+pnpm dev:server                     # API，默认 127.0.0.1:8080
+pnpm dev:worker                     # 会话 worker（另开终端）
 
-```bash
+# 3) 冒烟：Agent → Session → 发消息 → 读事件
 API_KEY=<启动时打印的 mas_sk_...> npx tsx scripts/smoke.ts
 ```
 
-测试（需要本地 PG，默认 `postgres://mas@localhost:5433/mas_test`，用 `DATABASE_URL` 覆盖；测试会清空该库）：
+或者 docker compose 一把梭（postgres + server + worker）：
 
 ```bash
-pnpm test        # 149 个集成用例：AUTH/AGT/ENV/SES/EVT/EVT-R/TOOL/ORD/REC/FILE/RES/VLT/EGRESS/M5/GATEWAY/MEM/SKL/DEP/WEBHOOK/OAS+WARM
-pnpm gen:sdk      # 由 docs/openapi.yaml 重新生成 @mas/sdk 类型（tests/openapi.test.ts 守护提交物同步）
-pnpm test:chaos 200   # 确定性混沌门禁：200 个种子全绿（spec §17.2）
+docker compose -f deploy/compose/docker-compose.yml up --build
 ```
 
-## API 一览（BigModel 方言 headers：`zai-version: 2026-05-26`，`zai-beta: managed-agents-2026-05-26`）
+> egress-proxy（8081）与 model-gateway（8082）为可选组件，接真实沙箱出站 / 上游模型时启用，
+> 见 [docs/OPS.md](docs/OPS.md#1-部署形态)。
+
+### 第一次调用
 
 ```bash
 KEY=mas_sk_...; BASE=http://127.0.0.1:8080
 
-# Agent（版本化）
+# Agent（版本化；model 为对象形态）
 curl -XPOST $BASE/v1/agents -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"name":"demo","model":{"id":"glm-5.3-flash"},"tools":[{"type":"agent_toolset_20260601","default_config":{"permission_policy":{"type":"always_allow"}}}]}'
-curl $BASE/v1/agents -H "authorization: Bearer $KEY"
 
-# Environment
+# Environment（沙箱/网络配置）
 curl -XPOST $BASE/v1/environments -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"name":"default","config":{"type":"cloud"}}'
 
 # Session + 一轮对话
 curl -XPOST $BASE/v1/sessions -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"agent":"agent_xxx","environment_id":"env_xxx"}'
-curl -XPOST $BASE/v1/sessions/sesn_xxx/events -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
-  -d '{"events":[{"type":"user.message","content":[{"type":"text","text":"run echo hi"}]}]}'
-curl $BASE/v1/sessions/sesn_xxx/events -H "authorization: Bearer $KEY"     # 历史
-curl -N $BASE/v1/sessions/sesn_xxx/events/stream -H "authorization: Bearer $KEY"  # SSE
+  -d '{"agent":"agent_xxx","environment_id":"env_xxx","initial_events":[{"type":"user.message","content":[{"type":"text","text":"hello"}]}]}'
+
+curl $BASE/v1/sessions/sesn_xxx/events -H "authorization: Bearer $KEY"           # 事件历史
+curl -N $BASE/v1/sessions/sesn_xxx/events/stream -H "authorization: Bearer $KEY" # SSE 实时流
 ```
 
-## 仓库结构（对应 spec §18）
+### TypeScript SDK
+
+类型由 OpenAPI 规范生成（`pnpm gen:sdk`），与手写 client 一起发布为 `@mas/sdk`：
+
+```ts
+import { createMasClient, MasApiError } from "@mas/sdk";
+
+const client = createMasClient({
+  baseUrl: "http://127.0.0.1:8080",
+  apiKey: process.env.MAS_API_KEY!, // 自动携带 zai-version / zai-beta 方言 headers
+});
+
+// 定义 agent 与运行环境
+const agent = await client.createAgent({ name: "demo", model: { id: "glm-5.3-flash" } });
+const env = await client.createEnvironment({ name: "default", config: { type: "cloud" } });
+
+// 开会话 + 发消息（支持 Idempotency-Key）
+const session = await client.createSession({
+  agent: agent.id,
+  environment_id: env.id,
+  initial_events: [{ type: "user.message", content: [{ type: "text", text: "跑一下" }] }],
+});
+await client.sendEvents(session.id, [
+  { type: "user.message", content: [{ type: "text", text: "再来一轮" }] },
+], { idempotencyKey: "msg-001" });
+
+// 事件历史 / SSE / 长期记忆 / 定时调度……同一 client 全覆盖
+const events = await client.listEvents(session.id, { limit: 100 });
+const store = await client.createMemoryStore({ name: "kb" });
+const dep = await client.createDeployment({
+  agent: agent.id, environment_id: env.id, schedule: "*/5 * * * *",
+});
+
+// 非 2xx 统一抛 MasApiError（status / errorType / requestId 来自错误信封）
+try { await client.getSession("sess_nope"); }
+catch (e) { if (e instanceof MasApiError) console.log(e.status, e.errorType); } // 404 not_found_error
+```
+
+## API 概览
+
+完整契约见 **[docs/openapi.yaml](docs/openapi.yaml)**（OpenAPI 3.1，74 个操作，
+含 BigModel 方言 headers、双鉴权方案与统一错误信封）——规范与 fastify 路由注册表**零漂移**，
+由测试双向断言守护。
+
+| 分组 | 端点（示例） | 说明 |
+| --- | --- | --- |
+| Agents | `POST/GET /v1/agents`、`GET /v1/agents/{id}`、`GET /v1/agents/{id}/versions` | 版本化 CRUD + 归档 |
+| Environments | `POST/GET /v1/environments`、`POST /v1/environments/{id}` | 沙箱/网络/包配置 |
+| Sessions | `POST/GET /v1/sessions`、`POST /v1/sessions/{id}/resources` | 生命周期 + 资源挂载 |
+| Events | `POST/GET /v1/sessions/{id}/events`、`GET .../events/stream` | 准入定序 + SSE |
+| Files | `POST /v1/files`、`GET /v1/files/{id}/content` | 上传下载 + 内容寻址 |
+| Vaults | `POST /v1/vaults`、`POST /v1/vaults/{id}/credentials` | 凭据信封加密管理 |
+| Memory | `POST /v1/memory-stores`、`POST .../memories`、`POST .../versions/{vid}/redact` | 版本化记忆树 |
+| Skills | `POST /v1/skills`、`POST /v1/skills/{id}/versions`、`GET .../content` | zip 版本化技能 |
+| Deployments | `POST /v1/deployments`、`POST /v1/deployments/{id}/runs`、`GET /v1/deployment_runs` | cron 调度 + 手动 run |
+| Webhooks | `POST /v1/webhooks`、`GET /v1/webhooks/{id}/deliveries` | 签名投递 + 重试 |
+
+## 测试与验证
+
+```bash
+pnpm test            # 149 个集成用例（真实 PG + 真实 HTTP + 假沙箱 runtime）
+pnpm test:chaos 200  # 确定性混沌门禁：200 个种子并发注入（双收/租约强过期/陈旧 fence），六不变量逐步断言
+pnpm typecheck       # 6 个工程 TypeScript strict 全量检查
+```
+
+验证体系的三道防线：
+
+1. **集成测试**：验收用例驱动（鉴权/CRUD/事件/审批/恢复/凭据/网络/文件/记忆/技能/调度/Webhook/OpenAPI/warm pool），
+   跑在真实 PostgreSQL 上，覆盖崩溃接管、重放幂等等故障路径。
+2. **混沌门禁**：mulberry32 种子化驱动 3 个 worker 并发执行真实 db 函数——重复收集、租约强过期、
+   陈旧 fence 写入必须被拒；种子固定，任何回归可精确复现。
+3. **契约守护**：OpenAPI 规范 ↔ 路由注册表零漂移（双向断言）；生成物与规范同步性有专门测试
+   （改规范忘重新生成 SDK 即红）。
+
+## 仓库结构
 
 ```text
-packages/core        # ID/ULID、MasError（方言错误信封）、分页游标、Zod schema（Agent/Env/Session/Event/Memory）、AES-256-GCM 信封加密、5 字段 cron 引擎
-packages/db          # Kysely + pg：前向迁移（11 组）、repos（准入/定序/claim/renew/settle/reap/历史）、checkpoint/output/vault/memory/skills/deployments/webhooks
+packages/core        # 领域内核：ID/ULID、方言错误信封、Zod schema、信封加密、cron 引擎
+packages/db          # Kysely + pg：前向迁移（11 组）与全部 repos（定序/claim/checkpoint/...）
 packages/runtime     # AgentRuntimeDriver 接口 + FakeCodexDriver（JSON-RPC stdio 假 app-server）
-packages/sandbox     # SandboxProvider 抽象（capabilities/create/attach/pause/resume/destroy）+ Fake/Docker provider + WarmPoolProvider 预热池 + orphan 登记
-packages/sdk         # @mas/sdk：openapi-typescript 生成的类型 + MasClient（fetch 封装，错误信封→MasApiError）
-packages/egress      # 出站 token（maseg_v1）签发/验签、主机策略/黑名单匹配
-apps/server          # Fastify：鉴权、request-id、方言、限流、幂等、Agent/Env/Session/Events/Vault/File/Memory/Skill/Deployment/Webhook 路由 + SSE + 指标/调试 + 部署态常驻调度器（deployment/webhook）
-apps/worker          # session-worker：NOTIFY + 扫描驱动，SessionRunner 持租约执行（checkpoint/输出/恢复/接管）
-apps/egress-proxy    # 沙箱出站代理（fence 校验 + 凭据注入 + 主机策略）
-apps/model-gateway   # Responses API 网关（会话 token 鉴权 + 上游 key 注入 + 流式计量落账）
+packages/sandbox     # SandboxProvider（Fake / Docker+runsc / WarmPool 预热池）+ orphan reconcile
+packages/sdk         # @mas/sdk：OpenAPI 生成的类型 + MasClient
+packages/egress      # 出站 token 签发/验签、主机策略匹配
+apps/server          # Fastify API：/v1 全部路由 + SSE + 指标/调试 + 常驻调度器
+apps/worker          # session-worker：NOTIFY 驱动，租约执行与恢复
+apps/egress-proxy    # 沙箱出站代理（fence 校验 + 凭据注入 + 网络策略）
+apps/model-gateway   # Responses API 网关（上游 key 注入 + 流式计量落账）
 deploy/compose       # docker-compose（postgres + server + worker）
-tests/               # 集成测试（test-case-plan 的 P0/P1 子集 + chaos-harness）
-scripts/smoke.ts     # 端到端冒烟；scripts/chaos.ts 混沌门禁
+tests/               # 集成测试 + chaos-harness
+docs/                # openapi.yaml / OPS.md / DESIGN.md
+spec.md · plan.md · test-case-plan.md   # 架构规格 / 执行计划 / 验收用例
 ```
 
-## 关键设计落地（与 spec 章节映射）
+## 关键配置
 
-- **事件日志是唯一事实来源**（§1.2/§5.4/§7.3）：`session_events(seq 可空, processed_at, disposition, source_event_id 唯一, generation)`；用户输入由 api 写入（排队，`processed_at=null`，历史可见），worker claim 后在 fence 内定序（`seq = last+1`，`processed_at` 会话内单调唯一）；`GET events` 按 `ORDER BY seq NULLS LAST`（= 按 processed_at），排队事件排在 asc 末尾。
-- **单写者 + execution 级 fencing**（§5.6/§7.1）：`session_executions` 表即队列即 WAL；claim 用 `FOR UPDATE SKIP LOCKED` 一次完成（state/owner/attempt_id/generation+1/attempt_count/lease）；事件追加前校验 fence（旧 generation 写入被拒）；settle 前强制再续约。
-- **中断是持久状态**（§6）：POST events 同一事务内写 `interrupt_requested_at`、取消同 lane 的 queued 输入（其事件定序并标记 `flushed`，保留在历史）；worker tick 检测后调用 `turn/interrupt`；requires_action 期间的 interrupt 生成 `kind=interrupt` 执行，未决审批按 deny 处理。
-- **审批映射**（§8.2/§12.1）：`always_ask` → driver `approvalPolicy=untrusted`；`item/awaitingApproval` → `agent.tool_use(evaluated_permission=ask)` + `session.status_idle{requires_action, event_ids}`；`user.tool_confirmation` 走 `kind=tool_confirmation` execution 回写 runtime；resolution 校验 404/409。
-- **SSE**（§11.5）：每连接独立 LISTEN client；先 LISTEN 再回补再按 seq 去重；无 Last-Event-ID 时从当前 max(seq) 起步（默认只推实时）；15s 心跳；删除会话用 `pg_notify(payload='deleted')` 推送合成 `session.deleted` 帧后关闭。
-- **Checkpoint 提交协议**（§9.4）：每轮 settle 后写 `watermark.json` 到 runtime home → 打包不可变候选（`json.gz/v1`，目录文件集的 gzip JSON）→ 重新读取校验 sha256 → 事务内 CAS 发布（fence 失效则候选作废）→ GC 保留最近 3 个。对象存储走 `SnapshotStore` 抽象（MVP 为本地 `FsSnapshotStore`，接 MinIO 换 S3 实现）。
-- **输出清单**（§5.5）：轮末枚举沙箱 outputs 目录，逐文件 sha256 后按 `outputs/{session}/{sha256}` 内容寻址上传（字节一致 = 幂等）；manifest 只有当前 fence 能 CAS 发布为 `sessions.active_output_manifest`；条目登记为 session 范围 File，`(scope_id, filename, sha256)` 唯一索引保证重复收集不产生重复 File（REC-08）；失败条目写 `session.error{output_incomplete}`。
-- **凭据与挂载**（§10.1/§5.5）：机密字段双层 AES-256-GCM 信封加密（数据密钥 + 主密钥包裹），API 只回 `***`+末 4 位；会话创建校验 `vault_ids`（存在/同租户/未归档）；File Resource 由 worker 每轮物化到 `<home>/uploads/<mount_path>`（重挂载重建、卸载即删）。
-- **能力协商**（§9.0）：环境 `config.isolation`（gvisor/microvm/runc，缺省 = 平台默认 gvisor|microvm）对 worker 的 `providerIsolation`（`MAS_SANDBOX_ISOLATION`）校验，不满足 fail closed → `terminated` + `session.error{capability_unsatisfied}`，禁止静默降级（REC-09）。
-- **沙箱 provider**（§9）：`SandboxProvider` 是 worker 与沙箱实现的唯一边界——`capabilities()` 供 §9.0 fail closed 协商（Fake 声明式，Docker 探测 runsc runtime 后如实上报）；`create()` 落 §9.2 目录约定（DockerProvider 挂载 `/session/.codex`、`/mnt/session/outputs`、只读 uploads）；强杀失败记 `sandbox_orphans`（不含 fence token，reaper 只能销毁不能发布状态）。
-- **egress-proxy**（§10.2/§10.4）：沙箱 `http_proxy` 指向本服务，`proxy-authorization` 携带出站 token（HMAC 签名，claims 绑定 workspace/session/execution/generation/sandbox，签发走 `POST /internal/bindings` + 管理密钥）。每请求：token 验签/时效 → fence 时效（generation 数值比较，4s 缓存）→ 黑名单（元数据服务/RFC1918）→ 凭据命中（先按会话 `vault_ids` 缩小候选再按 host 匹配，剥离 `authorization`/`x-api-key` 后注入真实值，占位符 `mas_ph_*` 永不出代理）→ env networking（limited 按 allowed_hosts 通配、unrestricted 仅 80/443）；拒绝带 `x-mas-denied-host`，`session.error{egress_denied}` 同 host 每分钟至多一条。
-- **水位线恢复**（§14.2.1）：接管方 acquire runtime 时判定 —— `active_workspace_checkpoint.completed_execution_watermark === sessions.last_completed_execution_id` 且 `codex_version_digest` 一致 → **Level 1**（restoreCheckpoint 还原文件 + `thread/resume` 原生续聊）；否则（checkpoint 缺失/落后/损坏）→ **Level 0** 语义恢复：从事件日志重放 `user.message`/`agent.message` 文本（绝不重放工具输入），写内部事件 `runtime.recovered{mode, reason}`；checkpoint 校验失败额外写 `session.error{checkpoint_corrupt}`。
-- **model-gateway**（§10.3）：`POST /v1/responses`（Responses API 兼容，流式 SSE 透传）。会话侧只持 `masmt_v1` 短期 token（claims：ws/sesn/exp/jti，`POST /internal/tokens` 凭管理密钥签发）；网关验签后剥离会话凭证、注入上游真实 API key 转发；从响应（非流式 JSON 或流式 `response.completed` 帧）提取 usage，以 API 身份回写 `span.model_request_start/end{model_usage, is_error}` 与累计 `session.usage`（物化 `sessions.usage`）；`GET /internal/metrics` 暴露 `mas_model_tokens_total{model,kind}`。
-- **OpenAPI 规范即契约**（plan 5.7）：手写 docs/openapi.yaml + `app.addHook("onRoute")` 登记路由表，tests/openapi.test.ts 双向断言零漂移（fastify 有而规范无 = 失败；规范有而 fastify 无 = 失败）；生成物 schema.d.ts 与规范的同步性同样有测试守护（改规范忘 gen:sdk 即红）。
-- **Warm pool 迟绑定**（§9.3 二期）：预热沙箱以占位 spec（sessionId=warmup、临时宿主目录）预建；acquire 时 `attach(sandboxId, realSpec)` 绑定会话目录——Fake provider 下即目录约定重物化，真实 provider（Docker/OpenSandbox/K8s）应挂会话卷；补池走串行 promise 链（构造预热/出池补池/prewarm 同队列），杜绝并发过填。
-- **确定性混沌车道**（§5.20 / M3 3.9）：mulberry32 种子化随机驱动 3 个 owner 并发执行真实 db 函数（claim/renew/append/checkpoint/output/settle），动作含重复收集（幂等）、租约强过期（重写 `lease_expires_at` 模拟时钟推进）、陈旧 fence 写入（必须被 409 拒绝）；每步后断言六不变量：陈旧 fence 写拒、seq 连续、active checkpoint 可校验、输出无重复、接管语义、settle 后可恢复。`pnpm test:chaos [N=200]` 为发布门禁（§17.2），种子固定可复现。
-- **Memory Store**（plan M6 W11 / §19）：store（name→slug，workspace 内唯一）→ memory（`(store, path)` 唯一）→ memory_versions（每次写入追加，`head_version` 指针）。precondition 更新按 head `content_sha256`（不一致 409），条件删除同理；redact 只允许历史版本（head 409），redact 后 path/content/sha 置 null；list 支持 `path_prefix`/`depth`（深层折叠为 `memory_prefix` 元素）/`view=full`（limit ≤20）。会话以资源形态挂载（上限 8 个）：worker 每轮把 head 版本物化到 `<home>/mnt/memory/<slug>`（read_only 挂载 chmod 555/444，agent 写入 EACCES；read_write 挂载轮末 diff 回写新版本，并发以 precondition 乐观锁让位）。
-- **Skills**（plan M6 W12 / §19）：上传 zip → `normalizeSkillZip`（剔绝对路径/`..` 段、剥公共根目录、path 排序后 200 文件截断、根必须有 SKILL.md）→ 重打包内容寻址存储 `skills/{id}/v{n}.zip`。`(workspace, directory)` 唯一（409 `skill_directory_conflict`）；`agent.skills` 引用随版本快照固化，删除 skill 前查全部 `agent_versions.config->skills`（历史版本保留引用即拒绝）；会话资源挂载（可 pin 版本）由 worker 物化到 `<home>/workspace/skills/<dir>/` 并 chmod 只读；bootstrap 幂等播种 `source=zai` 内置。
-- **Deployments**（plan M6 W12）：自研 5 字段 cron（分钟步进求值，Asia/Shanghai 固定 UTC+8）：可解析 + 存在未来触发点 + 连续触发间隔 ≥5min 才接受。创建时 `agent_version` 固定为当前 head；`upcoming_runs_at` 按 cron 实时计算（paused/archived 为空）。调度 tick 三步：schedule 到点补 run（以 `last_scheduled_at` 为锚，每次至多一个）→ pending run 校验 env/agent 后建会话并 `admitEvents` 投首轮（`input.message`）→ running run 跟随 session（`stop_reason` 非空才算收尾，避免把未认领的新会话误判完成）。归档 agent 联动归档其 deployments。
-- **Webhooks**（plan M6 W13 / §19）：事件写入路径（`appendEvent`/`appendApiEvent`，事务外尽力而为）按订阅过滤入 outbox；分发器 POST `{id, type, timestamp, data}` 并带 Standard Webhooks 头——`webhook-signature: v1,base64(HMAC-SHA256(base64decode(whsec_...), "${id}.${ts}.${body}"))`；非 2xx/网络错误按 2^attempts 秒退避重试，6 次后 failed；secret 仅创建响应回显一次。
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DATABASE_URL` | – | PostgreSQL 连接串 |
+| `PORT` / `HOST` | `8080` / `127.0.0.1` | API 监听地址 |
+| `MAS_MASTER_KEY` | 开发默认（**生产必设**） | 机密信封加密主密钥（64 位 hex） |
+| `MAS_EGRESS_SECRET` | 开发默认（**生产必设**） | 出站 token 签发密钥 |
+| `MAS_GATEWAY_SECRET` | 开发默认（**生产必设**） | model-gateway 会话 token 密钥 |
+| `MAS_UPSTREAM_BASE_URL` / `MAS_UPSTREAM_API_KEY` | – / – | model-gateway 上游与真实 key |
+| `MAS_FILES_DIR` / `MAS_SNAPSHOT_DIR` | `/tmp/mas-files` / `/tmp/mas-snapshots` | 文件与 checkpoint 对象根目录 |
+| `MAS_INTERNAL_TOKEN` | 未设置=开放 | `/internal/*`（metrics/debug）门禁 |
+| `MAS_SANDBOX_ISOLATION` | `gvisor` | Fake provider 声明的隔离等级 |
+| `MAS_WARM_POOL_MIN` | `0`（关） | worker 沙箱预热池保温数量 |
 
-## 与规格的已知偏差（务实取舍）
+完整列表与部署形态、备份恢复、故障排查见 **[docs/OPS.md](docs/OPS.md)**。
 
-1. runtime 为 FakeCodexDriver（本机子进程 + `/tmp` rollout），非沙箱内 `codex app-server`；协议形态一致（initialize/thread/start/turn/start/item/*/turn/completed），替换真实 driver 不动 worker。
-2. api 在 `requires_action` 等状态下可能从快照读 stop_reason 而非事件推导（物化视图已同步维护）。
-3. 限流为单进程内存令牌桶；多实例部署需换 PG/Redis（spec §13.4 预留）。
-4. checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。
-5. File 内容与 output 对象存本地 FS（`MAS_FILES_DIR`，默认 `/tmp/mas-files`）而非 MinIO；Key 布局与 spec 一致（`files/{org}/{file_id}`、`outputs/{session}/{sha256}`），换 S3 实现即可。
-6. egress-proxy MVP 只处理 HTTP 绝对 URI 形态（无 CONNECT/TLS 终止）；真实部署需镜像预置企业 CA、代理按 SNI 签发证书（§10.1）。worker 侧 prepare/attach/revoke 生命周期接线随真实沙箱宿主落地。
-7. DockerProvider 通过 docker CLI 驱动（非 dockerode），且未在 runsc 宿主上验证（macOS 开发机不可用）；结构按 §9.1 硬编码全部隔离参数。
-8. 沙箱能力协商目前 FakeSandboxProvider 为声明式（`MAS_SANDBOX_ISOLATION`/构造参数），DockerProvider 已按 runsc 探测如实上报。
-9. agent 事件 `span.model_request_*`/`session.usage` 经 model-gateway 落账（§10.3：网关在响应完成时以 API 身份回写 span 与累计 usage，并物化 `sessions.usage`）；FakeCodexDriver 不调用模型，计量验收用例直接驱动 gateway。指标端点为单进程聚合，多实例部署需加 Prometheus 联邦或 pushgateway。
-10. 文件上传（multipart）暂未接 Idempotency-Key（请求体哈希需累积原始流，随 M6 补）。
-11. 混沌车道中的“租约过期”通过重写 `lease_expires_at` 模拟（SQL 时钟无法虚拟化），其余动作全部走真实 db 函数。
-12. Memory Store 内容存 PG（单条 ≤100 KiB，符合验收上限），未拆对象存储；read_write 挂载的回写是轮末 diff——worker 在 agent 写入与回写之间崩溃会丢该轮记忆写入（真实部署用沙箱内 watcher 实时上报）；agent 删除文件不产生版本 tombstone。read_only 的强只读靠 chmod（555/444），root 进程可绕过（真沙箱内由 gvisor/rootfs 保证）。
-13. Deployments 的 cron 时区按平台方言硬编码 Asia/Shanghai（UTC+8 无夏令时，直接偏移求值）；deployment/webhook 两个调度器为 api 进程内 setInterval（单实例假设），多实例部署需加选主或拆独立 scheduler 进程；schedule 到点的补跑以 `last_scheduled_at` 为锚每次一个 tick 至多补一个 run（暂停期不累积风暴）。
-14. Webhook secret（whsec_）以明文存 PG（签名需要原值；生产建议 KMS 信封加密后存）；投递为单进程串行（每 tick ≤10 条）；outbox 不做死信告警之外的清理。
+## 文档
 
-## 后续路线（按 plan.md）
+| 文档 | 内容 |
+| --- | --- |
+| [spec.md](spec.md) | 后端架构规格（事件模型 / fencing / 恢复协议 / 安全边界，全部设计溯源） |
+| [plan.md](plan.md) | 里程碑执行计划（M0–M6） |
+| [test-case-plan.md](test-case-plan.md) | 验收用例（BigModel Managed Agents 方言子集） |
+| [docs/DESIGN.md](docs/DESIGN.md) | 能力矩阵（验收编号对照）、关键设计落地映射、已知偏差与路线状态 |
+| [docs/openapi.yaml](docs/openapi.yaml) | OpenAPI 3.1 契约（74 操作） |
+| [docs/OPS.md](docs/OPS.md) | 运维手册（部署 / 备份 / 升级 / 排查） |
 
-M3 已完成（checkpoint/水位线恢复 + REC-01~07）→ M4 已完成（Vault/Files/Resources + 输出清单 + REC-08/09/10；SandboxProvider + DockerProvider + egress-proxy）→ M5 已完成可落地件（幂等全量、指标/调试端点、运维手册 docs/OPS.md）→ model-gateway（§10.3，流式计量落账）+ 确定性混沌车道（M3 3.9，`pnpm test:chaos 200` 门禁）已完成（测试 139/139 绿）→ M6 W11-W13 已完成：Memory Store、Skills、Deployments、Webhooks → plan 5.7 已完成：OpenAPI 3.1 规范 + @mas/sdk（74 路由零漂移）、warm pool 最小实现（FakeSandboxProvider 预热池 + attach 迟绑定，MAS_WARM_POOL_MIN 开关）→ 剩余：egress TLS 终止与 worker 生命周期接线、OpenSandbox provider、OTel/k6（需专门基础设施）、K8s CRD provider / multiagent lanes / outcomes。
+## 实现状态
+
+**已落地**：MVP 核心 → 审批/中断/checkpoint 恢复 → Vault/Files/egress → 幂等/指标/运维 →
+model-gateway → 混沌门禁 → Memory Store / Skills / Deployments / Webhooks → OpenAPI + SDK → warm pool。
+
+**进行中 / 规划**：egress TLS 终止与沙箱生命周期接线、OpenSandbox / K8s CRD provider、
+OTel 链路与压测、multiagent lanes、custom tools、outcomes。
+
+细粒度状态与已知偏差（14 项务实取舍）见 [docs/DESIGN.md](docs/DESIGN.md#与规格的已知偏差务实取舍)。

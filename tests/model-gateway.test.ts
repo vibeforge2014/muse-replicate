@@ -102,6 +102,17 @@ function gwPost(path: string, token: string, body: unknown): Promise<{ status: n
   });
 }
 
+/** 计量事件与响应返回是最终一致的（网关在响应完成时异步落账）：慢机器上轮询到出现再断言。 */
+async function listEventsUntil(sid: string, predicate: (events: any[]) => boolean, timeoutMs = 15_000): Promise<any[]> {
+  const start = Date.now();
+  for (;;) {
+    const events = await listEvents(url, key, sid);
+    if (predicate(events)) return events;
+    if (Date.now() - start > timeoutMs) throw new Error(`gateway events not seen within ${timeoutMs}ms`);
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
 describe("model-gateway（单元：会话 token）", () => {
   test("签发/校验往返；过期与篡改拒绝", () => {
     const t = issueSessionToken("ws_a", "sesn_b");
@@ -126,7 +137,8 @@ describe("model-gateway（集成）", () => {
     expect(upstreamAuthSeen[before]).toBe(`Bearer ${UPSTREAM_KEY}`);
     expect(r.body).not.toContain("masmt_v1");
 
-    const events = await listEvents(url, key, sid);
+    const events = await listEventsUntil(sid, (evts) =>
+      evts.some((e) => e.type === "span.model_request_end") && evts.some((e) => e.type === "session.usage"));
     const start = events.find((e) => e.type === "span.model_request_start");
     expect(start?.model_usage?.model).toBe("glm-5.3");
     const end = events.find((e) => e.type === "span.model_request_end");
@@ -151,7 +163,10 @@ describe("model-gateway（集成）", () => {
     const r2 = await gwPost("/v1/responses", token, { model: "glm-5.3", input: "again", stream: true });
     expect(r2.status).toBe(200);
 
-    const events = await listEvents(url, key, sid);
+    const events = await listEventsUntil(
+      sid,
+      (evts) => evts.filter((e) => e.type === "session.usage").length >= 2,
+    );
     const usages = events.filter((e) => e.type === "session.usage");
     expect(usages.length).toBe(2);
     expect(usages[1]?.usage).toMatchObject({ input_tokens: 240, output_tokens: 68, cache_read_input_tokens: 20 });

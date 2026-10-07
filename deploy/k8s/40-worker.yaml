@@ -26,8 +26,12 @@ spec:
           command: ["npx", "tsx", "apps/worker/src/main.ts"]
           env:
             - { name: DATABASE_URL, value: "postgres://mas@postgres:5432/mas_dev" }
-            - { name: MAS_FILES_DIR, value: /var/mas/files }
-            - { name: MAS_SNAPSHOT_DIR, value: /var/mas/snapshots }
+            # 对象存储走 MinIO（55-minio.yaml）——worker 与 api 必须同后端（checkpoint/输出一致性）
+            - { name: MAS_OBJECT_STORE, value: s3 }
+            - { name: MAS_S3_ENDPOINT, value: "http://minio.mas.svc.cluster.local:9000" }
+            - { name: MAS_S3_ACCESS_KEY, value: mas-minio }
+            - { name: MAS_S3_SECRET_KEY, value: mas-minio-dev-secret }
+            - { name: MAS_S3_BUCKET, value: mas-objects }
             # - { name: MAS_WARM_POOL_MIN, value: "2" }
           volumeMounts:
             - { name: files, mountPath: /var/mas/files }

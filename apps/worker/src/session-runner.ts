@@ -14,7 +14,7 @@ import {
   FAKE_CODEX_DIGEST,
   reapExhaustedExecutions,
   fakeCodexHome,
-  FsSnapshotStore,
+  objectStoreFromEnv,
   getSessionRow,
   listFallbackCheckpoints,
   markCheckpointCorrupt,
@@ -73,8 +73,8 @@ export interface RunnerFaults {
 export class SessionRunner {
   private runtimes = new Map<string, HeldRuntime>();
   private disposed = false;
-  /** File 内容存储（与 api 同根；MVP 本地 FS）。 */
-  private filesStore = new FsSnapshotStore(process.env.MAS_FILES_DIR ?? "/tmp/mas-files");
+  /** File 内容存储（与 api 同根；MAS_OBJECT_STORE=s3 时同为 MinIO/S3）。 */
+  private filesStore = objectStoreFromEnv(process.env, process.env.MAS_FILES_DIR ?? "/tmp/mas-files");
   /** 测试故障注入（spec §5.19 的进程内等价物）。 */
   readonly faults: RunnerFaults = {};
 
@@ -84,7 +84,7 @@ export class SessionRunner {
     private db: Kysely<Database>,
     private driver: AgentRuntimeDriver,
     private workerId = `worker_${process.pid}`,
-    private store: SnapshotStore = new FsSnapshotStore(process.env.MAS_SNAPSHOT_DIR ?? "/tmp/mas-snapshots"),
+    private store: SnapshotStore = objectStoreFromEnv(process.env, process.env.MAS_SNAPSHOT_DIR ?? "/tmp/mas-snapshots"),
     /** 沙箱 provider（或其声明的隔离等级字符串；Fake provider 兜底）。 */
     providerOrIsolation: SandboxProvider | string = new FakeSandboxProvider(
       (process.env.MAS_SANDBOX_ISOLATION as "gvisor" | "microvm" | "runc") ?? "gvisor",

@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: mas
+  labels: { app: minio }
+spec:
+  selector: { app: minio }
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+      nodePort: 30900
+      # NodePort 供集群外（开发机）直连测试；生产应走 Ingress/TLS
+    - name: console
+      port: 9001
+      targetPort: 9001
+      nodePort: 30901
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: mas
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          # 开发默认凭据（部署时务必覆盖）；镜像经 deploy/k8s/README 的 mirror 拉取
+          image: minio/minio:latest
+          # 离线导入（docker save | k3s ctr images import）时避免 Always 重拉
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: mas-minio
+            - name: MINIO_ROOT_PASSWORD
+              value: mas-minio-dev-secret
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /minio/health/live, port: 9000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 20Gi

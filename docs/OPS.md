@@ -55,6 +55,9 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_WARM_POOL_MIN` | `0`（关） | worker 预热池保温数量（spec §9.3）：>0 时沙箱 create 走快路径（预建空沙箱 attach 迟绑定），池空直落冷创建；关停时自动 drain 池内沙箱 |
 | `MAS_RATELIMIT_BACKEND` | `memory` | 限流后端：`memory`=单进程令牌桶（零开销，单实例部署）；`pg`=`rate_limit_buckets` 行锁令牌桶（事务 + FOR UPDATE 串行化并发，elapsed 由 DB 时钟计算——多实例时钟偏移免疫，`MAS_RATELIMIT_BURST` 只在测试/本地放宽）；DB 故障时 **fail-open**（可用性优先，warn 日志可观察） |
 | `MAS_RATELIMIT_BURST` / `MAS_RATELIMIT_PER_MIN` | – | 限流令牌桶（仅测试/本地放宽用；生产走 spec §11.1 默认值） |
+| `MAS_OBJECT_STORE` | `fs` | 对象存储后端：`fs`=本地目录（单机）；`s3`=S3 兼容（MinIO/S3，SigV4 手写签名零依赖）。key 布局两种后端一致，可无损切换 |
+| `MAS_S3_ENDPOINT` / `MAS_S3_REGION` | – / `us-east-1` | S3 端点（path-style，如 `http://minio.mas.svc.cluster.local:9000`）与区域 |
+| `MAS_S3_ACCESS_KEY` / `MAS_S3_SECRET_KEY` / `MAS_S3_BUCKET` | – | S3 凭据与桶（`MAS_OBJECT_STORE=s3` 时必填，桶不存在自动创建）。put 走条件写（If-None-Match，MinIO ≥2024-08 / AWS S3），putIfAbsent 按 etag(md5) 比对 |
 | `MAS_RUNTIME_DRIVER` | `fake` | worker 的 runtime driver：`fake`=FakeCodexDriver（脚本化假 runtime，零额度消耗）；`codex`=真实 codex app-server（CodexDriver） |
 | `MAS_CODEX_BIN` | `codex`（PATH） | 真实 driver 的 codex 可执行文件路径（如 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`） |
 | `MAS_CODEX_AUTH_FILE` | `~/.codex/auth.json` | 每会话 CODEX_HOME 复制的登录凭据来源（存在才复制；机密绝不进 checkpoint 归档） |

@@ -78,8 +78,8 @@
 1. ~~runtime 为 FakeCodexDriver（本机子进程 + `/tmp` rollout），非沙箱内 `codex app-server`；协议形态一致（initialize/thread/start/turn/start/item/*/turn/completed），替换真实 driver 不动 worker。~~ 已收尾：`CodexDriver` 驱动真实 `codex app-server`（`MAS_RUNTIME_DRIVER=codex`），协议/恢复/审批/动态工具全链路映射，E2E 已实测（见上表）；测试默认仍走 FakeCodexDriver（零额度消耗）。沙箱内运行（driver 经 SandboxProvider 进容器）仍属后续（当前真实 driver 与 fake 同样在本机子进程内运行）。
 2. api 在 `requires_action` 等状态下可能从快照读 stop_reason 而非事件推导（物化视图已同步维护）。
 3. ~~限流为单进程内存令牌桶；多实例部署需换 PG/Redis（spec §13.4 预留）~~ 已收尾：`MAS_RATELIMIT_BACKEND=pg` 切换为 `rate_limit_buckets` 行锁令牌桶（事务内 FOR UPDATE 串行化、elapsed 由 DB 时钟计算——多实例时钟偏移免疫、DB 故障 fail-open）；默认仍为 memory（单实例零开销）。
-4. checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。
-5. File 内容与 output 对象存本地 FS（`MAS_FILES_DIR`，默认 `/tmp/mas-files`）而非 MinIO；Key 布局与 spec 一致（`files/{org}/{file_id}`、`outputs/{session}/{sha256}`），换 S3 实现即可。
+4. ~~checkpoint 归档格式为 `json.gz/v1`（文件集 gzip JSON）而非 spec 的 tar.gz；对象存储为本地 `FsSnapshotStore` 而非 S3（`SnapshotStore` 接口已抽象，替换实现即可）。~~ 归档格式维持 `json.gz/v1`（恢复走同一份代码，且带逐文件 base64 可审计）；对象存储已收尾：`S3SnapshotStore`（SigV4 手写签名零依赖，条件写保 put 不可覆盖、etag 比对保 putIfAbsent 幂等），`MAS_OBJECT_STORE=s3` 切换，k3s 形态默认走 MinIO（`deploy/k8s/55-minio.yaml`，实测 checkpoint 落桶）；开发默认仍为 FS。
+5. ~~File 内容与 output 对象存本地 FS（`MAS_FILES_DIR`，默认 `/tmp/mas-files`）而非 MinIO；Key 布局与 spec 一致（`files/{org}/{file_id}`、`outputs/{session}/{sha256}`），换 S3 实现即可。~~ 已随 #4 收尾：同一 `objectStoreFromEnv` 工厂覆盖 files/skills/outputs/snapshots，key 布局不变。
 6. egress-proxy MVP 只处理 HTTP 绝对 URI 形态（无 CONNECT/TLS 终止）；真实部署需镜像预置企业 CA、代理按 SNI 签发证书（§10.1）。worker 侧 prepare/attach/revoke 生命周期接线随真实沙箱宿主落地。
 7. DockerProvider 通过 docker CLI 驱动（非 dockerode）。**gVisor 路径已在真实宿主验证**（Debian 13 / 内核 6.12 / docker-ce 29.8.2 + runsc 20260928，容器真实运行于 runsc，全生命周期 4/4）；runc 降级路径亦已实测（Synology DSM，无 runsc 宿主：create 走默认 runtime、capabilities 如实上报 `runc`，§9.0 不虚报）。runsc 2026+ 为 sidecar 布局（gvisor-bin/ 目录需一并安装）；gVisor directfs 下宿主目录 DAC 对容器 root 生效（bind mount 目录需正常 umask）；DSM 宿主可能静默丢弃 pids-limit（未挂 pids cgroup 控制器），属内核能力差异。
 8. 沙箱能力协商目前 FakeSandboxProvider 为声明式（`MAS_SANDBOX_ISOLATION`/构造参数），DockerProvider 已按 runsc 探测如实上报。

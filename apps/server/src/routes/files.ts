@@ -3,13 +3,13 @@ import type { FastifyInstance } from "fastify";
 import type { Selectable } from "kysely";
 import { errInvalid, errNotFound, newId } from "@mas/core";
 import type { Database, FileRow } from "@mas/db";
-import { FsSnapshotStore } from "@mas/db";
+import { objectStoreFromEnv, type SnapshotStore } from "@mas/db";
 import type { RouteCtx } from "./agents.js";
 import { withIdempotency } from "../plugins/idempotent-route.js";
 
 /**
  * Files API（spec §5.5 / §11.4）：org 级上传与 session 输出共用 files 表；
- * 内容走内容存储（MVP 本地 FsSnapshotStore，接 MinIO 时换 S3 实现）。
+ * 内容走内容存储（SnapshotStore：默认本地 FS，MAS_OBJECT_STORE=s3 切 MinIO/S3）。
  * 分页用 before_id / after_id（C-06），二者同传 400。
  */
 
@@ -52,8 +52,9 @@ async function getFileRow(ctx: RouteCtx, ws: string, id: string): Promise<Select
   return row;
 }
 
-export function contentStore(): FsSnapshotStore {
-  return new FsSnapshotStore(process.env.MAS_FILES_DIR ?? "/tmp/mas-files");
+export function contentStore(): SnapshotStore {
+  // MAS_OBJECT_STORE=s3 → MinIO/S3（key 布局与 FS 一致）；默认本地 FS
+  return objectStoreFromEnv(process.env, process.env.MAS_FILES_DIR ?? "/tmp/mas-files");
 }
 
 export function registerFileRoutes(app: FastifyInstance, ctx: RouteCtx): void {

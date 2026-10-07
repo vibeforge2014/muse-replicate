@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
@@ -59,6 +59,9 @@ describe.skipIf(!dockerOk)("DockerProvider（真实宿主生命周期）", () =>
 
   test("create：容器运行 + §9.1 隔离参数 + 挂载物化 + internal 网络", async () => {
     const home = mkdtempSync(join(tmpdir(), "mas-docker-test-"));
+    // mkdtemp 0700 在 gVisor directfs 下连容器 root 都过不了宿主 DAC（runc 会绕过）；
+    // 生产形态 worker 物化目录为正常 umask，这里对齐
+    chmodSync(home, 0o755);
     const outputs = join(home, "outputs");
     const uploadHost = join(home, "upload-src");
     mkdirSync(outputs);
@@ -113,6 +116,7 @@ describe.skipIf(!dockerOk)("DockerProvider（真实宿主生命周期）", () =>
 
   test("destroy：容器彻底移除", async () => {
     const home = mkdtempSync(join(tmpdir(), "mas-docker-test-"));
+    chmodSync(home, 0o755);
     const h = await provider.create({
       sessionId: "sesn_docker_test2",
       generation: 1,

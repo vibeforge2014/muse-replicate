@@ -27,8 +27,14 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 
 ### 真实宿主实测记录
 
+- **Debian 13（trixie）/ 内核 6.12.111 / 60C Xeon / 59G**（专用机，k3s-node1）：**gVisor 路径已验证**——docker-ce 29.8.2 + runsc 20260928 注册为 runtime，DockerProvider 全生命周期 4/4（capabilities 如实上报 gvisor，容器真实运行于 runsc）。全量测试 + 混沌以非 root 用户通过。
+  - 部署形态：compose 主栈（postgres/server/worker，宿主 8080）+ Prometheus/Grafana（13000）+ 测试 PG（127.0.0.1:5433）。
+  - runsc 2026+ 为 sidecar 布局：除 `runsc` 外必须安装 tarball 内 `gvisor-bin/`（gvisor_sentry 等）到 `/usr/local/bin/gvisor-bin/`，否则容器启动报 `sidecar "gvisor_sentry" not usable`。
+  - 国内网络：daemon.json 配华为云镜像加速；**docker-ce 29 默认的 containerd-snapshotter 拉取路径会让 referrers API 绕过加速器直连 dockerhub 超时**，需 `"features": {"containerd-snapshotter": false}` 回经典 overlay2 路径；git 走局域网 clash 代理（`git config --global http.https://github.com.proxy`）。
+  - **测试/worker 不要以 root 运行**：root 绕过 read_only 挂载的 chmod（偏差 #12），且 gVisor directfs 下宿主目录 DAC 对容器 root 同样生效（bind mount 目录需正常 umask 755，勿用 mkdtemp 0700）。
+  - 并发启动（server+worker 同时起）曾撞 CREATE TYPE 唯一键：runMigrations 已加 advisory lock 串行化（tests/migrations-concurrent.test.ts 回归）。
 - **Synology SA6400 / DSM 7.2.1 / docker 24.0.2 / 4C 7.4G**：全量测试 159/159 + 混沌 200/200（真实 Linux + 容器 PG）；compose 全栈（postgres+server+worker）+ Prometheus/Grafana 运行中；DockerProvider 生命周期 4/4（runc 降级路径）。
-- 该内核**未开 user namespaces，gVisor 不可用**（`/proc/self/uid_map` 不存在，runsc 硬依赖）；另未挂 pids cgroup 控制器（`--pids-limit` 被 daemon 静默丢弃）。gVisor 验证需标准 Linux 内核宿主。
+- 该内核**未开 user namespaces，gVisor 不可用**（`/proc/self/uid_map` 不存在，runsc 硬依赖）；另未挂 pids cgroup 控制器（`--pids-limit` 被 daemon 静默丢弃）。gVisor 验证需标准 Linux 内核宿主（已在上方 Debian 13 主机完成）。
 
 ### 环境变量
 

@@ -59,6 +59,7 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_S3_ENDPOINT` / `MAS_S3_REGION` | – / `us-east-1` | S3 端点（path-style，如 `http://minio.mas.svc.cluster.local:9000`）与区域 |
 | `MAS_S3_ACCESS_KEY` / `MAS_S3_SECRET_KEY` / `MAS_S3_BUCKET` | – | S3 凭据与桶（`MAS_OBJECT_STORE=s3` 时必填，桶不存在自动创建）。put 走条件写（If-None-Match，MinIO ≥2024-08 / AWS S3），putIfAbsent 按 etag(md5) 比对 |
 | `MAS_SANDBOX_PROVIDER` | `fake` | 沙箱 provider：`fake`=本机目录；`docker`=宿主 docker；`k8s`=集群内沙箱 Pod（in-cluster SA 或 MAS_K8S_API/TOKEN/CA、MAS_K8S_NODE_SELECTOR、MAS_K8S_PVC/MAS_K8S_PVC_MOUNT；deploy/k8s/56-sandbox-rbac.yaml 配套） |
+| `MAS_K8S_POD_START_TIMEOUT_MS` | `60000` | 沙箱 Pod 起 Running 的等待上限；并发冷启风暴（几十个 runsc Pod 同时调度）下单节点 containerd 排队，需放大（worker manifest 设 180s） |
 | `MAS_RUNTIME_DRIVER` | `fake` | worker 的 runtime driver：`fake`=FakeCodexDriver（脚本化假 runtime，零额度消耗）；`codex`=真实 codex app-server（CodexDriver） |
 | `MAS_CODEX_BIN` | `codex`（PATH） | 真实 driver 的 codex 可执行文件路径（如 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`） |
 | `MAS_CODEX_AUTH_FILE` | `~/.codex/auth.json` | 每会话 CODEX_HOME 复制的登录凭据来源（存在才复制；机密绝不进 checkpoint 归档） |
@@ -104,7 +105,41 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 - `mas_api_requests_total{route,code}`：5xx 比例告警；
 - `mas_api_latency_seconds_*`：P99 告警；
 - `mas_sessions{status}`：`running` 长期堆积 → worker 容量/毒任务；
-- `mas_egress_denied_total`：突增 → 沙箱内异常出网尝试。
+- `mas_egress_denied_total`：突增 → 沙箱内异常出网尝试；
+- `mas_process_resident_memory_bytes`：进程 RSS（负载验收门禁的观测面）。
+
+## 5a. 负载验收（spec §17.1/§17.2）
+
+自研 harness（`pnpm perf`，`perf/harness.ts`）覆盖四个场景，按 §17.2 门禁判 PASS/FAIL：
+
+| 场景 | 测量 | 门禁 |
+| --- | --- | --- |
+| `cold` | 新会话 create→idle(end_turn) 全程（含沙箱冷启） | P50<5s、P95<15s |
+| `ttft` | POST events → SSE 首个 `agent.message` 帧 | 分布参考 |
+| `sse` | 单会话 K 连接扇出（人人收到完整帧） | 完整率 100% |
+| `conc` | 单 worker N 并发会话 + worker RSS | RSS<2GiB |
+
+```sh
+pnpm perf                                                  # 本地栈（同进程，限流放开；conc 上限 ~25：api+worker+driver 子进程共享一个事件循环）
+pnpm perf -- --base http://<node>:30080 --key mas_sk_... \ # 集群（真实限流/网络/沙箱 Pod）
+  --pre-clean "$CLEAN" --post-clean "$CLEAN" \
+  --rss-cmd "ssh root@<node> 'k3s kubectl -n mas exec deployment/mas-worker -c worker -- node -e \"console.log(process.memoryUsage().rss)\"'"
+# CLEAN='ssh root@<node> "k3s kubectl -n mas delete pod -l mas-sandbox=true --timeout=600s"'
+```
+
+k6 场景（API 面压测）另见 `perf/k6-api.js`。已实测（k3s 单节点 + gVisor，fake driver）：
+cold P50≈0.1s、ttft P50≈2.3s（=沙箱 Pod 冷启，预算内）、sse 20/20 完整、
+conc 50 并发 wall≈11s / worker RSS 46MiB。
+
+**集群压测运维要点（实测踩坑）**：
+1. **镜像架构**：Mac 上 `docker build` 默认 arm64，amd64 节点下 qemu 模拟会把延迟放大
+   10~50×且 worker 低并发即 OOM——构建务必 `--platform linux/amd64`；
+2. **沙箱 Pod 生命周期**：MVP 尚无 idle-pause/会话删除→回收接线，Pod 随会话累积，
+   撞节点 pod 上限（默认 110/节点）后新沙箱全部 Pending——连续压测用
+   `--pre-clean/--post-clean`（阻塞等删除完成；Terminating 期间仍占配额）；
+3. **失败重试风暴**：Pod 起不来的 execution 会以租约循环重试（每次 ~pod 超时 + 30s），
+   压测失败后先清 Pod + 清残留会话再复跑，否则旧会话耗尽 worker 吞吐；
+4. worker 内存上限须 ≥ 门禁值（manifest 已设 2Gi；1Gi 时 ~10 并发即 OOMKill）。
 
 model-gateway 另有 `GET /internal/metrics`：`mas_model_tokens_total{model,kind}`（input/output/cached 累计），按模型核对上游账单。
 

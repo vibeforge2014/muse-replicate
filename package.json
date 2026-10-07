@@ -18,6 +18,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p packages/core/tsconfig.json && tsc --noEmit -p packages/sdk/tsconfig.json && tsc --noEmit -p packages/db/tsconfig.json && tsc --noEmit -p packages/runtime/tsconfig.json && tsc --noEmit -p apps/server/tsconfig.json && tsc --noEmit -p apps/worker/tsconfig.json",
     "smoke": "tsx scripts/smoke.ts",
+    "perf": "tsx perf/harness.ts",
     "test:chaos": "tsx scripts/chaos.ts",
     "gen:sdk": "pnpm --filter @mas/sdk gen"
   },

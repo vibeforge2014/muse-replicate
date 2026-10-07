@@ -66,6 +66,10 @@ export function registerMetrics(app: FastifyInstance, ctx: { db: Kysely<Database
     lines.push("# TYPE mas_sse_connections gauge");
     lines.push(`mas_sse_connections ${state.sseConnections}`);
 
+    // 进程 RSS（负载验收用：spec §17.2 worker RSS < 2GB 门禁的观测面）
+    lines.push("# TYPE mas_process_resident_memory_bytes gauge");
+    lines.push(`mas_process_resident_memory_bytes ${process.memoryUsage().rss}`);
+
     // DB 侧 gauge
     const statuses = await sql<{ status: string; n: string }>`
       SELECT status, count(*)::text AS n FROM sessions GROUP BY status`.execute(ctx.db);

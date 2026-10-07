@@ -38,6 +38,8 @@ spec:
             # - { name: MAS_OTLP_SERVICE_NAME, value: mas-worker }
             # 沙箱 = 集群内 Pod（K8sSandboxProvider；56-sandbox-rbac.yaml 的 SA/PVC）
             - { name: MAS_SANDBOX_PROVIDER, value: k8s }
+            # 并发冷启风暴（几十个 runsc Pod 同时调度）下 containerd 排队：放宽 Pod 起Running 等待
+            - { name: MAS_K8S_POD_START_TIMEOUT_MS, value: "180000" }
             # TMPDIR 指到 PVC 挂载点 → 会话 home 落在共享卷上（沙箱 Pod subPath 可见）
             - { name: TMPDIR, value: /var/mas/sandboxes }
             # - { name: MAS_WARM_POOL_MIN, value: "2" }
@@ -47,8 +49,10 @@ spec:
             - { name: snapshots, mountPath: /var/mas/snapshots }
             - { name: sandboxes, mountPath: /var/mas/sandboxes }
           resources:
-            requests: { cpu: 200m, memory: 256Mi }
-            limits: { memory: 1Gi }
+            requests: { cpu: 200m, memory: 512Mi }
+            # spec §17.2：单 worker 50 并发会话 RSS < 2GB —— 容器上限须≥该门禁值，
+            # 且每会话一个 driver 子进程（fake≈60MB/个），1Gi 在 ~10 并发就会被 OOMKill
+            limits: { memory: 2Gi }
       volumes:
         - name: files
           persistentVolumeClaim: { claimName: mas-files }

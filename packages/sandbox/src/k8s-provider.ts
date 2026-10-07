@@ -40,6 +40,9 @@ export interface K8sProviderOptions {
    * 部分节点就绪时把沙箱钉到打了标的节点；local-path PVC 也要求 worker 与沙箱同节点。
    */
   nodeSelector?: string;
+  /** Pod 起 Running 的等待上限；缺省 MAS_K8S_POD_START_TIMEOUT_MS 或 60s。并发冷启
+   *  风暴（几十个 runsc Pod 同时调度）下单节点 containerd 会排队，需要放大。 */
+  podStartTimeoutMs?: number;
 }
 
 interface K8sRequestOptions {
@@ -112,6 +115,8 @@ export class K8sSandboxProvider implements SandboxProvider {
   /** "k=v,k2=v2" → Pod nodeSelector。 */
   private readonly nodeSelector: Record<string, string> | undefined;
   private runscAvailable: boolean | undefined;
+  /** Pod 起 Running 的等待上限（ms）。 */
+  private readonly podStartTimeoutMs: number;
   /** pause 语义需要重建：sandboxId → spec。 */
   private specs = new Map<string, SandboxSpec>();
   private netPolicyEnsured = false;
@@ -138,6 +143,8 @@ export class K8sSandboxProvider implements SandboxProvider {
         )
       : undefined;
     this.runscAvailable = opts.runtimeClassName === null ? false : opts.runtimeClassName ? true : undefined;
+    this.podStartTimeoutMs =
+      opts.podStartTimeoutMs ?? (Number(process.env.MAS_K8S_POD_START_TIMEOUT_MS) || 60_000);
   }
 
   private podName(sandboxId: string): string {
@@ -247,7 +254,7 @@ export class K8sSandboxProvider implements SandboxProvider {
       throw new Error(`k8s create pod failed: ${created.status} ${msg}`);
     }
     try {
-      await this.waitRunning(this.podName(sandboxId), 60_000);
+      await this.waitRunning(this.podName(sandboxId), this.podStartTimeoutMs);
     } catch (e) {
       await this.destroy(sandboxId).catch(() => undefined);
       throw e;
@@ -291,7 +298,7 @@ export class K8sSandboxProvider implements SandboxProvider {
       body: this.buildPod(sandboxId, spec),
     });
     if (r.status >= 300 && r.status !== 409) throw new Error(`k8s resume pod failed: ${r.status}`);
-    await this.waitRunning(this.podName(sandboxId), 60_000);
+    await this.waitRunning(this.podName(sandboxId), this.podStartTimeoutMs);
   }
 
   private async deletePod(sandboxId: string): Promise<void> {

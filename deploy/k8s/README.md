@@ -3,6 +3,26 @@
 与 `deploy/compose/` 等价的 Kubernetes 形态（spec §18.1 单机拓扑）。
 适合已有 k3s/K8s 的环境；docker-compose 仍是零依赖路径。
 
+## 多节点注意（local-path 卷的节点局部性）
+
+local-path PV 绑死在首个调度的节点上。多节点集群里 MAS 的共享卷（files/snapshots/
+sandboxes/egress-ca）必须同节点，否则沙箱 Pod 挂不到 worker 写入的会话目录。两种做法：
+
+1. **把 MAS 工作负载钉到同一节点**（本仓库实测形态，单机够用）：
+
+```bash
+for d in mas-server mas-worker mas-egress prometheus; do
+  kubectl -n mas patch deploy $d --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/nodeSelector","value":{"kubernetes.io/hostname":"<节点名>"}}]'
+done
+```
+
+2. 换网络存储 StorageClass（NFS/Ceph），manifest 无需改动。
+
+镜像若不走仓库而是 `save | import`，import 得打进**每个**可能调度 MAS/沙箱 Pod 的节点
+（沙箱 Pod 挂 sandboxes PVC，会被卷亲和自然约束到同一节点）。另外集群上跑着其他业务时，
+本目录所有对象都在 `mas` 命名空间内，apply/删除不影响其他业务。
+
 ## 前置
 
 - k3s（或任意单节点 K8s ≥1.30，默认 StorageClass 支持 PVC——k3s 自带 local-path）

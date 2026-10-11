@@ -611,6 +611,9 @@ export class SessionRunner {
               executionId: fence.executionId,
               generation: fence.generation,
               sandboxId: `pending:${sessionId}`,
+              // 绑定随沙箱生命周期（Pod env 不可变）：exp 取沙箱尺度；
+              // 逐请求 fence 校验 + revoke denylist 才是权威控制（§10.4）
+              ttlSeconds: 86_400,
             }),
             fetchEgressCa(this.egress),
           ]);

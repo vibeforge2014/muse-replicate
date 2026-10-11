@@ -15,7 +15,8 @@ import type {
  * - 工作区共享：worker 与沙箱 Pod 挂同一 PVC，沙箱以 subPath 绑定会话目录
  *   （worker 的 TMPDIR 指到 PVC 挂载点，fakeCodexHome 会话目录即 PVC 子目录）；
  * - 隔离：节点装有 runsc RuntimeClass 时 gvisor（如实探测，无则 runc）；
- * - egress：打默认拒绝 NetworkPolicy（k3s 自带 policy 控制器时生效）→ 上报 advisory，
+ * - egress：下发 NetworkPolicy——沙箱直连出网默认拒绝，只放行 egress-proxy(8081) 与
+ *   kube-dns(53)（spec §10 强制模型；k3s 自带 policy 控制器时生效）→ 上报 advisory，
  *   不虚报 enforced（§9.0）；
  * - pause/resume：删除/重建 Pod（目录在 PVC 上保留；无容器冻结原语）；
  * - 销毁失败抛错（worker 侧记 sandbox_orphans，§9.3）。
@@ -49,6 +50,8 @@ interface K8sRequestOptions {
   method: "GET" | "POST" | "DELETE" | "PATCH";
   path: string;
   body?: unknown;
+  /** PATCH 必须按 k8s 要求指定 patch content-type（默认 application/json） */
+  contentType?: string;
 }
 
 class K8sApi {
@@ -74,7 +77,7 @@ class K8sApi {
             authorization: `Bearer ${this.token}`,
             accept: "application/json",
             ...(payload !== undefined
-              ? { "content-type": "application/json", "content-length": Buffer.byteLength(payload) }
+              ? { "content-type": opts.contentType ?? "application/json", "content-length": Buffer.byteLength(payload) }
               : {}),
           },
           timeout: 15_000,
@@ -177,7 +180,9 @@ export class K8sSandboxProvider implements SandboxProvider {
     return {
       isolation: (await this.hasRunsc()) ? "gvisor" : "runc",
       persistentWorkspace: true, // 工作区在 PVC 上，Pod 重建不丢
-      egress: "advisory", // NetworkPolicy 已下发；是否强制取决于 CNI（k3s 自带 policy 控制器时生效），不虚报 enforced
+      // NetworkPolicy 已下发（只放行 egress-proxy 与 kube-dns，直连出网被拒）；
+      // 是否强制取决于 CNI——k3s 自带 policy 控制器时生效，不虚报 enforced
+      egress: "advisory",
     };
   }
 
@@ -190,10 +195,40 @@ export class K8sSandboxProvider implements SandboxProvider {
       spec: {
         podSelector: { matchLabels: { "mas-sandbox": "true" } },
         policyTypes: ["Egress"],
-        egress: [], // 默认拒绝；egress 经 egress-proxy 的路径后续按需放行
+        // spec §10 强制模型：沙箱直连出网一律拒绝，唯一例外是 egress-proxy 与 DNS
+        egress: [
+          {
+            to: [{ podSelector: { matchLabels: { app: "mas-egress" } } }],
+            ports: [{ protocol: "TCP", port: 8081 }],
+          },
+          {
+            to: [
+              {
+                namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": "kube-system" } },
+                podSelector: { matchLabels: { "k8s-app": "kube-dns" } },
+              },
+            ],
+            ports: [
+              { protocol: "UDP", port: 53 },
+              { protocol: "TCP", port: 53 },
+            ],
+          },
+        ],
       },
     };
-    await this.api.req({ method: "POST", path: `/apis/networking.k8s.io/v1/namespaces/${this.namespace}/networkpolicies`, body: policy }).catch(() => undefined);
+    const path = `/apis/networking.k8s.io/v1/namespaces/${this.namespace}/networkpolicies`;
+    // PATCH 优先：已存在的旧策略要就地更新（POST 对已存在只会 409 被吞掉）
+    const patched = await this.api
+      .req({
+        method: "PATCH",
+        path: `${path}/mas-sandbox-egress-deny`,
+        body: policy,
+        contentType: "application/merge-patch+json",
+      })
+      .catch(() => undefined);
+    if (!patched || patched.status === 404) {
+      await this.api.req({ method: "POST", path, body: policy }).catch(() => undefined);
+    }
     this.netPolicyEnsured = true;
   }
 

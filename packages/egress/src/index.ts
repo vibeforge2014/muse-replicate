@@ -33,7 +33,9 @@ export interface EgressBinding {
 
 /** 签发出站授权 token（prepare；不含任何凭据）。 */
 export function issueEgressToken(scope: EgressScope): EgressBinding {
-  const ttl = Math.min(scope.ttlSeconds ?? 60, 600);
+  // 上限 24h：沙箱生命周期级绑定（Pod env 创建后不可变，无法逐执行轮换）；
+  // 权威控制是逐请求 fence 校验 + revoke denylist，exp 仅兜底（spec §10.4 偏差，见 DESIGN）
+  const ttl = Math.min(scope.ttlSeconds ?? 60, 86_400);
   const exp = Math.floor(Date.now() / 1000) + ttl;
   const jti = randomBytes(8).toString("hex");
   const body = {

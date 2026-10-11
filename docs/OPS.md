@@ -115,7 +115,7 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 - `mas_egress_requests_total{outcome}`（egress-proxy）：forwarded/credential_injected/host_denied/revoked/stale_fence/auth_denied 决策计数；
 - `mas_process_resident_memory_bytes`：进程 RSS（负载验收门禁的观测面）。
 
-**看板与告警已随仓库供给**：Grafana 双看板（MAS Overview / MAS Runtime）+ Prometheus 告警规则 8 条——k8s 形态在 `deploy/k8s/50-observability.yaml`（prometheus-rules ConfigMap，随 `kubectl apply` 生效），compose 形态在 `deploy/observability/`（`prometheus-rules.yml` 已由 compose 挂载）。关键 critical 两条：`MasServerDown`（api 抓取失败 >1m）与 `MasEgressDown`（egress-proxy 不可达 >1m，spec §10 要求平台必须告警——沙箱出站 fail closed）。
+**看板与告警已随仓库供给**：Grafana 双看板（MAS Overview / MAS Runtime）+ Prometheus 告警规则 9 条——k8s 形态在 `deploy/k8s/50-observability.yaml`（prometheus-rules ConfigMap，随 `kubectl apply` 生效），compose 形态在 `deploy/observability/`（`prometheus-rules.yml` 已由 compose 挂载）。关键 critical 两条：`MasServerDown`（api 抓取失败 >1m）与 `MasEgressDown`（egress-proxy 不可达 >1m，spec §10 要求平台必须告警——沙箱出站 fail closed）。
 
 ## 5a. 负载验收（spec §17.1/§17.2）
 
@@ -160,4 +160,4 @@ model-gateway 另有 `GET /internal/metrics`：`mas_model_tokens_total{model,kin
 - `mas.worker.execution`：worker 每执行一个 span，**父 = `session_executions.traceparent` 列携带的上下文**——「traceparent 跟随 command」：调用方带 `traceparent` 头 POST 事件 → 落 execution 行 → 任意 worker claim 后接续同一条 trace（api → PG → worker 跨进程串联，不依赖进程间直连）；
 - `mas.worker.turn_loop`：execution 下的 driver 交互子 span，属性 `outcome=turn_done|awaiting_approval|fence_lost`。
 
-端到端断言见 `tests/otel.test.ts`（本地起 OTLP 接收器，验证四层父子串联 + OTLP 报文格式）。未实现：Grafana 看板、告警规则文件（README「后续路线」）。
+端到端断言见 `tests/otel.test.ts`（本地起 OTLP 接收器，验证四层父子串联 + OTLP 报文格式）。Grafana 看板与告警规则已落地（见 §5），未实现：采样决策（全导出）。

@@ -403,4 +403,17 @@ CREATE TABLE IF NOT EXISTS rate_limit_buckets (
 ALTER TABLE session_executions ADD COLUMN IF NOT EXISTS traceparent text;
 `,
   },
+  {
+    name: "0014_sandbox_state",
+    sql: `
+-- 沙箱状态机（spec §9.3 空闲 reaper）：idle 超时 pause（k8s=删 Pod），更久 destroy；
+-- sandbox_spec 持久化 create 时的 SandboxSpec，k8s resume 重建 Pod 时用
+-- （worker 重启后 provider 内存 specs 丢失，DB 是唯一权威）。
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_state text;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_paused_at timestamptz;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_spec jsonb;
+CREATE INDEX IF NOT EXISTS sessions_sandbox_reap_ix
+  ON sessions (sandbox_state, sandbox_paused_at) WHERE sandbox_id IS NOT NULL;
+`,
+  },
 ];

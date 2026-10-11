@@ -4,6 +4,7 @@ import { createDb, runMigrations, sessionsWithWork } from "@mas/db";
 import { WarmPoolProvider, type SandboxProvider } from "@mas/sandbox";
 import { SessionRunner } from "./session-runner.js";
 import { driverFromEnv, sandboxProviderFromEnv } from "./driver.js";
+import { reaperOptionsFromEnv, startReaper } from "./reaper.js";
 
 /**
  * session-worker 主循环（spec §4.1）：
@@ -50,8 +51,22 @@ async function main() {
   const timer = setInterval(() => void drain(), 3000);
   console.log(`[worker] listening for session_exec (pid ${process.pid})`);
 
+  // 空闲沙箱 reaper（spec §9.3/§9.4）：多 worker 由 PG advisory lock 选主；MAS_REAPER=0 关闭
+  const reaperCfg = reaperOptionsFromEnv();
+  let stopReaper: (() => void) | undefined;
+  if (provider && reaperCfg.enabled) {
+    stopReaper = startReaper(
+      { db: db.db, provider, dropRuntime: (sid) => runner.dropRuntime(sid) },
+      reaperCfg.tickMs,
+    );
+    console.log(
+      `[worker] reaper on (tick=${reaperCfg.tickMs}ms pauseAfter=${reaperCfg.opts.pauseAfterSec}s destroyAfter=${reaperCfg.opts.destroyAfterSec}s)`,
+    );
+  }
+
   const shutdown = async () => {
     clearInterval(timer);
+    stopReaper?.();
     await client.end().catch(() => undefined);
     if (provider instanceof WarmPoolProvider) await provider.drain().catch(() => undefined);
     await db.close();

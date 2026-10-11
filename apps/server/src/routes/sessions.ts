@@ -288,6 +288,16 @@ export function registerSessionRoutes(app: FastifyInstance, ctx: RouteCtx): void
     if (row.status === "rescheduling") throw errConflict("cannot delete a rescheduling session");
     // 写 session.deleted 后删除事件与资源（spec §11.4）；SSE 通过 'deleted' NOTIFY 推送合成帧
     await appendApiEvent(ctx.db, id, "session.deleted", { id, type: "session.deleted" });
+    // 沙箱 teardown 交接（spec §9.3/§9.4）：会话删除即沙箱生命周期终结——登记
+    // sandbox_orphans 交 worker reaper 下个 tick 销毁（行删除后 reaper 的 sessions
+    // 扫描找不到它，orphan 是唯一通道）；egress token 随 fence 失配自然失效
+    if (row.sandbox_id) {
+      await ctx.db
+        .insertInto("sandbox_orphans")
+        .values({ sandbox_ref: row.sandbox_id, session_id: id, generation: 0, reason: "session_deleted" })
+        .execute()
+        .catch(() => undefined);
+    }
     await ctx.db.transaction().execute(async (tx) => {
       await tx.deleteFrom("session_events").where("session_id", "=", id).execute();
       await tx.deleteFrom("session_resources").where("session_id", "=", id).execute();

@@ -66,6 +66,8 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_RUNTIME_DRIVER` | `fake` | worker 的 runtime driver：`fake`=FakeCodexDriver（脚本化假 runtime，零额度消耗）；`codex`=真实 codex app-server（CodexDriver） |
 | `MAS_RUNTIME_SANDBOX` | –（host） | `inside`=driver 进沙箱（spec §8.4）：runtime 进程经 pods/exec WebSocket 跑在沙箱 Pod 容器内（先建沙箱后起 driver）；缺省=本机子进程。需 provider 支持 `exec`（当前仅 k8s）且沙箱镜像含 node/app（`MAS_K8S_SANDBOX_IMAGE`） |
 | `MAS_K8S_SANDBOX_IMAGE` | `busybox:latest` | k8s 沙箱 Pod 镜像。inside 模式必须用 `mas-sandbox`（Dockerfile `--target sandbox`，= runtime 层 + codex CLI）；镜像 tag 变更即 §8.7 Level 0 语义恢复（versionDigest=`codex-image@<tag>`） |
+| `MAS_REAPER` / `MAS_REAPER_TICK_MS` | 开 / 60000 | worker 内空闲沙箱 reaper（§9.3）：`=0` 关闭；tick 间隔 ms（PG advisory lock 选主，多 worker 不重复收割） |
+| `MAS_IDLE_PAUSE_AFTER_S` / `MAS_IDLE_DESTROY_AFTER_S` | 600 / 86400 | idle 判定=无在途 execution 且最后事件早于阈值：超 pause → 沙箱暂停（k8s=删 Pod，工作区留 PVC）；超 destroy → 销毁并清 sandbox_id（下一条消息懒重建）。暂停/销毁失败下个 tick 重试，destroy 无法确认记 sandbox_orphans |
 | `MAS_CODEX_BIN` | `codex`（PATH） | 真实 driver 的 codex 可执行文件路径（如 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`） |
 | `MAS_CODEX_AUTH_FILE` | `~/.codex/auth.json` | 每会话 CODEX_HOME 复制的登录凭据来源（存在才复制；机密绝不进 checkpoint 归档） |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | codex 后端（chatgpt.com）可达性；受限网络下 worker 进程需可出站代理 |

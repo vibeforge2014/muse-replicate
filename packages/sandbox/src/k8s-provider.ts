@@ -371,13 +371,16 @@ export class K8sSandboxProvider implements SandboxProvider {
     await this.deletePod(sandboxId);
   }
 
-  async resume(sandboxId: string): Promise<void> {
-    const spec = this.specs.get(sandboxId);
-    if (!spec) throw new Error(`k8s sandbox ${sandboxId} unknown (worker 重启后不可 resume，应走 checkpoint 恢复)`);
+  async resume(sandboxId: string, spec?: SandboxSpec): Promise<void> {
+    // pause = 删 Pod，resume 重建：spec 优先取调用方传入（sessions.sandbox_spec，
+    // worker 重启后仍可恢复），其次本进程内存（同 worker pause→resume）
+    const s = spec ?? this.specs.get(sandboxId);
+    if (!s) throw new Error(`k8s sandbox ${sandboxId} unknown（无 spec，无法重建 Pod）`);
+    this.specs.set(sandboxId, s);
     const r = await this.api.req({
       method: "POST",
       path: `/api/v1/namespaces/${this.namespace}/pods`,
-      body: this.buildPod(sandboxId, spec),
+      body: this.buildPod(sandboxId, s),
     });
     if (r.status >= 300 && r.status !== 409) throw new Error(`k8s resume pod failed: ${r.status}`);
     await this.waitRunning(this.podName(sandboxId), this.podStartTimeoutMs);

@@ -34,7 +34,7 @@ import {
   type NormalizedRuntimeEvent,
   type RuntimeHandle,
 } from "@mas/runtime";
-import { FakeSandboxProvider, type SandboxProvider } from "@mas/sandbox";
+import { FakeSandboxProvider, recordOrphan, type SandboxProvider, type SandboxSpec } from "@mas/sandbox";
 import { egressEnvForSandbox } from "@mas/egress";
 import { egressWireFromEnv, fetchEgressCa, prepareEgressBinding, revokeEgressBinding, type EgressWire } from "./egress.js";
 
@@ -501,7 +501,7 @@ export class SessionRunner {
    */
   private async acquireRuntime(
     sessionId: string,
-    session: { codex_thread_id: string | null; codex_version_digest: string | null; last_completed_execution_id: string | null; active_workspace_checkpoint: Record<string, unknown> | null; sandbox_id: string | null },
+    session: { codex_thread_id: string | null; codex_version_digest: string | null; last_completed_execution_id: string | null; active_workspace_checkpoint: Record<string, unknown> | null; sandbox_id: string | null; sandbox_state: string | null; sandbox_spec: Record<string, unknown> | null },
     agent: { system: string | null; model: { id: string; effort?: string } },
     hasAsk: boolean,
     hasToolset: boolean,
@@ -580,10 +580,38 @@ export class SessionRunner {
     const insideSandbox = this.inSandboxRuntime && typeof this.provider.exec === "function";
     let sandboxId = session.sandbox_id;
     let sandboxEgress: HeldRuntime["egress"];
+    let sandboxSpec: Record<string, unknown> | null = null;
+    if (sandboxId && session.sandbox_state === "paused") {
+      // 懒恢复（spec §9.3：被 reaper 暂停的沙箱在下一条消息到来时 resume）；
+      // 失败不阻塞——降级为销毁重建（工作区在 PVC/checkpoint，语义等价）
+      try {
+        await this.provider.resume(
+          sandboxId,
+          session.sandbox_spec ? (session.sandbox_spec as unknown as SandboxSpec) : undefined,
+        );
+        await this.db
+          .updateTable("sessions")
+          .set({ sandbox_state: "active", sandbox_paused_at: null })
+          .where("id", "=", sessionId)
+          .execute();
+      } catch (e) {
+        console.warn(`[worker] sandbox resume failed for ${sessionId}: ${(e as Error).message}（重建）`);
+        await this.provider.destroy(sandboxId).catch(() => undefined);
+        await recordOrphan(this.db, {
+          sandboxRef: sandboxId,
+          sessionId,
+          generation: fence.generation,
+          reason: "resume_failed",
+          lastError: (e as Error).message,
+        }).catch(() => undefined);
+        sandboxId = null;
+      }
+    }
     if (insideSandbox && !sandboxId) {
       const r = await this.ensureSandbox(sessionId, fence);
       sandboxId = r.sandboxId;
       sandboxEgress = r.egress;
+      sandboxSpec = r.spec;
     }
 
     const handle = await this.driver.start({
@@ -606,11 +634,18 @@ export class SessionRunner {
     if (!sandboxId) {
       const r = await this.ensureSandbox(sessionId, fence);
       sandboxId = r.sandboxId;
+      sandboxSpec = r.spec;
       if (r.egress) held.egress = r.egress;
     }
     await this.db
       .updateTable("sessions")
-      .set({ codex_thread_id: handle.threadId, codex_version_digest: digest, sandbox_id: sandboxId })
+      .set({
+        codex_thread_id: handle.threadId,
+        codex_version_digest: digest,
+        sandbox_id: sandboxId,
+        // create 路径写入重建提示与状态（spec §9.3 reaper 状态机）
+        ...(sandboxSpec ? { sandbox_spec: sandboxSpec, sandbox_state: "active", sandbox_paused_at: null } : {}),
+      })
       .where("id", "=", sessionId)
       .execute();
     if (recovered) {
@@ -626,7 +661,7 @@ export class SessionRunner {
   private async ensureSandbox(
     sessionId: string,
     fence: { executionId: string; generation: number },
-  ): Promise<{ sandboxId: string; egress?: HeldRuntime["egress"] }> {
+  ): Promise<{ sandboxId: string; spec: Record<string, unknown>; egress?: HeldRuntime["egress"] }> {
     const spec: {
       sessionId: string;
       generation: number;
@@ -675,7 +710,20 @@ export class SessionRunner {
       }
     }
     const sbx = await this.provider.create(spec);
-    return { sandboxId: sbx.sandboxId, ...(egress ? { egress } : {}) };
+    return { sandboxId: sbx.sandboxId, spec: spec as Record<string, unknown>, ...(egress ? { egress } : {}) };
+  }
+
+  /**
+   * 释放本进程持有的 warm runtime（reaper 暂停/销毁沙箱前调用）：
+   * stop driver 进程 + 移出 map；下一条消息按 checkpoint 恢复路径重建。
+   * 不在此撤销 egress 绑定——绑定随沙箱生命周期（§10.4：resume 用同一 Pod env；
+   * destroy 后由逐请求 fence 校验 + token exp 兜底）。
+   */
+  async dropRuntime(sessionId: string): Promise<void> {
+    const held = this.runtimes.get(sessionId);
+    if (!held) return;
+    this.runtimes.delete(sessionId);
+    await held.handle.stop("sandbox pause").catch(() => undefined);
   }
 
   /**

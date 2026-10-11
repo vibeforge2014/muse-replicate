@@ -64,6 +64,11 @@ export interface SessionRow {
   active_workspace_checkpoint: Record<string, unknown> | null;
   active_output_manifest: Record<string, unknown> | null;
   sandbox_id: string | null;
+  /** 沙箱状态机（spec §9.3 reaper）：null/'active' → 'paused' → destroy 后回 null。 */
+  sandbox_state: string | null;
+  sandbox_paused_at: Date | null;
+  /** 沙箱重建提示（create 时的 SandboxSpec 原样持久化；k8s resume 重建 Pod 用）。 */
+  sandbox_spec: Record<string, unknown> | null;
   codex_thread_id: string | null;
   codex_version_digest: string | null;
   archived_at: Date | null;

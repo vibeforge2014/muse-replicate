@@ -61,7 +61,12 @@ export interface SandboxProvider {
    */
   exec?(sandboxId: string): RemoteSpawnContext;
   pause(sandboxId: string): Promise<void>;
-  resume(sandboxId: string): Promise<void>;
+  /**
+   * 恢复被 pause 的沙箱。spec 是持久化在 sessions.sandbox_spec 的重建提示：
+   * k8s 的 pause = 删 Pod，resume 需原 spec 重建（worker 重启后 provider 内存
+   * specs 丢失，spec 由 DB 传入）；docker/fake 忽略之（容器/目录原样在）。
+   */
+  resume(sandboxId: string, spec?: SandboxSpec): Promise<void>;
   destroy(sandboxId: string): Promise<void>;
 }
 
@@ -128,7 +133,9 @@ export class FakeSandboxProvider implements SandboxProvider {
   async pause(sandboxId: string): Promise<void> {
     this.state.set(sandboxId, "paused");
   }
-  async resume(sandboxId: string): Promise<void> {
+  async resume(sandboxId: string, spec?: SandboxSpec): Promise<void> {
+    // 幂等重物化：pause 不删目录，但 resume 带 spec 时补齐目录约定无害
+    if (spec) this.materialize(sandboxId, spec);
     this.state.set(sandboxId, "ready");
   }
   async destroy(sandboxId: string): Promise<void> {
@@ -230,8 +237,8 @@ export class WarmPoolProvider implements SandboxProvider {
   async pause(sandboxId: string): Promise<void> {
     await this.inner.pause(sandboxId);
   }
-  async resume(sandboxId: string): Promise<void> {
-    await this.inner.resume(sandboxId);
+  async resume(sandboxId: string, spec?: SandboxSpec): Promise<void> {
+    await this.inner.resume(sandboxId, spec);
   }
   async destroy(sandboxId: string): Promise<void> {
     await this.inner.destroy(sandboxId);
@@ -384,7 +391,8 @@ export class DockerProvider implements SandboxProvider {
   async pause(sandboxId: string): Promise<void> {
     await docker(["pause", sandboxId]);
   }
-  async resume(sandboxId: string): Promise<void> {
+  async resume(sandboxId: string, _spec?: SandboxSpec): Promise<void> {
+    // 容器原样冻结在宿主上，unpause 即恢复（无需 spec 重建）
     await docker(["unpause", sandboxId]);
   }
   async destroy(sandboxId: string): Promise<void> {

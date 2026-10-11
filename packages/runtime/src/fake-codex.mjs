@@ -14,11 +14,18 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { hostname } from "node:os";
 import { join, dirname } from "node:path";
 import readline from "node:readline";
 
 const home = process.env.FAKE_CODEX_HOME ?? "/tmp/fake-codex-home";
 mkdirSync(home, { recursive: true });
+// 运行位置标记：driver 进沙箱（spec §8.4）时 hostname = Pod 名，worker 侧经 PVC 可见
+try {
+  writeFileSync(join(home, "runtime-host.txt"), `${hostname()} pid=${process.pid} at=${new Date().toISOString()}\n`);
+} catch {
+  /* 只读卷上忽略 */
+}
 const rolloutPath = join(home, "rollout.json");
 
 let nextId = 1;

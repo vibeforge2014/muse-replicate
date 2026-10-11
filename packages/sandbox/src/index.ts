@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { sql, type Kysely } from "kysely";
 import type { Database } from "@mas/db";
+import type { RemoteSpawnContext } from "@mas/runtime";
 
 /**
  * SandboxProvider（spec §9）：worker 与具体沙箱实现之间的唯一边界。
@@ -54,6 +55,11 @@ export interface SandboxProvider {
    * WarmPoolProvider 拒绝包装该 provider（fail closed，不虚报能力）。
    */
   attach?(sandboxId: string, spec: SandboxSpec): Promise<SandboxHandle>;
+  /**
+   * driver 进沙箱（spec §8.4 真实形态）：在沙箱容器里 spawn 进程。
+   * 未实现时 worker 保持宿主子进程模式（fake provider / DockerProvider 现状）。
+   */
+  exec?(sandboxId: string): RemoteSpawnContext;
   pause(sandboxId: string): Promise<void>;
   resume(sandboxId: string): Promise<void>;
   destroy(sandboxId: string): Promise<void>;
@@ -439,3 +445,5 @@ export function resetFakeSandboxHome(sessionId: string): void {
 }
 
 export * from "./k8s-provider.js";
+export * from "./ws-exec.js";
+export * from "./ws-frame.js";

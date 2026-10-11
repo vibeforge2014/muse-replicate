@@ -42,6 +42,10 @@ spec:
             # 代理不可达时 best-effort 降级（不注入 env，仅告警日志）
             - { name: MAS_EGRESS_URL, value: "http://mas-egress:8081" }
             - { name: MAS_EGRESS_ADMIN, value: mas-dev-egress-secret }
+            # driver 进沙箱（spec §8.4）：runtime 进程经 pods/exec 跑在沙箱 Pod 里。
+            # 需要导入 mas-sandbox 镜像（Dockerfile sandbox 目标，含 codex CLI / node+repo）
+            - { name: MAS_RUNTIME_SANDBOX, value: inside }
+            - { name: MAS_K8S_SANDBOX_IMAGE, value: "mas-sandbox:latest" }
             # 并发冷启风暴（几十个 runsc Pod 同时调度）下 containerd 排队：放宽 Pod 起Running 等待
             - { name: MAS_K8S_POD_START_TIMEOUT_MS, value: "180000" }
             # TMPDIR 指到 PVC 挂载点 → 会话 home 落在共享卷上（沙箱 Pod subPath 可见）

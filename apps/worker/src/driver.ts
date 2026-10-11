@@ -17,6 +17,11 @@ export function driverFromEnv(env: NodeJS.ProcessEnv = process.env): AgentRuntim
     return new CodexDriver({
       bin: env.MAS_CODEX_BIN,
       authFile: env.MAS_CODEX_AUTH_FILE,
+      // codex 跑在沙箱镜像里时，worker 宿主上探不到二进制版本——用镜像标识当
+      // 版本指纹（镜像变更即 runtime 升级，触发 Level 0 语义恢复，spec §8.7）
+      ...(env.MAS_RUNTIME_SANDBOX === "inside"
+        ? { versionDigest: `codex-image@${env.MAS_K8S_SANDBOX_IMAGE ?? "default"}` }
+        : {}),
     });
   }
   return new FakeCodexDriver();

@@ -62,11 +62,11 @@ BASE_URL=http://<node-ip>:30080 MAS_API_KEY=<key> ./scripts/smoke.sh
 | 10-postgres.yaml | StatefulSet + 10Gi PVC + Service（mas_dev，trust——生产改 secret + TLS） |
 | 20-shared-pvc.yaml | mas-files / mas-snapshots 共享卷（FS 存储模式的回退路径） |
 | 30-server.yaml | Deployment（就绪探针 /internal/metrics）+ Service(30080)，S3 env 指向 MinIO |
-| 40-worker.yaml | Deployment（MAS_WARM_POOL_MIN 可开），S3 env 与 server 一致；`MAS_SANDBOX_PROVIDER=k8s` + TMPDIR 指到 mas-sandboxes PVC；`MAS_EGRESS_URL` 指向 mas-egress（§10.4 生命周期自动开启） |
+| 40-worker.yaml | Deployment（MAS_WARM_POOL_MIN 可开），S3 env 与 server 一致；`MAS_SANDBOX_PROVIDER=k8s` + TMPDIR 指到 mas-sandboxes PVC；`MAS_EGRESS_URL` 指向 mas-egress（§10.4 生命周期自动开启）；`MAS_RUNTIME_SANDBOX=inside` + `MAS_K8S_SANDBOX_IMAGE=mas-sandbox:latest`（driver 进沙箱，需先导入沙箱镜像，见下） |
 | 45-egress.yaml | egress-proxy Deployment + Service(8081) + mas-egress-ca PVC（CA 落盘，重启不换根）；单副本（revoke denylist 在内存，权威吊销是逐请求 fence 检查） |
 | 50-observability.yaml | Prometheus（抓取 mas-server/mas-egress + 告警规则 ConfigMap）+ Grafana（双看板自动供给，31300） |
 | 55-minio.yaml | MinIO StatefulSet（20Gi local-path）+ Service（集群内 9000；NodePort 30900/30901 供外部测试/Console） |
-| 56-sandbox-rbac.yaml | mas-sandboxes PVC + mas-worker ServiceAccount/Role（沙箱 Pod 管理 + NetworkPolicy 下发） |
+| 56-sandbox-rbac.yaml | mas-sandboxes PVC + mas-worker ServiceAccount/Role（沙箱 Pod 管理 + pods/exec（inside 模式 driver 通道）+ NetworkPolicy 下发） |
 
 ## 沙箱（K8sSandboxProvider）
 
@@ -95,6 +95,13 @@ worker `MAS_SANDBOX_PROVIDER=k8s` 时沙箱 = 集群内 Pod（`packages/sandbox/
   local-path PVC 本身也把 worker 与沙箱钉在 PV 所在节点）。
 - **工作区共享**：worker `TMPDIR=/var/mas/sandboxes`（PVC 挂载点）→ 会话 home 落 PVC；
   沙箱 Pod 以 subPath 绑定同 PVC 的会话子目录（/session/.codex、/mnt/session/outputs）。
+- **driver 进沙箱（inside 模式，spec §8.4）**：worker `MAS_RUNTIME_SANDBOX=inside` 后 runtime 进程
+  （codex app-server / fake-codex.mjs）经 pods/exec WebSocket 跑在沙箱 Pod 内。前置条件：
+  1. 构建+导入沙箱镜像：`docker build --target sandbox -t mas-sandbox:latest .`（含 codex CLI；架构须与节点一致），
+     `docker save mas-sandbox:latest | gzip | ssh <node> "gunzip -c - | k3s ctr images import -"`；
+  2. worker env `MAS_K8S_SANDBOX_IMAGE=mas-sandbox:latest`（缺省 busybox 无 node/app，inside 起不来）；
+  3. 验证：`kubectl exec <sandbox-pod> -- cat /session/.codex/runtime-host.txt`，hostname==Pod 名即进程在容器内。
+  host 模式（缺省）不受影响：driver 仍为 worker 本机子进程。
 - **pause/resume**：K8s 无容器冻结原语 = 删/建 Pod（目录在 PVC 保留）；销毁失败抛错由 worker 记 sandbox_orphans。
 - **egress**：provider 下发 `mas-sandbox-egress-deny` NetworkPolicy（默认拒绝带 `mas-sandbox=true` 标签的 Pod），
   上报 `advisory`（是否强制取决于 CNI，k3s 自带 policy 控制器时生效）——不虚报 enforced（§9.0）。

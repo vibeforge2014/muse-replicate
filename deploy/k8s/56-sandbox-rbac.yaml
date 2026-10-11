@@ -30,9 +30,13 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [create, get, list, delete]
+  # driver 进沙箱（spec §8.4）：codex app-server 经 pods/exec 在沙箱容器里 spawn
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
   - apiGroups: ["networking.k8s.io"]
     resources: [networkpolicies]
-    verbs: [create, get]
+    verbs: [create, get, patch]
 ---
 # RuntimeClass 为 cluster-scoped：只读放行（沙箱能力探测）
 apiVersion: rbac.authorization.k8s.io/v1

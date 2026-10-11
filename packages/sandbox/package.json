@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@mas/core": "workspace:*",
-    "@mas/db": "workspace:*"
+    "@mas/db": "workspace:*",
+    "@mas/runtime": "workspace:*"
   }
 }

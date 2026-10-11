@@ -1,4 +1,3 @@
-import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,10 +9,12 @@ import type {
   RuntimeCommand,
   RuntimeHandle,
   RuntimeStartInput,
+  StdioProcess,
 } from "./types.js";
+import { localStdioSpawn } from "./local-spawn.js";
 
 interface FakeHandle extends RuntimeHandle {
-  proc: ChildProcess;
+  proc: StdioProcess;
   events: NormalizedRuntimeEvent[];
   waiters: ((e: NormalizedRuntimeEvent | null) => void)[];
   notify(method: string, params: Record<string, unknown>): void;
@@ -116,14 +117,25 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
   async start(input: RuntimeStartInput): Promise<RuntimeHandle> {
     const codexHome = join(tmpdir(), "mas-fake-codex", input.sessionId);
     mkdirSync(codexHome, { recursive: true });
-    const proc = spawn(process.execPath, [join(here, "fake-codex.mjs")], {
-      stdio: ["pipe", "pipe", "inherit"],
-      env: {
-        ...process.env,
-        FAKE_CODEX_HOME: codexHome,
-        MAS_SESSION_ID: input.sessionId,
-      },
-    });
+    const extraEnv = { FAKE_CODEX_HOME: codexHome, MAS_SESSION_ID: input.sessionId };
+    // 沙箱内运行（driver 进沙箱）：在容器里跑同一份 fake-codex.mjs（镜像内路径一致），
+    // FAKE_CODEX_HOME 映射为容器路径（PVC 双向可见）
+    const remote = input.remote;
+    const proc = await (remote
+      ? remote.spawn({
+          command: process.execPath,
+          args: [join(here, "fake-codex.mjs")],
+          env:
+            remote.toContainerPath(codexHome) === codexHome
+              ? extraEnv
+              : { ...extraEnv, FAKE_CODEX_HOME: remote.toContainerPath(codexHome) },
+          cwd: remote.toContainerPath(codexHome),
+        })
+      : localStdioSpawn({
+          command: process.execPath,
+          args: [join(here, "fake-codex.mjs")],
+          env: extraEnv,
+        }));
     const handle: FakeHandle = {
       sessionId: input.sessionId,
       threadId: "",
@@ -159,18 +171,22 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
       },
       async stop(reason) {
         this.notify("turn/interrupt", {});
-        if (!proc.killed) {
-          proc.kill("SIGTERM");
+        if (!proc.exited) {
+          proc.kill();
           await new Promise((r) => setTimeout(r, 50));
-          if (!proc.killed || proc.exitCode === null) proc.kill("SIGKILL");
+          if (!proc.exited) proc.kill();
         }
         void reason;
       },
     };
 
+    let textBuf = "";
     proc.stdout.on("data", (buf: Buffer) => {
-      const text = buf.toString();
-      for (const line of text.split("\n")) {
+      // NDJSON 可能一行拆多段：缓存到换行为止
+      textBuf += buf.toString();
+      const lines = textBuf.split("\n");
+      textBuf = lines.pop() ?? "";
+      for (const line of lines) {
         if (!line.trim()) continue;
         let msg: { method?: string; params?: Record<string, unknown> };
         try {
@@ -187,9 +203,26 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
         }
       }
     });
-    proc.on("exit", () => {
+    const flushOnExit = () => {
+      if (textBuf.trim()) {
+        try {
+          const msg = JSON.parse(textBuf) as { method?: string; params?: Record<string, unknown> };
+          if (msg.method) {
+            const ev = normalize(msg.method, msg.params ?? {});
+            if (ev) {
+              const waiter = handle.waiters.shift();
+              if (waiter) waiter(ev);
+              else handle.events.push(ev);
+            }
+          }
+        } catch {
+          /* 半行残余丢弃 */
+        }
+      }
+      textBuf = "";
       for (const w of handle.waiters.splice(0)) w(null);
-    });
+    };
+    proc.stdout.on("close", flushOnExit);
 
     await handle.request("initialize", { clientInfo: { name: "mas-worker" } });
     if (input.resumeThreadId) {
@@ -241,7 +274,7 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
     const h = handle as FakeHandle;
     const buffered = h.events.shift();
     if (buffered) return buffered;
-    const exited = h.proc.exitCode !== null;
+    const exited = h.proc.exited;
     if (exited) return null;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {

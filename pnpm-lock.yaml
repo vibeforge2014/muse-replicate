@@ -242,6 +242,9 @@ importers:
       '@mas/db':
         specifier: workspace:*
         version: link:../db
+      '@mas/runtime':
+        specifier: workspace:*
+        version: link:../runtime
 
   packages/sdk:
     devDependencies:

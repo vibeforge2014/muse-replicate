@@ -64,6 +64,8 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_SANDBOX_PROVIDER` | `fake` | 沙箱 provider：`fake`=本机目录；`docker`=宿主 docker；`k8s`=集群内沙箱 Pod（in-cluster SA 或 MAS_K8S_API/TOKEN/CA、MAS_K8S_NODE_SELECTOR、MAS_K8S_PVC/MAS_K8S_PVC_MOUNT；deploy/k8s/56-sandbox-rbac.yaml 配套） |
 | `MAS_K8S_POD_START_TIMEOUT_MS` | `60000` | 沙箱 Pod 起 Running 的等待上限；并发冷启风暴（几十个 runsc Pod 同时调度）下单节点 containerd 排队，需放大（worker manifest 设 180s） |
 | `MAS_RUNTIME_DRIVER` | `fake` | worker 的 runtime driver：`fake`=FakeCodexDriver（脚本化假 runtime，零额度消耗）；`codex`=真实 codex app-server（CodexDriver） |
+| `MAS_RUNTIME_SANDBOX` | –（host） | `inside`=driver 进沙箱（spec §8.4）：runtime 进程经 pods/exec WebSocket 跑在沙箱 Pod 容器内（先建沙箱后起 driver）；缺省=本机子进程。需 provider 支持 `exec`（当前仅 k8s）且沙箱镜像含 node/app（`MAS_K8S_SANDBOX_IMAGE`） |
+| `MAS_K8S_SANDBOX_IMAGE` | `busybox:latest` | k8s 沙箱 Pod 镜像。inside 模式必须用 `mas-sandbox`（Dockerfile `--target sandbox`，= runtime 层 + codex CLI）；镜像 tag 变更即 §8.7 Level 0 语义恢复（versionDigest=`codex-image@<tag>`） |
 | `MAS_CODEX_BIN` | `codex`（PATH） | 真实 driver 的 codex 可执行文件路径（如 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`） |
 | `MAS_CODEX_AUTH_FILE` | `~/.codex/auth.json` | 每会话 CODEX_HOME 复制的登录凭据来源（存在才复制；机密绝不进 checkpoint 归档） |
 | `HTTPS_PROXY` / `HTTP_PROXY` | – | codex 后端（chatgpt.com）可达性；受限网络下 worker 进程需可出站代理 |
@@ -87,6 +89,11 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 3. 真实 driver（`MAS_RUNTIME_DRIVER=codex`）：digest 取 `codex --version`（`codex@<ver>`），CLI 升级同样触发上述降级。
    真实 E2E 需显式开启（消耗登录账号额度）：
    `MAS_CODEX_E2E=1 MAS_CODEX_BIN=<codex> [MAS_CODEX_MODEL=gpt-6.1-sol] [HTTPS_PROXY=...] npx vitest run tests/codex-driver-e2e.test.ts`。
+4. **inside 模式（driver 进沙箱，spec §8.4）**：digest 为 `codex-image@<MAS_K8S_SANDBOX_IMAGE>`（worker 容器内无 codex 可执行文件可探测，镜像 tag 即版本）——换沙箱镜像 = Level 0 升级。运维要点：
+   - 构建/导入沙箱镜像：`docker build --target sandbox -t mas-sandbox:latest .`（= runtime 层 + codex CLI；`--build-arg CODEX_VERSION=<ver>` 可钉版本），`docker save | gzip` 后经快链路传到节点 `k3s ctr images import -`（注意架构须与节点一致）。
+   - 验证 driver 确在容器内：沙箱 Pod 存活时 `kubectl exec <pod> -- cat /session/.codex/runtime-host.txt`——`hostname==Pod 名` 即进程在沙箱里（写 worker 主机名则退回了 host 模式）。
+   - PVC 落盘排查：节点上沙箱文件在 local-path 动态目录（`kubectl get pv mas-sandboxes-* -o jsonpath='{.spec.local.path}'`），不是 worker 容器内的挂载视角路径。
+   - egress attach 失败只降级为无代理沙箱（warn 日志 `egress attach skipped`），不阻塞会话；inside 序反转后 home 目录由 worker 先建（CA 写入前置 mkdir）。
 
 ## 4. 常见故障排查
 

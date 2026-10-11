@@ -58,4 +58,47 @@ describe.skipIf(!k8sOk)("K8sSandboxProvider 真实集群", () => {
     await provider.destroy(handle!.sandboxId);
     handle = null;
   }, 60_000);
+
+  test("exec：WS 传输在沙箱容器里 spawn（stdio + env + 路径映射，spec §8.4）", async () => {
+    handle = await provider.create({
+      sessionId,
+      generation: 1,
+      mounts: [],
+      codexHome: home,
+      outputsDir: join(home, "outputs"),
+    });
+    const remote = provider.exec!(handle.sandboxId);
+    // 宿主路径 → 容器路径（挂载表换算）
+    expect(remote.toContainerPath(home)).toBe("/session/.codex");
+    expect(remote.toContainerPath(join(home, "outputs", "a.txt"))).toBe("/mnt/session/outputs/a.txt");
+
+    // 容器内进程：env 注入（exec API 无 env → sh 包装）+ stdout 回传 + 文件落 PVC
+    const proc = await remote.spawn({
+      command: "/bin/sh",
+      args: ["-c", 'echo "marker:$MARKER"; echo ws-exec-ok > /session/.codex/exec-marker.txt'],
+      env: { MARKER: "m42" },
+      cwd: "/session/.codex",
+    });
+    let out = "";
+    proc.stdout.on("data", (c: Buffer) => (out += c.toString()));
+    const exited = new Promise<number | null>((r) => proc.onExit((code) => r(code)));
+    const code = await Promise.race([exited, new Promise<null>((r) => setTimeout(() => r(null), 30_000))]);
+    expect(out).toContain("marker:m42");
+    expect(code).toBe(0);
+    // 文件落在 PVC 上——测试可能跑在集群外，回读同样经容器内 exec（宿主侧由
+    // worker 进程自己消费，真实链路见 runtime-host 标记验收）
+    const cat = await remote.spawn({
+      command: "/bin/cat",
+      args: ["/session/.codex/exec-marker.txt"],
+      env: {},
+      cwd: "/session/.codex",
+    });
+    let catOut = "";
+    cat.stdout.on("data", (c: Buffer) => (catOut += c.toString()));
+    const catDone = new Promise<number | null>((r) => cat.onExit((c) => r(c)));
+    await Promise.race([catDone, new Promise<null>((r) => setTimeout(() => r(null), 30_000))]);
+    expect(catOut.trim()).toBe("ws-exec-ok");
+    await provider.destroy(handle.sandboxId);
+    handle = null;
+  }, 180_000);
 });

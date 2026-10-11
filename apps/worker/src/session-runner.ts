@@ -85,6 +85,8 @@ export class SessionRunner {
   private provider: SandboxProvider;
   /** egress 生命周期接线（§10.4；MAS_EGRESS_URL 未设=关闭）。 */
   private egress: EgressWire | null = egressWireFromEnv();
+  /** driver 进沙箱（spec §8.4；MAS_RUNTIME_SANDBOX=inside）。 */
+  private inSandboxRuntime = false;
 
   constructor(
     private db: Kysely<Database>,
@@ -100,6 +102,8 @@ export class SessionRunner {
       typeof providerOrIsolation === "string"
         ? new FakeSandboxProvider(providerOrIsolation as "gvisor" | "microvm" | "runc")
         : providerOrIsolation;
+    // driver 进沙箱（spec §8.4）：MAS_RUNTIME_SANDBOX=inside 且 provider 支持 exec 时开启
+    this.inSandboxRuntime = process.env.MAS_RUNTIME_SANDBOX === "inside";
   }
 
   /** 模拟 kill -9：中止在途工作并停掉全部 runtime（测试用）。 */
@@ -571,6 +575,17 @@ export class SessionRunner {
       }
     }
 
+    // driver 进沙箱（spec §8.4）：沙箱必须先于 runtime 存在——exec 落在沙箱 Pod 里，
+    // 路径经 provider 映射（宿主 PVC 路径 ↔ 容器路径）
+    const insideSandbox = this.inSandboxRuntime && typeof this.provider.exec === "function";
+    let sandboxId = session.sandbox_id;
+    let sandboxEgress: HeldRuntime["egress"];
+    if (insideSandbox && !sandboxId) {
+      const r = await this.ensureSandbox(sessionId, fence);
+      sandboxId = r.sandboxId;
+      sandboxEgress = r.egress;
+    }
+
     const handle = await this.driver.start({
       sessionId,
       system: agent.system,
@@ -579,57 +594,19 @@ export class SessionRunner {
       hasBuiltinToolset: hasToolset,
       ...(resumeThreadId ? { resumeThreadId } : {}),
       ...(replayHistory?.length ? { replayHistory } : {}),
+      ...(insideSandbox && sandboxId ? { remote: this.provider.exec!(sandboxId) } : {}),
     });
-    const held: HeldRuntime = { handle, toolUseIds: new Map() };
+    const held: HeldRuntime = {
+      handle,
+      toolUseIds: new Map(),
+      ...(sandboxEgress ? { egress: sandboxEgress } : {}),
+    };
     this.runtimes.set(sessionId, held);
-    // 沙箱创建/复用（spec §9.3）：首个 runtime 生命周期内创建一次，登记 sandbox_id
-    let sandboxId = session.sandbox_id;
+    // 宿主 runtime 模式：沙箱在 driver 之后建（原顺序，spec §9.3）
     if (!sandboxId) {
-      const spec: {
-        sessionId: string;
-        generation: number;
-        mounts: { hostPath: string; mountPath: string }[];
-        codexHome: string;
-        outputsDir: string;
-        env?: Record<string, string>;
-      } = {
-        sessionId,
-        generation: fence.generation,
-        mounts: [],
-        codexHome: fakeCodexHome(sessionId),
-        outputsDir: join(fakeCodexHome(sessionId), "outputs"),
-      };
-      // egress attach（§10.4 生命周期：claim → prepare → create → attach）：
-      // 签发短期出站 token + 写入企业 CA + 组装 HTTP(S)_PROXY env。
-      // 失败只降级为"无代理沙箱"（warn 可观测），不阻塞会话执行。
-      if (this.egress) {
-        try {
-          const [binding, caPem] = await Promise.all([
-            prepareEgressBinding(this.egress, {
-              workspaceId: await this.workspaceOf(sessionId),
-              sessionId,
-              executionId: fence.executionId,
-              generation: fence.generation,
-              sandboxId: `pending:${sessionId}`,
-              // 绑定随沙箱生命周期（Pod env 不可变）：exp 取沙箱尺度；
-              // 逐请求 fence 校验 + revoke denylist 才是权威控制（§10.4）
-              ttlSeconds: 86_400,
-            }),
-            fetchEgressCa(this.egress),
-          ]);
-          const caName = "egress-ca.crt";
-          writeFileSync(join(fakeCodexHome(sessionId), caName), caPem);
-          // 沙箱内路径按 provider 约定：k8s 把 codexHome 挂在 /session/.codex；fake 同机同路径
-          const caPath =
-            this.provider.kind === "k8s" ? `/session/.codex/${caName}` : join(fakeCodexHome(sessionId), caName);
-          spec.env = egressEnvForSandbox({ proxyUrl: this.egress.url, token: binding.token, caPath });
-          held.egress = { bindingId: binding.bindingId, token: binding.token, expiresAt: binding.expiresAt };
-        } catch (e) {
-          console.warn(`[worker] egress attach skipped for ${sessionId}: ${(e as Error).message}`);
-        }
-      }
-      const sbx = await this.provider.create(spec);
-      sandboxId = sbx.sandboxId;
+      const r = await this.ensureSandbox(sessionId, fence);
+      sandboxId = r.sandboxId;
+      if (r.egress) held.egress = r.egress;
     }
     await this.db
       .updateTable("sessions")
@@ -643,6 +620,62 @@ export class SessionRunner {
       });
     }
     return held;
+  }
+
+  /** 沙箱创建（spec §9.3）+ egress attach（§10.4）。 */
+  private async ensureSandbox(
+    sessionId: string,
+    fence: { executionId: string; generation: number },
+  ): Promise<{ sandboxId: string; egress?: HeldRuntime["egress"] }> {
+    const spec: {
+      sessionId: string;
+      generation: number;
+      mounts: { hostPath: string; mountPath: string }[];
+      codexHome: string;
+      outputsDir: string;
+      env?: Record<string, string>;
+    } = {
+      sessionId,
+      generation: fence.generation,
+      mounts: [],
+      codexHome: fakeCodexHome(sessionId),
+      outputsDir: join(fakeCodexHome(sessionId), "outputs"),
+    };
+    // egress attach（§10.4 生命周期：claim → prepare → create → attach）：
+    // 签发出站 token + 写入企业 CA + 组装 HTTP(S)_PROXY env。
+    // 失败只降级为"无代理沙箱"（warn 可观测），不阻塞会话执行。
+    let egress: HeldRuntime["egress"] | undefined;
+    if (this.egress) {
+      try {
+        const [binding, caPem] = await Promise.all([
+          prepareEgressBinding(this.egress, {
+            workspaceId: await this.workspaceOf(sessionId),
+            sessionId,
+            executionId: fence.executionId,
+            generation: fence.generation,
+            sandboxId: `pending:${sessionId}`,
+            // 绑定随沙箱生命周期（Pod env 不可变）：exp 取沙箱尺度；
+            // 逐请求 fence 校验 + revoke denylist 才是权威控制（§10.4）
+            ttlSeconds: 86_400,
+          }),
+          fetchEgressCa(this.egress),
+        ]);
+        const caName = "egress-ca.crt";
+        // inside 模式下顺序反转（沙箱先于 driver 创建），home 目录此刻可能尚不存在
+        // （host 模式由本地 driver 进程先建）；CA 写入前先补建（PVC 上，Pod subPath 可见）
+        mkdirSync(fakeCodexHome(sessionId), { recursive: true });
+        writeFileSync(join(fakeCodexHome(sessionId), caName), caPem);
+        // 沙箱内路径按 provider 约定：k8s 把 codexHome 挂在 /session/.codex；fake 同机同路径
+        const caPath =
+          this.provider.kind === "k8s" ? `/session/.codex/${caName}` : join(fakeCodexHome(sessionId), caName);
+        spec.env = egressEnvForSandbox({ proxyUrl: this.egress.url, token: binding.token, caPath });
+        egress = { bindingId: binding.bindingId, token: binding.token, expiresAt: binding.expiresAt };
+      } catch (e) {
+        console.warn(`[worker] egress attach skipped for ${sessionId}: ${(e as Error).message}`);
+      }
+    }
+    const sbx = await this.provider.create(spec);
+    return { sandboxId: sbx.sandboxId, ...(egress ? { egress } : {}) };
   }
 
   /**

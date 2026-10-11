@@ -2,12 +2,14 @@ import { request as httpsRequest } from "node:https";
 import { readFileSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, relative, isAbsolute } from "node:path";
+import type { RemoteSpawnContext } from "@mas/runtime";
 import type {
   ProviderCapabilities,
   SandboxHandle,
   SandboxProvider,
   SandboxSpec,
 } from "./index.js";
+import { buildExecArgv, wsExec } from "./ws-exec.js";
 
 /**
  * K8sSandboxProvider：沙箱 = 集群内 Pod（单节点 k3s 形态，deploy/k8s/56-sandbox-rbac.yaml）。
@@ -56,9 +58,9 @@ interface K8sRequestOptions {
 
 class K8sApi {
   constructor(
-    private readonly server: string,
-    private readonly token: string,
-    private readonly ca: Buffer | undefined,
+    readonly server: string,
+    readonly token: string,
+    readonly ca: Buffer | undefined,
   ) {}
 
   /** status 返回体；404 时抛 { status: 404 }（调用方按需吞掉）。 */
@@ -80,7 +82,7 @@ class K8sApi {
               ? { "content-type": opts.contentType ?? "application/json", "content-length": Buffer.byteLength(payload) }
               : {}),
           },
-          timeout: 15_000,
+          timeout: 30_000,
         },
         (res) => {
           const chunks: Buffer[] = [];
@@ -184,6 +186,48 @@ export class K8sSandboxProvider implements SandboxProvider {
       // 是否强制取决于 CNI——k3s 自带 policy 控制器时生效，不虚报 enforced
       egress: "advisory",
     };
+  }
+
+  /**
+   * driver 进沙箱（spec §8.4 真实形态）：在沙箱容器里 spawn 进程，
+   * stdio 经 pods/exec 的 WebSocket（v4.channel.k8s.io）；宿主路径经 toContainerPath 映射。
+   * Pod env 里已有出站代理/CA（§10.4 attach），exec 进程继承。
+   */
+  exec(sandboxId: string): RemoteSpawnContext {
+    const pod = this.podName(sandboxId);
+    return {
+      spawn: (opts) =>
+        wsExec({
+          server: this.api.server,
+          token: this.api.token,
+          ca: this.api.ca,
+          namespace: this.namespace,
+          pod,
+          // exec API 无 env 参数：sh -c 包一层（export 后 exec 目标命令）
+          command: buildExecArgv(opts),
+        }),
+      toContainerPath: (hostPath) => this.toContainerPath(sandboxId, hostPath),
+    };
+  }
+
+  /** worker 宿主路径 → 容器内路径（按 create 时的挂载表换算；未知路径原样返回）。 */
+  private toContainerPath(sandboxId: string, hostPath: string): string {
+    const spec = this.specs.get(sandboxId);
+    if (!spec) return hostPath;
+    // 挂载目标可嵌套（outputsDir 物理上就在 codexHome 之下）：
+    // 按宿主前缀最长匹配，保证子目录挂载优先于父目录挂载。
+    const entries: { base: string; root: string }[] = [
+      ...spec.mounts.map((m) => ({ base: m.hostPath, root: join("/mnt/session/uploads", m.mountPath) })),
+      { base: spec.outputsDir, root: "/mnt/session/outputs" },
+      { base: spec.codexHome, root: "/session/.codex" },
+    ];
+    let best: { root: string; rel: string; baseLen: number } | null = null;
+    for (const e of entries) {
+      const r = relative(e.base, hostPath);
+      if (r !== "" && (r.startsWith("..") || isAbsolute(r))) continue;
+      if (!best || e.base.length > best.baseLen) best = { root: e.root, rel: r, baseLen: e.base.length };
+    }
+    return best ? join(best.root, best.rel) : hostPath;
   }
 
   private async ensureNetworkPolicy(): Promise<void> {

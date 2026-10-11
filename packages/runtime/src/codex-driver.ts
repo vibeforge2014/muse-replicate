@@ -1,4 +1,4 @@
-import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +9,9 @@ import type {
   RuntimeCommand,
   RuntimeHandle,
   RuntimeStartInput,
+  StdioProcess,
 } from "./types.js";
+import { localStdioSpawn } from "./local-spawn.js";
 
 /**
  * 真实 codex app-server driver（codex-cli ≥ 0.160 的 app-server v2 协议，NDJSON stdio）。
@@ -36,10 +38,15 @@ export interface CodexDriverOptions {
   /** auth.json 来源（默认 MAS_CODEX_AUTH_FILE 或 ~/.codex/auth.json；存在才复制）。 */
   authFile?: string;
   requestTimeoutMs?: number;
+  /**
+   * 版本指纹覆盖：沙箱内运行时 worker 传镜像标识（镜像变更即"runtime 升级"，
+   * 触发 Level 0 语义恢复，spec §8.7）——worker 宿主上没有 codex 二进制可探。
+   */
+  versionDigest?: string;
 }
 
 interface CodexHandle extends RuntimeHandle {
-  proc: ChildProcess;
+  proc: StdioProcess;
   events: NormalizedRuntimeEvent[];
   waiters: ((e: NormalizedRuntimeEvent | null) => void)[];
   /** 审批 itemId → server 请求 id（approval_response 按 itemId 回复）。 */
@@ -216,6 +223,10 @@ export class CodexDriver implements AgentRuntimeDriver {
     this.bin = opts.bin ?? process.env.MAS_CODEX_BIN ?? "codex";
     this.authFile = opts.authFile ?? process.env.MAS_CODEX_AUTH_FILE ?? join(homedir(), ".codex", "auth.json");
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 30_000;
+    if (opts.versionDigest) {
+      this.versionDigest = opts.versionDigest;
+      return;
+    }
     try {
       const v = execFileSync(this.bin, ["--version"], { encoding: "utf8", timeout: 10_000 }).trim();
       this.versionDigest = `codex@${v.split(/\s+/).pop() ?? "unknown"}`;
@@ -240,11 +251,24 @@ export class CodexDriver implements AgentRuntimeDriver {
       }
     }
 
-    const proc = spawn(this.bin, ["app-server"], {
-      stdio: ["pipe", "pipe", "inherit"],
-      cwd: home,
-      env: { ...process.env, CODEX_HOME: codexHome },
-    });
+    // 沙箱内运行（spec §8.4）：codex app-server 经 exec 在沙箱容器里 spawn；
+    // CODEX_HOME/cwd 换算为容器路径（会话 home 经 PVC 双向可见）
+    const remote = input.remote;
+    const workdir = remote ? remote.toContainerPath(home) : home;
+    const codexHomeArg = remote ? remote.toContainerPath(codexHome) : codexHome;
+    const proc = await (remote
+      ? remote.spawn({
+          command: this.bin,
+          args: ["app-server"],
+          env: { CODEX_HOME: codexHomeArg },
+          cwd: workdir,
+        })
+      : localStdioSpawn({
+          command: this.bin,
+          args: ["app-server"],
+          env: { CODEX_HOME: codexHome },
+          cwd: home,
+        }));
 
     const requestTimeoutMs = this.requestTimeoutMs;
     const pending = new Map<number | string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
@@ -334,13 +358,12 @@ export class CodexDriver implements AgentRuntimeDriver {
       pending.clear();
       for (const w of handle.waiters.splice(0)) w(null);
     };
-    proc.on("exit", () => failAll(`codex app-server exited (code ${proc.exitCode})`));
-    proc.on("error", (e) => failAll(`codex app-server spawn error: ${e.message}`));
+    proc.onExit((code) => failAll(`codex app-server exited (code ${code})`));
 
     await handle.request("initialize", { clientInfo: { name: "mas-codex-driver", version: "0.1.0" } });
 
     const threadParams: Record<string, unknown> = {
-      cwd: home,
+      cwd: workdir,
       approvalPolicy: input.approvalPolicy === "never" ? "never" : "untrusted",
       sandbox: input.approvalPolicy === "never" ? "danger-full-access" : "workspace-write",
     };
@@ -375,10 +398,10 @@ export class CodexDriver implements AgentRuntimeDriver {
       } catch {
         /* 尽力而为 */
       }
-      if (!proc.killed) {
-        proc.kill("SIGTERM");
+      if (!proc.exited) {
+        proc.kill();
         await new Promise((r) => setTimeout(r, 200));
-        if (proc.exitCode === null) proc.kill("SIGKILL");
+        if (!proc.exited) proc.kill();
       }
     };
     return handle;
@@ -426,7 +449,7 @@ export class CodexDriver implements AgentRuntimeDriver {
     const h = handle as CodexHandle;
     const buffered = h.events.shift();
     if (buffered) return buffered;
-    if (h.proc.exitCode !== null || h.proc.killed) return null;
+    if (h.proc.exited) return null;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         const i = h.waiters.indexOf(waiter);

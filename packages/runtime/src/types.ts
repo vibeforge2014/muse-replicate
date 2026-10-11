@@ -2,6 +2,36 @@
  * AgentRuntimeDriver 抽象（spec §8.1 的 MVP 子集）。
  * 沙箱内运行 codex app-server；平台只负责驱动和归一化。
  */
+import type { Readable, Writable } from "node:stream";
+
+/** 与 spawn 等价的 stdio 进程抽象：本地子进程或沙箱内远程进程同构。 */
+export interface StdioProcess {
+  stdin: Writable;
+  stdout: Readable;
+  /** 尽力终止（本地信号 / 远程断开连接），幂等；两次调用等于强制。 */
+  kill(): void;
+  /** 进程已退出（远程连接断开亦视为退出）。 */
+  readonly exited: boolean;
+  /** 退出回调（本地 exit 事件 / 远程连接关闭或收到终态 status）。 */
+  onExit(cb: (code: number | null) => void): void;
+}
+
+export interface StdioSpawnOptions {
+  command: string;
+  args: string[];
+  /** 追加环境变量（本地实现会并入 worker 进程 env；远程实现只下发这些）。 */
+  env: Record<string, string | undefined>;
+  cwd?: string;
+}
+
+export type StdioSpawn = (opts: StdioSpawnOptions) => Promise<StdioProcess> | StdioProcess;
+
+/** 沙箱内 runtime（driver 进沙箱，spec §8/§9）：spawn 在容器里执行，路径先经映射。 */
+export interface RemoteSpawnContext {
+  spawn: StdioSpawn;
+  /** worker 宿主路径 → 容器内路径（挂载表换算）。 */
+  toContainerPath(hostPath: string): string;
+}
 
 export interface RuntimeStartInput {
   sessionId: string;
@@ -18,6 +48,8 @@ export interface RuntimeStartInput {
   scriptOverrides?: Record<string, string>;
   /** agent 是否配置了内置工具集（未配置时 runtime 无 bash 等工具，TOOL-02）。 */
   hasBuiltinToolset?: boolean;
+  /** 沙箱内运行（spec §8.4 真实形态）：driver 经它在沙箱容器里 spawn。 */
+  remote?: RemoteSpawnContext;
 }
 
 export type RuntimeCommand =

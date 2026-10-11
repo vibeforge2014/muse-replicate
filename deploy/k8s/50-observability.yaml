@@ -9,11 +9,85 @@ data:
   prometheus.yml: |
     global:
       scrape_interval: 15s
+    rule_files:
+      - /etc/prometheus/rules/*.yml
     scrape_configs:
       - job_name: mas
         metrics_path: /internal/metrics
         static_configs:
           - targets: ["mas-server:8080"]
+      - job_name: mas-egress # egress-proxy 存活（spec §10：不可用必须告警）+ 决策计数
+        metrics_path: /internal/metrics
+        static_configs:
+          - targets: ["mas-egress:8081"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: mas
+data:
+  mas-alerts.yml: |
+    # 与 deploy/observability/prometheus-rules.yml 同源（spec §16/§17）
+    groups:
+      - name: mas-availability
+        rules:
+          - alert: MasServerDown
+            expr: up{job="mas"} == 0
+            for: 1m
+            labels: { severity: critical }
+            annotations:
+              summary: "mas-server 抓取失败超过 1 分钟（宕机或 /internal/metrics 不可达）"
+          - alert: MasEgressDown
+            expr: up{job="mas-egress"} == 0
+            for: 1m
+            labels: { severity: critical }
+            annotations:
+              summary: "egress-proxy 不可用：沙箱凭据出站 fail closed，平台必须告警（spec §10）"
+      - name: mas-api-slo
+        rules:
+          - alert: MasApi5xxRate
+            expr: sum(rate(mas_api_requests_total{code=~"5.."}[5m])) > 0.1
+            for: 5m
+            labels: { severity: warning }
+            annotations:
+              summary: "API 5xx 速率 {{ $value }} req/s 持续 5 分钟"
+          - alert: MasApiLatencyHigh
+            expr: sum(mas_api_latency_seconds_sum) / clamp_min(sum(mas_api_latency_seconds_count), 1) > 1
+            for: 10m
+            labels: { severity: warning }
+            annotations:
+              summary: "API 平均延迟超过 1s 持续 10 分钟"
+      - name: mas-runtime
+        rules:
+          - alert: MasQueueBacklog
+            expr: mas_executions{state="queued"} > 10
+            for: 5m
+            labels: { severity: warning }
+            annotations:
+              summary: "执行队列积压 {{ $value }} 条（worker 吞吐不足或卡死，spec §5.6）"
+          - alert: MasStuckExecutions
+            expr: mas_executions{state="running"} > 20
+            for: 10m
+            labels: { severity: warning }
+            annotations:
+              summary: "running 执行 {{ $value }} 条持续过久（租约丢失未回收？spec §5.6）"
+          - alert: MasEgressDeniedSpike
+            expr: increase(mas_egress_denied_total[5m]) > 5
+            labels: { severity: warning }
+            annotations:
+              summary: "出站拒绝 5 分钟新增 {{ $value }} 次：疑似越权出网/凭据滥用（spec §10）"
+          - alert: MasRuntimeRestartSpike
+            expr: mas_runtime_restarts_total > 3
+            labels: { severity: warning }
+            annotations:
+              summary: "近 24h 执行重试 {{ $value }} 次（driver/沙箱不稳定，spec §8）"
+          - alert: MasServerMemoryHigh
+            expr: mas_process_resident_memory_bytes > 1610612736
+            for: 10m
+            labels: { severity: warning }
+            annotations:
+              summary: "api 进程 RSS 持续超过 1.5Gi（逼近 §17.2 的 2GB 门禁）"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -31,13 +105,18 @@ spec:
         - name: prometheus
           image: prom/prometheus:v2.53.0
           args: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
-          volumeMounts: [{ name: config, mountPath: /etc/prometheus }, { name: data, mountPath: /prometheus }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus/prometheus.yml, subPath: prometheus.yml }
+            - { name: rules, mountPath: /etc/prometheus/rules }
+            - { name: data, mountPath: /prometheus }
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             limits: { memory: 512Mi }
       volumes:
         - name: config
           configMap: { name: prometheus-config }
+        - name: rules
+          configMap: { name: prometheus-rules }
         - name: data
           emptyDir: {}
 ---
@@ -96,6 +175,33 @@ data:
           "targets": [{ "expr": "mas_egress_denied_total" }] },
         { "id": 7, "title": "模型 token 计量（gateway）", "type": "timeseries", "gridPos": { "x": 12, "y": 16, "w": 12, "h": 6 },
           "targets": [{ "expr": "mas_model_tokens_total", "legendFormat": "{{model}} {{kind}}" }] }
+      ],
+      "schemaVersion": 39, "version": 1
+    }
+  mas-runtime.json: |
+    {
+      "title": "MAS Runtime", "uid": "mas-runtime", "timezone": "browser", "refresh": "15s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        { "id": 1, "title": "执行队列（按状态，spec §5.6）", "type": "timeseries", "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+          "targets": [{ "expr": "mas_executions", "legendFormat": "{{state}}" }] },
+        { "id": 2, "title": "轮均时延 / TTFT（近 1h，秒）", "type": "timeseries", "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+          "targets": [
+            { "expr": "mas_session_turn_seconds_mean", "legendFormat": "turn" },
+            { "expr": "mas_session_ttft_seconds_mean", "legendFormat": "ttft" }
+          ] },
+        { "id": 3, "title": "沙箱活跃数", "type": "stat", "gridPos": { "x": 0, "y": 8, "w": 6, "h": 6 },
+          "targets": [{ "expr": "mas_sandbox_active" }] },
+        { "id": 4, "title": "执行重试（近 24h）", "type": "stat", "gridPos": { "x": 6, "y": 8, "w": 6, "h": 6 },
+          "targets": [{ "expr": "mas_runtime_restarts_total" }] },
+        { "id": 5, "title": "egress 决策速率（按 outcome）", "type": "timeseries", "gridPos": { "x": 12, "y": 8, "w": 12, "h": 6 },
+          "targets": [{ "expr": "sum(rate(mas_egress_requests_total[5m])) by (outcome)", "legendFormat": "{{outcome}}" }] },
+        { "id": 6, "title": "出站拒绝事件（egress deny，累计）", "type": "timeseries", "gridPos": { "x": 0, "y": 14, "w": 8, "h": 6 },
+          "targets": [{ "expr": "mas_egress_denied_total" }] },
+        { "id": 7, "title": "api 进程 RSS（§17.2 门禁 2GB）", "type": "timeseries", "gridPos": { "x": 8, "y": 14, "w": 8, "h": 6 },
+          "targets": [{ "expr": "mas_process_resident_memory_bytes", "legendFormat": "rss" }] },
+        { "id": 8, "title": "组件存活（up）", "type": "stat", "gridPos": { "x": 16, "y": 14, "w": 8, "h": 6 },
+          "targets": [{ "expr": "up{job=~\"mas.*\"}", "legendFormat": "{{job}}" }] }
       ],
       "schemaVersion": 39, "version": 1
     }

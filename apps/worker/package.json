@@ -20,7 +20,8 @@
     "pg": "^8.23.1",
     "pino": "^9.6.0",
     "zod": "^3.24.0",
-    "@mas/sandbox": "workspace:*"
+    "@mas/sandbox": "workspace:*",
+    "@mas/egress": "workspace:*"
   },
   "devDependencies": {
     "@types/pg": "^8.23.1"

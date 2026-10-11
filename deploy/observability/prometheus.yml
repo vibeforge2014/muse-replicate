@@ -3,6 +3,9 @@
 global:
   scrape_interval: 15s
 
+rule_files:
+  - /etc/prometheus/rules/*.yml # 告警规则（prometheus-rules.yml，k8s/compose 同源）
+
 scrape_configs:
   - job_name: mas
     metrics_path: /internal/metrics

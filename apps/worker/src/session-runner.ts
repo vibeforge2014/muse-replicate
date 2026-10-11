@@ -35,6 +35,8 @@ import {
   type RuntimeHandle,
 } from "@mas/runtime";
 import { FakeSandboxProvider, type SandboxProvider } from "@mas/sandbox";
+import { egressEnvForSandbox } from "@mas/egress";
+import { egressWireFromEnv, fetchEgressCa, prepareEgressBinding, revokeEgressBinding, type EgressWire } from "./egress.js";
 
 const LEASE_SECONDS = 30;
 const RENEW_INTERVAL_MS = 10_000;
@@ -57,6 +59,8 @@ interface HeldRuntime {
   handle: RuntimeHandle;
   /** fake itemId → sevt id（审批与 tool_result 关联）。 */
   toolUseIds: Map<string, string>;
+  /** egress binding（§10.4 attach 时签发；dispose/失栅时 revoke）。 */
+  egress?: { bindingId: string; token: string; expiresAt: string };
 }
 
 /**
@@ -79,6 +83,8 @@ export class SessionRunner {
   readonly faults: RunnerFaults = {};
 
   private provider: SandboxProvider;
+  /** egress 生命周期接线（§10.4；MAS_EGRESS_URL 未设=关闭）。 */
+  private egress: EgressWire | null = egressWireFromEnv();
 
   constructor(
     private db: Kysely<Database>,
@@ -99,7 +105,10 @@ export class SessionRunner {
   /** 模拟 kill -9：中止在途工作并停掉全部 runtime（测试用）。 */
   async dispose(): Promise<void> {
     this.disposed = true;
-    for (const [, held] of this.runtimes) await held.handle.stop("disposed").catch(() => undefined);
+    for (const [, held] of this.runtimes) {
+      if (held.egress && this.egress) await revokeEgressBinding(this.egress, held.egress.bindingId);
+      await held.handle.stop("disposed").catch(() => undefined);
+    }
     this.runtimes.clear();
   }
 
@@ -331,6 +340,7 @@ export class SessionRunner {
     try {
     for (;;) {
       if (fenceLost) {
+        if (held.egress && this.egress) await revokeEgressBinding(this.egress, held.egress.bindingId);
         await held.handle.stop("fence lost");
         this.runtimes.delete(sessionId);
         loopSpan.end(false, { outcome: "fence_lost" });
@@ -575,13 +585,47 @@ export class SessionRunner {
     // 沙箱创建/复用（spec §9.3）：首个 runtime 生命周期内创建一次，登记 sandbox_id
     let sandboxId = session.sandbox_id;
     if (!sandboxId) {
-      const sbx = await this.provider.create({
+      const spec: {
+        sessionId: string;
+        generation: number;
+        mounts: { hostPath: string; mountPath: string }[];
+        codexHome: string;
+        outputsDir: string;
+        env?: Record<string, string>;
+      } = {
         sessionId,
         generation: fence.generation,
         mounts: [],
         codexHome: fakeCodexHome(sessionId),
         outputsDir: join(fakeCodexHome(sessionId), "outputs"),
-      });
+      };
+      // egress attach（§10.4 生命周期：claim → prepare → create → attach）：
+      // 签发短期出站 token + 写入企业 CA + 组装 HTTP(S)_PROXY env。
+      // 失败只降级为"无代理沙箱"（warn 可观测），不阻塞会话执行。
+      if (this.egress) {
+        try {
+          const [binding, caPem] = await Promise.all([
+            prepareEgressBinding(this.egress, {
+              workspaceId: await this.workspaceOf(sessionId),
+              sessionId,
+              executionId: fence.executionId,
+              generation: fence.generation,
+              sandboxId: `pending:${sessionId}`,
+            }),
+            fetchEgressCa(this.egress),
+          ]);
+          const caName = "egress-ca.crt";
+          writeFileSync(join(fakeCodexHome(sessionId), caName), caPem);
+          // 沙箱内路径按 provider 约定：k8s 把 codexHome 挂在 /session/.codex；fake 同机同路径
+          const caPath =
+            this.provider.kind === "k8s" ? `/session/.codex/${caName}` : join(fakeCodexHome(sessionId), caName);
+          spec.env = egressEnvForSandbox({ proxyUrl: this.egress.url, token: binding.token, caPath });
+          held.egress = { bindingId: binding.bindingId, token: binding.token, expiresAt: binding.expiresAt };
+        } catch (e) {
+          console.warn(`[worker] egress attach skipped for ${sessionId}: ${(e as Error).message}`);
+        }
+      }
+      const sbx = await this.provider.create(spec);
       sandboxId = sbx.sandboxId;
     }
     await this.db

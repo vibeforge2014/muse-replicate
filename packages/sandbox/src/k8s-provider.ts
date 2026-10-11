@@ -225,6 +225,9 @@ export class K8sSandboxProvider implements SandboxProvider {
             image: this.image,
             imagePullPolicy: "IfNotPresent",
             command: ["sleep", "infinity"],
+            ...(spec.env && Object.keys(spec.env).length > 0
+              ? { env: Object.entries(spec.env).map(([name, value]) => ({ name, value })) }
+              : {}),
             volumeMounts: mounts.map((m) => ({
               name: "workspace",
               mountPath: m.mountPath,

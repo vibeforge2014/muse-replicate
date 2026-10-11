@@ -1,0 +1,64 @@
+# MAS 告警规则（spec §16/§17；Prometheus ≥ 2.53）。
+# k8s 形态经 deploy/k8s/50-observability.yaml 的 prometheus-rules ConfigMap 挂载；
+# compose 形态由 docker-compose.observability.yml 挂到 /etc/prometheus/rules。
+groups:
+  - name: mas-availability
+    rules:
+      - alert: MasServerDown
+        expr: up{job="mas"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "mas-server 抓取失败超过 1 分钟（宕机或 /internal/metrics 不可达）"
+      - alert: MasEgressDown
+        expr: up{job="mas-egress"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "egress-proxy 不可用：沙箱凭据出站 fail closed，平台必须告警（spec §10）"
+
+  - name: mas-api-slo
+    rules:
+      - alert: MasApi5xxRate
+        expr: sum(rate(mas_api_requests_total{code=~"5.."}[5m])) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "API 5xx 速率 {{ $value }} req/s 持续 5 分钟"
+      - alert: MasApiLatencyHigh
+        expr: sum(mas_api_latency_seconds_sum) / clamp_min(sum(mas_api_latency_seconds_count), 1) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "API 平均延迟超过 1s 持续 10 分钟"
+
+  - name: mas-runtime
+    rules:
+      - alert: MasQueueBacklog
+        expr: mas_executions{state="queued"} > 10
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "执行队列积压 {{ $value }} 条（worker 吞吐不足或卡死，spec §5.6）"
+      - alert: MasStuckExecutions
+        expr: mas_executions{state="running"} > 20
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "running 执行 {{ $value }} 条持续过久（租约丢失未回收？spec §5.6）"
+      - alert: MasEgressDeniedSpike
+        expr: increase(mas_egress_denied_total[5m]) > 5
+        labels: { severity: warning }
+        annotations:
+          summary: "出站拒绝 5 分钟新增 {{ $value }} 次：疑似越权出网/凭据滥用（spec §10）"
+      - alert: MasRuntimeRestartSpike
+        expr: mas_runtime_restarts_total > 3
+        labels: { severity: warning }
+        annotations:
+          summary: "近 24h 执行重试 {{ $value }} 次（driver/沙箱不稳定，spec §8）"
+      - alert: MasServerMemoryHigh
+        expr: mas_process_resident_memory_bytes > 1610612736
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "api 进程 RSS 持续超过 1.5Gi（逼近 §17.2 的 2GB 门禁）"

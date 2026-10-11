@@ -46,8 +46,10 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_SNAPSHOT_DIR` | `/tmp/mas-snapshots` | checkpoint 归档根目录 |
 | `MAS_FILES_DIR` | `/tmp/mas-files` | File 内容 / 输出对象根目录（api 与 worker 必须一致） |
 | `MAS_MASTER_KEY` | 开发默认（**生产必设**，64 位 hex） | 机密信封加密主密钥 |
-| `MAS_EGRESS_SECRET` | 开发默认（**生产必设**） | 出站 token 签发/验签密钥 |
-| `MAS_EGRESS_CA_CERT` / `MAS_EGRESS_CA_KEY` | –（生成临时 CA） | egress TLS 终止的企业 CA（PEM 文件）。未提供则进程内生成；`MAS_EGRESS_CA_DIR` 设置时生成物落盘（egress-ca.crt/key）复用。沙箱预置同一张 CA（`GET /internal/ca`，x-egress-admin 保护）后，HTTPS 流量按 SNI 签发叶子证书并在代理处终止（§10.1） |
+| `MAS_EGRESS_SECRET` | 开发默认（**生产必设**） | 出站 token 签发/验签密钥（egress-proxy 侧）；兼作 /internal/* 管理密钥 |
+| `MAS_EGRESS_URL` | –（worker egress 关闭） | worker 侧 egress-proxy 地址（如 `http://mas-egress:8081`）。设置后启用 §10.4 生命周期：建沙箱前 prepare 出站 token + 拉企业 CA 落会话 home，沙箱 env 注入 `http(s)_proxy`（userinfo 带 token）/`no_proxy`/CA 三家变量；dispose/失去租约时 revoke。代理不可达时 best-effort 降级（不注入，仅告警日志） |
+| `MAS_EGRESS_ADMIN` | 同 `MAS_EGRESS_SECRET` | worker 调 egress-proxy 内部端点（bindings/CA/revoke）的管理密钥（`x-egress-admin`） |
+| `MAS_EGRESS_CA_CERT` / `MAS_EGRESS_CA_KEY` | –（生成临时 CA） | egress TLS 终止的企业 CA（PEM 文件）。未提供则进程内生成；`MAS_EGRESS_CA_DIR` 设置时生成物落盘（egress-ca.crt/key）复用（k8s 形态落 PVC，重启不换根）。沙箱由 worker 自动预置同一张 CA（`GET /internal/ca`），HTTPS 流量按 SNI 签发叶子证书并在代理处终止（§10.1） |
 | `MAS_GATEWAY_SECRET` | 开发默认（**生产必设**） | model-gateway 会话 token（`masmt_v1`）签发/验签密钥 |
 | `MAS_UPSTREAM_BASE_URL` | `https://api.openai.com` | model-gateway 上游（Responses API 兼容） |
 | `MAS_UPSTREAM_API_KEY` | – | model-gateway 注入上游的真实 API key（永不下发给会话侧） |
@@ -101,13 +103,19 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 
 ## 5. 指标与告警建议
 
-`GET /internal/metrics`（Prometheus 文本）：
+`GET /internal/metrics`（Prometheus 文本，api 与 egress-proxy 各一份）：
 
 - `mas_api_requests_total{route,code}`：5xx 比例告警；
 - `mas_api_latency_seconds_*`：P99 告警；
 - `mas_sessions{status}`：`running` 长期堆积 → worker 容量/毒任务；
+- `mas_executions{state}`：`queued` 积压 → worker 吞吐不足；`running` 长期高位 → 租约丢失未回收；
+- `mas_session_turn_seconds_mean` / `mas_session_ttft_seconds_mean`：轮时延与首字时延（DB 聚合近 1h gauge）；
+- `mas_sandbox_active` / `mas_runtime_restarts_total`：沙箱存量与执行重试（近 24h）；
 - `mas_egress_denied_total`：突增 → 沙箱内异常出网尝试；
+- `mas_egress_requests_total{outcome}`（egress-proxy）：forwarded/credential_injected/host_denied/revoked/stale_fence/auth_denied 决策计数；
 - `mas_process_resident_memory_bytes`：进程 RSS（负载验收门禁的观测面）。
+
+**看板与告警已随仓库供给**：Grafana 双看板（MAS Overview / MAS Runtime）+ Prometheus 告警规则 8 条——k8s 形态在 `deploy/k8s/50-observability.yaml`（prometheus-rules ConfigMap，随 `kubectl apply` 生效），compose 形态在 `deploy/observability/`（`prometheus-rules.yml` 已由 compose 挂载）。关键 critical 两条：`MasServerDown`（api 抓取失败 >1m）与 `MasEgressDown`（egress-proxy 不可达 >1m，spec §10 要求平台必须告警——沙箱出站 fail closed）。
 
 ## 5a. 负载验收（spec §17.1/§17.2）
 

@@ -82,6 +82,50 @@ export function registerMetrics(app: FastifyInstance, ctx: { db: Kysely<Database
     lines.push("# TYPE mas_egress_denied_total gauge");
     lines.push(`mas_egress_denied_total ${Number(denied.rows[0]?.n ?? 0)}`);
 
+    // ---- 运行面（spec §16 表中 worker 侧指标，DB 聚合导出）----
+    // worker 进程无 HTTP 端口，事件/执行表即事实源；_mean 是近 1h 聚合 gauge
+    // 而非逐轮直方图（DESIGN.md 偏差表）
+    const execStates = await sql<{ state: string; n: string }>`
+      SELECT state, count(*)::text AS n FROM session_executions
+       WHERE state IN ('queued','running','retrying') GROUP BY state`.execute(ctx.db);
+    lines.push("# TYPE mas_executions gauge");
+    // 空队列也显式出 0（告警/看板不缺序列）
+    const execCounts: Record<string, number> = { queued: 0, running: 0, retrying: 0 };
+    for (const r of execStates.rows) execCounts[r.state] = Number(r.n);
+    for (const [state, n] of Object.entries(execCounts)) lines.push(`mas_executions{state="${state}"} ${n}`);
+
+    const turn = await sql<{ n: string | null }>`
+      SELECT coalesce(avg(extract(epoch from (settled_at - claimed_at)))::text, '') AS n
+       FROM session_executions
+       WHERE settled_at > now() - interval '1 hour' AND claimed_at IS NOT NULL`.execute(ctx.db);
+    lines.push("# TYPE mas_session_turn_seconds_mean gauge");
+    lines.push(`mas_session_turn_seconds_mean ${Number(turn.rows[0]?.n ?? 0).toFixed(3)}`);
+
+    // TTFT：每轮 claimed_at → 首个对用户可见的 agent.* 事件（近 1h 末 50 轮）
+    const ttft = await sql<{ n: string | null }>`
+      SELECT coalesce(avg(extract(epoch from (e.created_at - x.claimed_at)))::text, '') AS n
+       FROM (SELECT session_id, claimed_at FROM session_executions
+              WHERE settled_at > now() - interval '1 hour' AND claimed_at IS NOT NULL
+              ORDER BY settled_at DESC LIMIT 50) x
+       JOIN LATERAL (SELECT created_at FROM session_events e
+                      WHERE e.session_id = x.session_id AND e.created_at >= x.claimed_at
+                        AND e.type LIKE 'agent.%' AND e.disposition = 'normal'
+                      ORDER BY e.seq ASC NULLS LAST LIMIT 1) e ON true`.execute(ctx.db);
+    lines.push("# TYPE mas_session_ttft_seconds_mean gauge");
+    lines.push(`mas_session_ttft_seconds_mean ${Number(ttft.rows[0]?.n ?? 0).toFixed(3)}`);
+
+    const sandbox = await sql<{ n: string }>`
+      SELECT count(*)::text AS n FROM sessions
+       WHERE sandbox_id IS NOT NULL AND status IN ('active','completed')`.execute(ctx.db);
+    lines.push("# TYPE mas_sandbox_active gauge");
+    lines.push(`mas_sandbox_active ${Number(sandbox.rows[0]?.n ?? 0)}`);
+
+    const restarts = await sql<{ n: string }>`
+      SELECT count(*)::text AS n FROM session_executions
+       WHERE attempt_count > 1 AND (settled_at IS NULL OR settled_at > now() - interval '1 day')`.execute(ctx.db);
+    lines.push("# TYPE mas_runtime_restarts_total gauge");
+    lines.push(`mas_runtime_restarts_total ${Number(restarts.rows[0]?.n ?? 0)}`);
+
     reply.header("content-type", "text/plain; version=0.0.4");
     return lines.join("\n") + "\n";
   });

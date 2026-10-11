@@ -95,6 +95,24 @@ describe("M5 可观测与调试", () => {
     expect(text).toContain("mas_sse_connections");
   });
 
+  test("metrics 输出运行面 gauge（执行队列/沙箱/轮时延/TTFT，spec §16）", async () => {
+    const res = await fetch(`${url}/internal/metrics`);
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("# TYPE mas_executions gauge");
+    expect(text).toContain('mas_executions{state="');
+    expect(text).toContain("mas_session_turn_seconds_mean");
+    expect(text).toContain("mas_session_ttft_seconds_mean");
+    expect(text).toContain("mas_sandbox_active");
+    expect(text).toContain("mas_runtime_restarts_total");
+    // 数值行必须是合法非负浮点（SQL 空聚合回退 0）
+    for (const line of text.split("\n")) {
+      if (line.startsWith("mas_session_turn_seconds_mean ") || line.startsWith("mas_session_ttft_seconds_mean ")) {
+        expect(Number(line.split(" ").pop())).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
   test("metrics 受 MAS_INTERNAL_TOKEN 保护", async () => {
     process.env.MAS_INTERNAL_TOKEN = "ops-secret";
     const noToken = await fetch(`${url}/internal/metrics`);

@@ -1,0 +1,70 @@
+{
+  "title": "MAS Runtime",
+  "uid": "mas-runtime",
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "执行队列（按状态，spec §5.6）",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [{ "expr": "mas_executions", "legendFormat": "{{state}}" }]
+    },
+    {
+      "id": 2,
+      "title": "轮均时延 / TTFT（近 1h，秒）",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "mas_session_turn_seconds_mean", "legendFormat": "turn" },
+        { "expr": "mas_session_ttft_seconds_mean", "legendFormat": "ttft" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "沙箱活跃数",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 8, "w": 6, "h": 6 },
+      "targets": [{ "expr": "mas_sandbox_active" }]
+    },
+    {
+      "id": 4,
+      "title": "执行重试（近 24h）",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 8, "w": 6, "h": 6 },
+      "targets": [{ "expr": "mas_runtime_restarts_total" }]
+    },
+    {
+      "id": 5,
+      "title": "egress 决策速率（按 outcome）",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 6 },
+      "targets": [{ "expr": "sum(rate(mas_egress_requests_total[5m])) by (outcome)", "legendFormat": "{{outcome}}" }]
+    },
+    {
+      "id": 6,
+      "title": "出站拒绝事件（egress deny，累计）",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 14, "w": 8, "h": 6 },
+      "targets": [{ "expr": "mas_egress_denied_total" }]
+    },
+    {
+      "id": 7,
+      "title": "api 进程 RSS（§17.2 门禁 2GB）",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 14, "w": 8, "h": 6 },
+      "targets": [{ "expr": "mas_process_resident_memory_bytes", "legendFormat": "rss" }]
+    },
+    {
+      "id": 8,
+      "title": "组件存活（up）",
+      "type": "stat",
+      "gridPos": { "x": 16, "y": 14, "w": 8, "h": 6 },
+      "targets": [{ "expr": "up{job=~\"mas.*\"}", "legendFormat": "{{job}}" }]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

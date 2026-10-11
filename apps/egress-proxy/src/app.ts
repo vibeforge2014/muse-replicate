@@ -12,6 +12,7 @@ import {
   hostMatches,
   isBlacklistedHost,
   issueEgressToken,
+  parseProxyAuthorization,
   loadOrCreateEgressCA,
   mintServerCert,
   verifyEgressToken,
@@ -68,6 +69,19 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
   const adminSecret = opts.adminSecret ?? process.env.MAS_EGRESS_SECRET ?? "mas-dev-egress-secret";
   const fenceCache = new Map<string, { ok: boolean; at: number }>();
   const deniedLogLimiter = new Map<string, number>(); // `${sessionId}|${host}` → last ts
+  const egressCounters = new Map<string, number>(); // outcome → count（/internal/metrics）
+  function bumpEgress(outcome: string): void {
+    egressCounters.set(outcome, (egressCounters.get(outcome) ?? 0) + 1);
+  }
+  /** 显式撤销的 binding（jti；§10.4 revoke）。token 自带 exp 兜底，条目 2h 后清理。 */
+  const revokedBindings = new Map<string, number>(); // jti → revokedAt(ms)
+  const REVOKED_TTL_MS = 2 * 3600_000;
+
+  function isBindingRevoked(jti: string): boolean {
+    const now = Date.now();
+    for (const [id, at] of revokedBindings) if (now - at > REVOKED_TTL_MS) revokedBindings.delete(id);
+    return revokedBindings.has(jti);
+  }
 
   async function fenceStillCurrent(executionId: string, generation: number): Promise<boolean> {
     const key = `${executionId}|${generation}`;
@@ -191,7 +205,34 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
     return issueEgressToken({ ...body, generation } as EgressScope);
   });
 
+  // ---- 内部：显式撤销（§10.4 revoke：execution 结束/失去租约/取消时调用；幂等）----
+  app.post("/internal/bindings/:bindingId/revoke", async (req, reply) => {
+    if (req.headers["x-egress-admin"] !== adminSecret) {
+      reply.code(403);
+      return { error: "unauthorized" };
+    }
+    const { bindingId } = req.params as { bindingId: string };
+    if (!bindingId) {
+      reply.code(400);
+      return { error: "bindingId required" };
+    }
+    revokedBindings.set(bindingId, Date.now());
+    return { revoked: true, bindingId };
+  });
+
   app.get("/healthz", async () => ({ ok: true }));
+
+  // Prometheus 抓取（计数只含 outcome，不含 host/凭据等敏感维度）
+  app.get("/internal/metrics", async (_req, reply) => {
+    const lines = ["# TYPE mas_egress_requests_total counter"];
+    for (const [outcome, n] of [...egressCounters.entries()].sort()) {
+      lines.push(`mas_egress_requests_total{outcome="${outcome}"} ${n}`);
+    }
+    lines.push("# TYPE mas_egress_revoked_bindings gauge");
+    lines.push(`mas_egress_revoked_bindings ${revokedBindings.size}`);
+    reply.header("content-type", "text/plain; version=0.0.4");
+    return lines.join("\n") + "\n";
+  });
 
   // ---- 代理入口：绝对 URI 请求（http_proxy 客户端行为）----
   app.setNotFoundHandler(async (req, reply) => {
@@ -204,27 +245,36 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
     const host = target.hostname;
     const port = target.port ? Number(target.port) : 80;
 
-    const token = String(req.headers["proxy-authorization"] ?? "").replace(/^Bearer\s+/i, "");
+    const token = parseProxyAuthorization(String(req.headers["proxy-authorization"] ?? "")) ?? "";
     const verdict = verifyEgressToken(token);
     if (!verdict.ok) {
+      bumpEgress("auth_denied");
       reply.code(403);
       return { error: `egress token ${verdict.error}` };
+    }
+    if (isBindingRevoked(verdict.claims.jti)) {
+      bumpEgress("revoked");
+      reply.code(403);
+      return { error: "binding revoked" };
     }
     const claims = verdict.claims;
     // 旧 generation / 已 failed 的 execution：立即拒绝（§10.4 第 2 条）
     if (!(await fenceStillCurrent(claims.executionId, claims.generation))) {
+      bumpEgress("stale_fence");
       reply.code(403);
       return { error: "stale fence" };
     }
 
     const ctx = await loadSessionContext(claims.sessionId);
     if (!ctx) {
+      bumpEgress("unknown_session");
       reply.code(403);
       return { error: "unknown session" };
     }
 
     // 1) 平台黑名单（元数据服务 / RFC1918）
     if (isBlacklistedHost(host)) {
+      bumpEgress("host_denied");
       reply.header("x-mas-denied-host", host);
       await recordDenied(claims.sessionId, host, "blacklisted");
       reply.code(403);
@@ -236,6 +286,7 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
     // 2) 凭据命中 → 注入（占位符替换/直接附加）；否则公共出网策略
     const matched = matchCredentialForHost(ctx, host);
     if (matched) {
+      bumpEgress("credential_injected");
       // 剥离竞争凭据头（§10.4 第 4 条），占位符替换 / 直接注入
       delete headers.authorization;
       delete headers["x-api-key"];
@@ -244,6 +295,7 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
       // 3) 公共出网策略（env networking；unrestricted 只放行 80/443）
       const decision = evaluateEgressPolicy(host, port, ctx.envNetworking);
       if (decision.action === "deny") {
+        bumpEgress("host_denied");
         reply.header("x-mas-denied-host", host);
         await recordDenied(claims.sessionId, host, decision.reason);
         reply.code(403);
@@ -252,6 +304,7 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
     }
 
     // 4) 转发（审计面只记 host/method/status，不落请求体）
+    bumpEgress("forwarded");
     reply.hijack();
     const upstream = httpRequest(
       { hostname: host, port, path: target.pathname + target.search, method: req.method, headers },
@@ -304,12 +357,14 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
     headers.host = meta.port === 443 ? meta.host : `${meta.host}:${meta.port}`;
     const matched = matchCredentialForHost(meta.ctx, meta.host);
     if (matched) {
+      bumpEgress("credential_injected");
       delete headers.authorization;
       delete headers["x-api-key"];
       headers.authorization = `Bearer ${matched.secret}`;
     } else {
       const decision = evaluateEgressPolicy(meta.host, meta.port, meta.ctx.envNetworking);
       if (decision.action === "deny") {
+        bumpEgress("host_denied");
         res.setHeader("x-mas-denied-host", meta.host);
         await recordDenied(meta.claims.sessionId, meta.host, decision.reason);
         res.writeHead(403, { "content-type": "application/json" });
@@ -354,18 +409,30 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
         const host = idx > 0 ? target.slice(0, idx) : target;
         const port = idx > 0 ? Number(target.slice(idx + 1)) || 443 : 443;
 
-        const token = String(req.headers["proxy-authorization"] ?? "").replace(/^Bearer\s+/i, "");
+        const token = parseProxyAuthorization(String(req.headers["proxy-authorization"] ?? "")) ?? "";
         const verdict = verifyEgressToken(token);
-        if (!verdict.ok) return denySocket(socket, "403 Forbidden");
+        if (!verdict.ok) {
+          bumpEgress("auth_denied");
+          return denySocket(socket, "403 Forbidden");
+        }
+        if (isBindingRevoked(verdict.claims.jti)) {
+          bumpEgress("revoked");
+          return denySocket(socket, "403 Forbidden");
+        }
         const claims = verdict.claims;
         if (!(await fenceStillCurrent(claims.executionId, claims.generation))) {
+          bumpEgress("stale_fence");
           return denySocket(socket, "403 Forbidden");
         }
         const ctx = await loadSessionContext(claims.sessionId);
-        if (!ctx) return denySocket(socket, "403 Forbidden");
+        if (!ctx) {
+          bumpEgress("unknown_session");
+          return denySocket(socket, "403 Forbidden");
+        }
 
         // 主机策略在隧道建立前判（凭据命中或公共出网允许；黑名单在此拦截）
         if (isBlacklistedHost(host)) {
+          bumpEgress("host_denied");
           await recordDenied(claims.sessionId, host, "blacklisted");
           return denySocket(socket, "403 Forbidden", { "x-mas-denied-host": host });
         }
@@ -373,10 +440,12 @@ export function buildEgressApp(opts: EgressAppOptions): FastifyInstance {
         if (!matched) {
           const decision = evaluateEgressPolicy(host, port, ctx.envNetworking);
           if (decision.action === "deny") {
+            bumpEgress("host_denied");
             await recordDenied(claims.sessionId, host, decision.reason);
             return denySocket(socket, "403 Forbidden", { "x-mas-denied-host": host });
           }
         }
+        bumpEgress("tunnel_opened");
 
         // TLS 终止：按 SNI host 签叶子证书（缓存），解密后走同一套凭据/策略管线
         const leaf = mintServerCert(ca, host);

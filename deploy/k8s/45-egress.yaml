@@ -1,0 +1,70 @@
+# egress-proxy：沙箱凭据出站唯一通道（spec §10）。单副本——吊销名单在内存，
+# 权威吊销是逐请求 fence 检查 + token exp 兜底；扩副本需把 denylist 换共享存储。
+apiVersion: v1
+kind: Service
+metadata:
+  name: mas-egress
+  namespace: mas
+spec:
+  selector: { app: mas-egress }
+  ports: [{ port: 8081, targetPort: 8081 }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mas-egress-ca
+  namespace: mas
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 16Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mas-egress
+  namespace: mas
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: mas-egress } }
+  template:
+    metadata:
+      labels: { app: mas-egress }
+    spec:
+      initContainers:
+        - name: wait-postgres
+          image: mas-server:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - -e
+            - "const net=require('node:net');function t(){const s=net.connect({port:5432,host:'postgres'});s.on('connect',()=>{console.log('pg up');process.exit(0)});s.on('error',()=>setTimeout(t,1000))}t()"
+      containers:
+        - name: egress
+          image: mas-server:latest
+          imagePullPolicy: IfNotPresent
+          command: ["npx", "tsx", "apps/egress-proxy/src/main.ts"]
+          env:
+            - { name: DATABASE_URL, value: "postgres://mas@postgres:5432/mas_dev" }
+            - { name: MAS_EGRESS_HOST, value: "0.0.0.0" }
+            - { name: MAS_EGRESS_PORT, value: "8081" }
+            # 管理密钥（worker prepare/CA 拉取用）：开发默认值，生产必改（OPS §2）
+            - { name: MAS_EGRESS_SECRET, value: mas-dev-egress-secret }
+            # CA 落 PVC：重启不换根 → 已下发沙箱的 ca.crt 不失效
+            - { name: MAS_EGRESS_CA_DIR, value: /var/mas/egress-ca }
+          ports:
+            - { containerPort: 8081 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            initialDelaySeconds: 3
+          volumeMounts:
+            - { name: egress-ca, mountPath: /var/mas/egress-ca }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: egress-ca
+          persistentVolumeClaim: { claimName: mas-egress-ca }

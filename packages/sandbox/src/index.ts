@@ -29,6 +29,11 @@ export interface SandboxSpec {
   codexHome: string;
   /** outputs 宿主侧目录（轮末收集，§5.5）。 */
   outputsDir: string;
+  /**
+   * 沙箱进程环境变量（egress attach 写入 HTTP(S)_PROXY/CA 路径等，spec §10.4）。
+   * provider 原样注入；不设置则沙箱无出站代理配置。
+   */
+  env?: Record<string, string>;
 }
 
 export interface SandboxHandle {
@@ -66,6 +71,8 @@ export interface SandboxProvider {
 export class FakeSandboxProvider implements SandboxProvider {
   readonly kind = "fake";
   private state = new Map<string, "ready" | "paused">();
+  /** 测试观测：最近一次 create/attach 的 spec（egress attach 断言用）。 */
+  readonly lastSpecs: SandboxSpec[] = [];
 
   constructor(readonly declaredIsolation: "gvisor" | "microvm" | "runc" = "gvisor") {}
 
@@ -93,8 +100,16 @@ export class FakeSandboxProvider implements SandboxProvider {
     mkdirSync(join(home, "uploads"), { recursive: true });
     writeFileSync(
       join(home, ".sandbox"),
-      JSON.stringify({ sandboxId, sessionId: spec.sessionId, generation: spec.generation, kind: this.kind }),
+      JSON.stringify({
+        sandboxId,
+        sessionId: spec.sessionId,
+        generation: spec.generation,
+        kind: this.kind,
+        ...(spec.env ? { env: spec.env } : {}),
+      }),
     );
+    this.lastSpecs.push(spec);
+    if (this.lastSpecs.length > 64) this.lastSpecs.shift();
     this.state.set(sandboxId, "ready");
     return {
       sandboxId,

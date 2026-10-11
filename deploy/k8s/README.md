@@ -42,8 +42,9 @@ BASE_URL=http://<node-ip>:30080 MAS_API_KEY=<key> ./scripts/smoke.sh
 | 10-postgres.yaml | StatefulSet + 10Gi PVC + Service（mas_dev，trust——生产改 secret + TLS） |
 | 20-shared-pvc.yaml | mas-files / mas-snapshots 共享卷（FS 存储模式的回退路径） |
 | 30-server.yaml | Deployment（就绪探针 /internal/metrics）+ Service(30080)，S3 env 指向 MinIO |
-| 40-worker.yaml | Deployment（MAS_WARM_POOL_MIN 可开），S3 env 与 server 一致；`MAS_SANDBOX_PROVIDER=k8s` + TMPDIR 指到 mas-sandboxes PVC |
-| 50-observability.yaml | Prometheus（抓取配置在 ConfigMap）+ Grafana（看板自动供给，31300） |
+| 40-worker.yaml | Deployment（MAS_WARM_POOL_MIN 可开），S3 env 与 server 一致；`MAS_SANDBOX_PROVIDER=k8s` + TMPDIR 指到 mas-sandboxes PVC；`MAS_EGRESS_URL` 指向 mas-egress（§10.4 生命周期自动开启） |
+| 45-egress.yaml | egress-proxy Deployment + Service(8081) + mas-egress-ca PVC（CA 落盘，重启不换根）；单副本（revoke denylist 在内存，权威吊销是逐请求 fence 检查） |
+| 50-observability.yaml | Prometheus（抓取 mas-server/mas-egress + 告警规则 ConfigMap）+ Grafana（双看板自动供给，31300） |
 | 55-minio.yaml | MinIO StatefulSet（20Gi local-path）+ Service（集群内 9000；NodePort 30900/30901 供外部测试/Console） |
 | 56-sandbox-rbac.yaml | mas-sandboxes PVC + mas-worker ServiceAccount/Role（沙箱 Pod 管理 + NetworkPolicy 下发） |
 

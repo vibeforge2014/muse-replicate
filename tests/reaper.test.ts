@@ -12,7 +12,7 @@ import { setupEnv, type TestEnv } from "./helpers.ts";
  */
 
 /** 观测用 spy provider：记录调用，destroy 可按 sandboxId 注入失败。 */
-class SpyProvider implements SandboxProvider {
+export class SpyProvider implements SandboxProvider {
   readonly kind = "fake";
   paused: string[] = [];
   resumed: string[] = [];

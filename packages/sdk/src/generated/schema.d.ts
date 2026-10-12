@@ -1152,6 +1152,11 @@ export interface components {
             sha256?: string;
             scope?: string | null;
             created_at?: components["schemas"]["Timestamp"];
+            /**
+             * Format: date-time
+             * @description 文件 TTL（上传可选；过期即视为不存在，行与内容由 reaper 回收）
+             */
+            expires_at?: string | null;
         };
         Vault: {
             id: string;
@@ -2234,6 +2239,11 @@ export interface operations {
                 "multipart/form-data": {
                     /** Format: binary */
                     file: string;
+                    /**
+                     * Format: date-time
+                     * @description 可选 TTL（RFC3339，须未来且 ≤10 年）；过期后读路径 404、列表过滤
+                     */
+                    expires_at?: string;
                 };
             };
         };

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import type { Selectable } from "kysely";
+import { sql, type Selectable } from "kysely";
 import { errInvalid, errNotFound, newId } from "@mas/core";
 import type { Database, FileRow } from "@mas/db";
 import { objectStoreFromEnv, type SnapshotStore } from "@mas/db";
@@ -11,6 +11,8 @@ import { withIdempotency } from "../plugins/idempotent-route.js";
  * Files API（spec §5.5 / §11.4）：org 级上传与 session 输出共用 files 表；
  * 内容走内容存储（SnapshotStore：默认本地 FS，MAS_OBJECT_STORE=s3 切 MinIO/S3）。
  * 分页用 before_id / after_id（C-06），二者同传 400。
+ * TTL（spec §8 files.expires_at）：上传可选 expires_at（RFC3339），过期即视为不存在
+ * （读路径 404 / 列表过滤），行与内容对象由 worker reaper 定期回收。
  */
 
 const iso = (d: Date | undefined | null) =>
@@ -49,6 +51,8 @@ async function getFileRow(ctx: RouteCtx, ws: string, id: string): Promise<Select
     .where("workspace_id", "=", ws)
     .executeTakeFirst();
   if (!row) throw errNotFound(`file ${id} not found`);
+  // TTL：过期即视为不存在（GC 有 tick 延迟，读路径先挡住）
+  if (row.expires_at && row.expires_at.getTime() <= Date.now()) throw errNotFound(`file ${id} not found`);
   return row;
 }
 
@@ -67,6 +71,20 @@ export function registerFileRoutes(app: FastifyInstance, ctx: RouteCtx): void {
     const filename = part.filename ?? "";
     const invalid = validateFilename(filename);
     if (invalid) throw errInvalid(invalid);
+    // 可选 expires_at（RFC3339，须未来，≤10 年）：文件 TTL（spec §8）
+    const expiresRaw = (part.fields["expires_at"] as { value?: string } | undefined)?.value?.trim();
+    let expiresAt: Date | null = null;
+    if (expiresRaw) {
+      expiresAt = new Date(expiresRaw);
+      if (
+        Number.isNaN(expiresAt.getTime()) ||
+        !/^\d{4}-\d{2}-\d{2}[Tt ]\d{2}/.test(expiresRaw) ||
+        expiresAt.getTime() <= Date.now() ||
+        expiresAt.getTime() > Date.now() + 10 * 365 * 24 * 3600 * 1000
+      ) {
+        throw errInvalid("expires_at must be an RFC3339 timestamp in the future (within 10 years)");
+      }
+    }
 
     const store = contentStore();
     const bytes: Buffer[] = [];
@@ -97,6 +115,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: RouteCtx): void {
           size: content.length,
           sha256,
           object_key: objectKey,
+          ...(expiresAt ? { expires_at: expiresAt } : {}),
         })
         .execute();
       return fileJson(await getFileRow(ctx, ws, id));
@@ -115,10 +134,11 @@ export function registerFileRoutes(app: FastifyInstance, ctx: RouteCtx): void {
     const scopeId = query.scope_id as string | undefined;
 
     const rows = await ctx.db
-      .selectFrom("files")
-      .selectAll()
-      .where("workspace_id", "=", ws)
-      .$if(!!scopeId, (q) => q.where("scope_type", "=", "session").where("scope_id", "=", scopeId!))
+    .selectFrom("files")
+    .selectAll()
+    .where("workspace_id", "=", ws)
+      .where(sql<boolean>`(expires_at is null or expires_at > now())`)
+    .$if(!!scopeId, (q) => q.where("scope_type", "=", "session").where("scope_id", "=", scopeId!))
       .$if(!scopeId, (q) => q.where("scope_type", "=", "org"))
       .$if(!!query.before_id, (q) => q.where("id", "<", query.before_id!))
       .$if(!!query.after_id, (q) => q.where("id", ">", query.after_id!))

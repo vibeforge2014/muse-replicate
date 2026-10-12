@@ -463,6 +463,10 @@ paths:
               required: [file]
               properties:
                 file: { type: string, format: binary }
+                expires_at:
+                  description: 可选 TTL（RFC3339，须未来且 ≤10 年）；过期后读路径 404、列表过滤
+                  type: string
+                  format: date-time
       responses:
         "200":
           description: 上传成功
@@ -1586,6 +1590,10 @@ components:
         sha256: { type: string }
         scope: { type: [string, "null"] }
         created_at: { $ref: "#/components/schemas/Timestamp" }
+        expires_at:
+          description: 文件 TTL（上传可选；过期即视为不存在，行与内容由 reaper 回收）
+          type: [string, "null"]
+          format: date-time
 
     Vault:
       type: object

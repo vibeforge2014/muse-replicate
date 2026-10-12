@@ -1,6 +1,6 @@
 import { Client } from "pg";
 import { configureOtel } from "@mas/core";
-import { createDb, runMigrations, sessionsWithWork } from "@mas/db";
+import { createDb, objectStoreFromEnv, runMigrations, sessionsWithWork } from "@mas/db";
 import { WarmPoolProvider, type SandboxProvider } from "@mas/sandbox";
 import { SessionRunner } from "./session-runner.js";
 import { driverFromEnv, sandboxProviderFromEnv } from "./driver.js";
@@ -51,16 +51,23 @@ async function main() {
   const timer = setInterval(() => void drain(), 3000);
   console.log(`[worker] listening for session_exec (pid ${process.pid})`);
 
-  // 空闲沙箱 reaper（spec §9.3/§9.4）：多 worker 由 PG advisory lock 选主；MAS_REAPER=0 关闭
+  // 空闲沙箱 reaper + 存储 GC（spec §9.3/§9.4/§8）：多 worker 由 PG advisory lock 选主；MAS_REAPER=0 关闭
   const reaperCfg = reaperOptionsFromEnv();
   let stopReaper: (() => void) | undefined;
   if (provider && reaperCfg.enabled) {
     stopReaper = startReaper(
-      { db: db.db, provider, dropRuntime: (sid) => runner.dropRuntime(sid) },
+      {
+        db: db.db,
+        provider,
+        dropRuntime: (sid) => runner.dropRuntime(sid),
+        // 文件内容存储与 api 侧同源（MAS_OBJECT_STORE / MAS_FILES_DIR）
+        fileStore: objectStoreFromEnv(process.env, process.env.MAS_FILES_DIR ?? "/tmp/mas-files"),
+      },
       reaperCfg.tickMs,
+      reaperCfg.opts,
     );
     console.log(
-      `[worker] reaper on (tick=${reaperCfg.tickMs}ms pauseAfter=${reaperCfg.opts.pauseAfterSec}s destroyAfter=${reaperCfg.opts.destroyAfterSec}s)`,
+      `[worker] reaper on (tick=${reaperCfg.tickMs}ms pauseAfter=${reaperCfg.opts.pauseAfterSec}s destroyAfter=${reaperCfg.opts.destroyAfterSec}s idemTtl=${reaperCfg.opts.idempotencyTtlSec}s)`,
     );
   }
 

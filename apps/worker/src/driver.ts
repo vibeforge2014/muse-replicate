@@ -2,7 +2,9 @@ import { CodexDriver, FakeCodexDriver, type AgentRuntimeDriver } from "@mas/runt
 import {
   DockerProvider,
   FakeSandboxProvider,
+  K8sCrdSandboxProvider,
   K8sSandboxProvider,
+  OpenSandboxProvider,
   type SandboxProvider,
 } from "@mas/sandbox";
 
@@ -30,11 +32,17 @@ export function driverFromEnv(env: NodeJS.ProcessEnv = process.env): AgentRuntim
 /**
  * 按 MAS_SANDBOX_PROVIDER 选择沙箱 provider：
  *  - "k8s"：集群内沙箱 Pod（K8sSandboxProvider，runsc RuntimeClass + PVC 工作区）；
+ *  - "k8s-crd"：agent-sandbox CRD（K8sCrdSandboxProvider，需集群装有
+ *    agents.x-k8s.io Sandbox 控制器；pause/resume 走 operatingMode 声明）；
+ *  - "opensandbox"：OpenSandbox lifecycle API（OpenSandboxProvider，spec §9.1 首选；
+ *    需 MAS_OSB_SERVER/MAS_OSB_API_KEY，exec 经沙箱内 stdio-bridge）；
  *  - "docker"：宿主 docker（DockerProvider，MAS_DOCKER_PROVIDER_IMAGE）；
  *  - 默认 fake：本机目录（开发/测试）。
  */
 export function sandboxProviderFromEnv(env: NodeJS.ProcessEnv = process.env): SandboxProvider {
   if (env.MAS_SANDBOX_PROVIDER === "k8s") return new K8sSandboxProvider();
+  if (env.MAS_SANDBOX_PROVIDER === "k8s-crd") return new K8sCrdSandboxProvider();
+  if (env.MAS_SANDBOX_PROVIDER === "opensandbox") return new OpenSandboxProvider();
   if (env.MAS_SANDBOX_PROVIDER === "docker") {
     return new DockerProvider(env.MAS_DOCKER_PROVIDER_IMAGE ?? "busybox:latest");
   }

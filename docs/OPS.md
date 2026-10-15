@@ -61,7 +61,12 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `MAS_OBJECT_STORE` | `fs` | 对象存储后端：`fs`=本地目录（单机）；`s3`=S3 兼容（MinIO/S3，SigV4 手写签名零依赖）。key 布局两种后端一致，可无损切换 |
 | `MAS_S3_ENDPOINT` / `MAS_S3_REGION` | – / `us-east-1` | S3 端点（path-style，如 `http://minio.mas.svc.cluster.local:9000`）与区域 |
 | `MAS_S3_ACCESS_KEY` / `MAS_S3_SECRET_KEY` / `MAS_S3_BUCKET` | – | S3 凭据与桶（`MAS_OBJECT_STORE=s3` 时必填，桶不存在自动创建）。put 走条件写（If-None-Match，MinIO ≥2024-08 / AWS S3），putIfAbsent 按 etag(md5) 比对 |
-| `MAS_SANDBOX_PROVIDER` | `fake` | 沙箱 provider：`fake`=本机目录；`docker`=宿主 docker；`k8s`=集群内沙箱 Pod（in-cluster SA 或 MAS_K8S_API/TOKEN/CA、MAS_K8S_NODE_SELECTOR、MAS_K8S_PVC/MAS_K8S_PVC_MOUNT；deploy/k8s/56-sandbox-rbac.yaml 配套） |
+| `MAS_SANDBOX_PROVIDER` | `fake` | 沙箱 provider：`fake`=本机目录；`docker`=宿主 docker；`k8s`=集群内沙箱 Pod（in-cluster SA 或 MAS_K8S_API/TOKEN/CA、MAS_K8S_NODE_SELECTOR、MAS_K8S_PVC/MAS_K8S_PVC_MOUNT；deploy/k8s/56-sandbox-rbac.yaml 配套）；`k8s-crd`=agent-sandbox CR（需先装 agent-sandbox 控制器，见 deploy/k8s/README §CRD；pause/resume 走 operatingMode，其余同 k8s）；`opensandbox`=私有化 OpenSandbox（spec §9.1 首选；`MAS_OSB_*` 配套） |
+| `MAS_OSB_SERVER` / `MAS_OSB_API_KEY` | – | OpenSandbox 生命周期 API 基址（如 `https://osb.internal`）与 `OPEN-SANDBOX-API-KEY` 头（provider=opensandbox 必填） |
+| `MAS_OSB_IMAGE` / `MAS_OSB_CPU` / `MAS_OSB_MEMORY` / `MAS_OSB_ISOLATION` | node:22-alpine / 1 / 1Gi / runc | OpenSandbox 沙箱镜像与资源（image URI 必须 = 含 node 的镜像；isolation 如实上报 capabilities，不虚报） |
+| `MAS_OSB_HOST_MOUNTS` | 0（关） | =1 时把会话目录（codexHome/outputs/uploads 只读）以 hostPath 挂进沙箱并按容器路径映射（单机 OpenSandbox 与 worker 同宿主时用；k8s 形态 PVC 已覆盖则关） |
+| `MAS_OSB_ENDPOINT_SCHEME` | http | endpoints 服务发现拼 URL 的 scheme（内网 http；企业 TLS 终止在前置代理时 https） |
+| 多 agent lanes（API 用法） | – | `POST /v1/sessions/{id}/events` 可选 `lane_id`（`^[a-z0-9][a-z0-9_-]{0,63}$`，缺省 `main`）：同 lane 严格 FIFO，跨 lane 并发（单沙箱单 runtime 进程、每 lane 一个 thread）。中断只作用于其 lane 的队列；审批（requires_action）仍为会话级门控——多 lane 并发时收到审批请求的批次先处理 |
 | `MAS_K8S_POD_START_TIMEOUT_MS` | `60000` | 沙箱 Pod 起 Running 的等待上限；并发冷启风暴（几十个 runsc Pod 同时调度）下单节点 containerd 排队，需放大（worker manifest 设 180s） |
 | `MAS_RUNTIME_DRIVER` | `fake` | worker 的 runtime driver：`fake`=FakeCodexDriver（脚本化假 runtime，零额度消耗）；`codex`=真实 codex app-server（CodexDriver） |
 | `MAS_RUNTIME_SANDBOX` | –（host） | `inside`=driver 进沙箱（spec §8.4）：runtime 进程经 pods/exec WebSocket 跑在沙箱 Pod 容器内（先建沙箱后起 driver）；缺省=本机子进程。需 provider 支持 `exec`（当前仅 k8s）且沙箱镜像含 node/app（`MAS_K8S_SANDBOX_IMAGE`） |

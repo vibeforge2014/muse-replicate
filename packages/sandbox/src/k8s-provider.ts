@@ -1,4 +1,5 @@
 import { request as httpsRequest } from "node:https";
+import { request as httpRequest } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, relative, isAbsolute } from "node:path";
@@ -67,14 +68,20 @@ class K8sApi {
   async req<T = Record<string, unknown>>(opts: K8sRequestOptions): Promise<{ status: number; body: T }> {
     const url = new URL(`${this.server}${opts.path}`);
     const payload = opts.body === undefined ? undefined : JSON.stringify(opts.body);
+    // http:// 仅测试桩用（本地假 API）；集群内一律 https
+    const doRequest = url.protocol === "http:" ? httpRequest : httpsRequest;
     return new Promise((resolve, reject) => {
-      const r = httpsRequest(
+      const r = doRequest(
         {
           hostname: url.hostname,
-          port: url.port || 443,
+          port: url.port || (url.protocol === "http:" ? 80 : 443),
           path: url.pathname + url.search,
           method: opts.method,
-          ...(this.ca ? { ca: this.ca } : { rejectUnauthorized: false }),
+          ...(url.protocol === "http:"
+            ? {}
+            : this.ca
+              ? { ca: this.ca }
+              : { rejectUnauthorized: false }),
           headers: {
             authorization: `Bearer ${this.token}`,
             accept: "application/json",
@@ -111,19 +118,19 @@ const IN_CLUSTER_TOKEN = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 const IN_CLUSTER_CA = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 
 export class K8sSandboxProvider implements SandboxProvider {
-  readonly kind = "k8s";
-  private readonly api: K8sApi;
-  private readonly namespace: string;
+  readonly kind: string = "k8s";
+  protected readonly api: K8sApi;
+  protected readonly namespace: string;
   private readonly pvc: string;
   private readonly pvcMountPath: string;
-  private readonly image: string;
+  protected readonly image: string;
   /** "k=v,k2=v2" → Pod nodeSelector。 */
   private readonly nodeSelector: Record<string, string> | undefined;
-  private runscAvailable: boolean | undefined;
+  protected runscAvailable: boolean | undefined;
   /** Pod 起 Running 的等待上限（ms）。 */
-  private readonly podStartTimeoutMs: number;
+  protected readonly podStartTimeoutMs: number;
   /** pause 语义需要重建：sandboxId → spec。 */
-  private specs = new Map<string, SandboxSpec>();
+  protected specs = new Map<string, SandboxSpec>();
   private netPolicyEnsured = false;
 
   constructor(opts: K8sProviderOptions = {}) {
@@ -152,7 +159,7 @@ export class K8sSandboxProvider implements SandboxProvider {
       opts.podStartTimeoutMs ?? (Number(process.env.MAS_K8S_POD_START_TIMEOUT_MS) || 60_000);
   }
 
-  private podName(sandboxId: string): string {
+  protected podName(sandboxId: string): string {
     return sandboxId.replace(/^sbx_/, "").replace(/_/g, "-").toLowerCase();
   }
 
@@ -165,7 +172,7 @@ export class K8sSandboxProvider implements SandboxProvider {
     return rel;
   }
 
-  private async hasRunsc(): Promise<boolean> {
+  protected async hasRunsc(): Promise<boolean> {
     if (this.runscAvailable === undefined) {
       try {
         // RuntimeClass 是 cluster-scoped 资源（无 namespace 段）
@@ -230,7 +237,7 @@ export class K8sSandboxProvider implements SandboxProvider {
     return best ? join(best.root, best.rel) : hostPath;
   }
 
-  private async ensureNetworkPolicy(): Promise<void> {
+  protected async ensureNetworkPolicy(): Promise<void> {
     if (this.netPolicyEnsured) return;
     const policy = {
       apiVersion: "networking.k8s.io/v1",
@@ -276,7 +283,21 @@ export class K8sSandboxProvider implements SandboxProvider {
     this.netPolicyEnsured = true;
   }
 
-  private buildPod(sandboxId: string, spec: SandboxSpec): Record<string, unknown> {
+  protected buildPod(sandboxId: string, spec: SandboxSpec): Record<string, unknown> {
+    return {
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: {
+        name: this.podName(sandboxId),
+        namespace: this.namespace,
+        labels: { "mas-sandbox": "true", "mas-sandbox-id": sandboxId, "mas-session": spec.sessionId },
+      },
+      spec: this.buildPodSpec(sandboxId, spec),
+    };
+  }
+
+  /** PodSpec 部分（agent-sandbox CRD 模式复用：Sandbox.spec.podTemplate.spec）。 */
+  protected buildPodSpec(sandboxId: string, spec: SandboxSpec): Record<string, unknown> {
     const mounts: { subPath: string; mountPath: string; readOnly?: boolean }[] = [
       { subPath: this.subPath(spec.codexHome), mountPath: "/session/.codex" },
       { subPath: this.subPath(spec.outputsDir), mountPath: "/mnt/session/outputs" },
@@ -287,36 +308,27 @@ export class K8sSandboxProvider implements SandboxProvider {
       })),
     ];
     return {
-      apiVersion: "v1",
-      kind: "Pod",
-      metadata: {
-        name: this.podName(sandboxId),
-        namespace: this.namespace,
-        labels: { "mas-sandbox": "true", "mas-sandbox-id": sandboxId, "mas-session": spec.sessionId },
-      },
-      spec: {
-        restartPolicy: "Never",
-        ...(this.nodeSelector ? { nodeSelector: this.nodeSelector } : {}),
-        ...(this.runscAvailable ? { runtimeClassName: "runsc" } : {}),
-        containers: [
-          {
-            name: "sandbox",
-            image: this.image,
-            imagePullPolicy: "IfNotPresent",
-            command: ["sleep", "infinity"],
-            ...(spec.env && Object.keys(spec.env).length > 0
-              ? { env: Object.entries(spec.env).map(([name, value]) => ({ name, value })) }
-              : {}),
-            volumeMounts: mounts.map((m) => ({
-              name: "workspace",
-              mountPath: m.mountPath,
-              subPath: m.subPath,
-              ...(m.readOnly ? { readOnly: true } : {}),
-            })),
-          },
-        ],
-        volumes: [{ name: "workspace", persistentVolumeClaim: { claimName: this.pvc } }],
-      },
+      restartPolicy: "Never",
+      ...(this.nodeSelector ? { nodeSelector: this.nodeSelector } : {}),
+      ...(this.runscAvailable ? { runtimeClassName: "runsc" } : {}),
+      containers: [
+        {
+          name: "sandbox",
+          image: this.image,
+          imagePullPolicy: "IfNotPresent",
+          command: ["sleep", "infinity"],
+          ...(spec.env && Object.keys(spec.env).length > 0
+            ? { env: Object.entries(spec.env).map(([name, value]) => ({ name, value })) }
+            : {}),
+          volumeMounts: mounts.map((m) => ({
+            name: "workspace",
+            mountPath: m.mountPath,
+            subPath: m.subPath,
+            ...(m.readOnly ? { readOnly: true } : {}),
+          })),
+        },
+      ],
+      volumes: [{ name: "workspace", persistentVolumeClaim: { claimName: this.pvc } }],
     };
   }
 
@@ -349,7 +361,7 @@ export class K8sSandboxProvider implements SandboxProvider {
     };
   }
 
-  private async waitRunning(name: string, timeoutMs: number): Promise<void> {
+  protected async waitRunning(name: string, timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const r = await this.api.req<{ status?: { phase?: string; conditions?: { type: string; status: string }[] } }>({
@@ -396,14 +408,18 @@ export class K8sSandboxProvider implements SandboxProvider {
         body: { gracePeriodSeconds: 1 },
       })
       .catch(() => undefined);
-    // 等待删除完成（PVC subPath 复用同名 Pod 需要旧对象消失）
-    const deadline = Date.now() + 30_000;
+    await this.waitPodGone(name, 30_000);
+  }
+
+  /** 等待 Pod 对象消失（PVC subPath 复用同名 Pod 需要旧对象先消失）。 */
+  protected async waitPodGone(name: string, timeoutMs = 30_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
     for (;;) {
       const r = await this.api
         .req({ method: "GET", path: `/api/v1/namespaces/${this.namespace}/pods/${name}` })
         .catch(() => ({ status: 404, body: {} as Record<string, unknown> }));
       if (r.status === 404) return;
-      if (Date.now() > deadline) throw new Error(`k8s sandbox pod ${name} not deleted within 30s`);
+      if (Date.now() > deadline) throw new Error(`k8s sandbox pod ${name} not deleted within ${timeoutMs}ms`);
       await new Promise((res) => setTimeout(res, 1000));
     }
   }

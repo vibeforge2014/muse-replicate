@@ -453,5 +453,7 @@ export function resetFakeSandboxHome(sessionId: string): void {
 }
 
 export * from "./k8s-provider.js";
+export * from "./k8s-crd-provider.js";
+export * from "./opensandbox-provider.js";
 export * from "./ws-exec.js";
 export * from "./ws-frame.js";

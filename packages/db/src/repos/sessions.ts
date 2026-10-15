@@ -123,6 +123,8 @@ export interface AdmitInput {
   deadlineHours?: number;
   /** api 入口请求的 W3C traceparent：跟随 command（execution）供 worker 接续链路（spec §16）。 */
   traceparent?: string | null;
+  /** multiagent lanes（spec §5.6 二期）：lane_id=thread_id；缺省 "main"。 */
+  laneId?: string;
 }
 
 export interface AdmitResult {
@@ -147,6 +149,7 @@ function fingerprintOf(events: AdmitInput["events"]): string {
  * 若批次含 user.interrupt：持久化中断请求，取消同 lane 的 queued 输入并把它们 flush。
  */
 export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Promise<AdmitResult> {
+  const laneId = input.laneId ?? "main";
   const leaseSeconds = input.leaseSeconds ?? 30;
   const deadlineHours = input.deadlineHours ?? 6;
   const hasInterrupt = input.events.some((e) => e.type === "user.interrupt");
@@ -207,7 +210,7 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
         .updateTable("session_executions")
         .set({ interrupt_requested_at: new Date(), revision: (sql`revision + 1`) as never })
         .where("session_id", "=", input.sessionId)
-        .where("lane_id", "=", "main")
+        .where("lane_id", "=", laneId)
         .where("state", "in", ["claimed", "delivered"])
         .where("interrupt_requested_at", "is", null)
         .returning(["id"])
@@ -216,7 +219,7 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
         .updateTable("session_executions")
         .set({ state: "cancelled", settled_at: new Date() })
         .where("session_id", "=", input.sessionId)
-        .where("lane_id", "=", "main")
+        .where("lane_id", "=", laneId)
         .where("state", "=", "queued")
         .returning(["id", "input_event_ids"])
         .execute();
@@ -241,7 +244,7 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
           id: executionId,
           workspace_id: input.workspaceId,
           session_id: input.sessionId,
-          lane_id: "main",
+          lane_id: laneId,
           kind: input.executionKind,
           input_event_ids: runtimeBoundIds,
           input_fingerprint: fingerprintOf(input.events),
@@ -353,6 +356,7 @@ export async function claimNextExecution(
   ownerId: string,
   attemptId: string,
   leaseSeconds = 30,
+  laneId = "main",
 ): Promise<ClaimedExecution | null> {
   const result = await sql<Selectable<ExecutionRow>>`
     UPDATE session_executions e
@@ -362,7 +366,7 @@ export async function claimNextExecution(
            revision=revision+1
      WHERE e.id = (
        SELECT id FROM session_executions
-        WHERE session_id=${sessionId} AND lane_id='main'
+        WHERE session_id=${sessionId} AND lane_id=${laneId}
           AND (state='queued' OR (state IN ('claimed','delivered') AND lease_expires_at < now()))
           AND attempt_count < max_attempts AND deadline_at > now()
         ORDER BY admitted_at, id LIMIT 1
@@ -370,6 +374,37 @@ export async function claimNextExecution(
      )
      RETURNING *`.execute(db);
   return result.rows[0] ?? null;
+}
+
+/** 会话内所有有待处理工作（queued 或租约过期）的 lane（multiagent lanes，spec §5.6 二期）。 */
+export async function pendingLanes(db: Kysely<Database>, sessionId: string): Promise<string[]> {
+  const result = await sql<{ lane_id: string }>`
+    SELECT DISTINCT lane_id FROM session_executions
+     WHERE session_id=${sessionId}
+       AND (state='queued'
+        OR (state IN ('claimed','delivered') AND lease_expires_at < now() AND attempt_count < max_attempts AND deadline_at > now()))`.execute(db);
+  return result.rows.map((r) => r.lane_id);
+}
+
+/** lane 的 codex thread id（multiagent lanes：worker 重启后按 lane 原生 resume）。 */
+export async function getLaneThreadId(db: Kysely<Database>, sessionId: string, laneId: string): Promise<string | null> {
+  const row = await db
+    .selectFrom("session_lanes")
+    .select("codex_thread_id")
+    .where("session_id", "=", sessionId)
+    .where("lane_id", "=", laneId)
+    .executeTakeFirst();
+  return row?.codex_thread_id ?? null;
+}
+
+export async function setLaneThreadId(db: Kysely<Database>, sessionId: string, laneId: string, threadId: string): Promise<void> {
+  await db
+    .insertInto("session_lanes")
+    .values({ session_id: sessionId, lane_id: laneId, codex_thread_id: threadId })
+    .onConflict((oc) =>
+      oc.columns(["session_id", "lane_id"]).doUpdateSet({ codex_thread_id: threadId, updated_at: new Date() }),
+    )
+    .execute();
 }
 
 /** 有待处理工作的会话（worker 轮询入口）。 */

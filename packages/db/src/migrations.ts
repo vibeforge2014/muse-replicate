@@ -416,4 +416,19 @@ CREATE INDEX IF NOT EXISTS sessions_sandbox_reap_ix
   ON sessions (sandbox_state, sandbox_paused_at) WHERE sandbox_id IS NOT NULL;
 `,
   },
+  {
+    name: "0015_session_lanes",
+    sql: `
+-- multiagent lanes（spec §5.6 二期：lane_id=thread_id，同 lane 严格 FIFO、跨 lane 并发）。
+-- 每个 lane 一个 codex thread：thread id 落这里，worker 重启后按 lane 原生 resume。
+CREATE TABLE IF NOT EXISTS session_lanes (
+  session_id text NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  lane_id text NOT NULL,
+  codex_thread_id text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_id, lane_id)
+);
+`,
+  },
 ];

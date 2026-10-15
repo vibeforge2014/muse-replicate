@@ -38,22 +38,42 @@ let awaitingInterrupt = null;
 let hasBash = true;
 const emitter = new EventEmitter();
 
-let history = [];
+// 每线程独立 rollout（multiagent lanes，spec §5.6 二期）：thread/start 生成 threadId，
+// 历史与持久化按 threadId 分桶；未带 threadId 的调用退回 legacy rollout.json（单线程形态兼容）
+const legacyHistory = [];
 if (existsSync(rolloutPath)) {
   try {
-    history = JSON.parse(readFileSync(rolloutPath, "utf8"));
+    legacyHistory.push(...JSON.parse(readFileSync(rolloutPath, "utf8")));
   } catch {
-    history = [];
+    /* 损坏文件当作空历史 */
   }
 }
-function persist() {
-  writeFileSync(rolloutPath, JSON.stringify(history));
+const histories = new Map(); // threadId -> items[]
+function historyOf(threadId) {
+  if (!threadId) return legacyHistory;
+  if (!histories.has(threadId)) {
+    const p = join(home, `rollout-${threadId}.json`);
+    let items = [];
+    if (existsSync(p)) {
+      try {
+        items = JSON.parse(readFileSync(p, "utf8"));
+      } catch {
+        items = [];
+      }
+    }
+    histories.set(threadId, items);
+  }
+  return histories.get(threadId);
+}
+function persist(threadId) {
+  if (!threadId) return writeFileSync(rolloutPath, JSON.stringify(legacyHistory));
+  writeFileSync(join(home, `rollout-${threadId}.json`), JSON.stringify(historyOf(threadId)));
 }
 
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");
 }
-function notify(method, params) {
+function notify0(method, params) {
   send({ jsonrpc: "2.0", method, params });
 }
 function reply(id, result) {
@@ -92,18 +112,18 @@ async function handle(msg) {
       reply(id, { threadId: params.threadId ?? "thrx_resumed" });
       return;
     case "thread/inject_items":
-      // Level 0 语义恢复：注入的历史成为 fake 的持久化 rollout（下一轮可被 checkpoint 捕获）
+      // Level 0 语义恢复：注入的历史成为该 thread 的持久化 rollout（下一轮可被 checkpoint 捕获）
       for (const item of params.items ?? []) {
         if (item.type === "message") {
-          history.push({ role: item.role, text: item.text });
+          historyOf(params.threadId ?? "").push({ role: item.role, text: item.text });
         }
       }
-      persist();
+      persist(params.threadId ?? "");
       reply(id, { ok: true });
       return;
     case "turn/start":
       reply(id, { ok: true });
-      runTurn(params).catch(() => {});
+      runTurn(params, params.threadId ?? "").catch(() => {});
       return;
     case "turn/interrupt":
       reply(id, { ok: true });
@@ -155,10 +175,13 @@ function userText(params) {
     .trim();
 }
 
-async function runTurn(params) {
+async function runTurn(params, threadId) {
   const text = userText(params);
   const approval = params.approvalPolicy === "untrusted";
-  notify("turn/started", {});
+  // 所有通知带 threadId：driver 按 thread 分流到对应 lane 的事件队列（同进程多 lane 并发）
+  const notify = (method, p = {}) => notify0(method, { threadId, ...p });
+  const history = historyOf(threadId);
+  notify("turn/started");
   if (text === "crash") {
     process.exit(70);
   }
@@ -198,7 +221,7 @@ async function runTurn(params) {
       notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: "tool was denied" });
       history.push({ role: "agent", text: "tool was denied" });
     }
-    persist();
+    persist(threadId);
     notify("turn/completed", { reason: "completed" });
     return;
   }
@@ -228,7 +251,7 @@ async function runTurn(params) {
     notify("item/completed", { itemId, itemType: "customToolCall", toolName });
     notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: outcome });
     history.push({ role: "agent", text: outcome });
-    persist();
+    persist(threadId);
     notify("turn/completed", { reason: response.interrupted ? "interrupted" : "completed" });
     return;
   }
@@ -250,7 +273,7 @@ async function runTurn(params) {
     }
     notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: outcome });
     history.push({ role: "user", text }, { role: "agent", text: outcome });
-    persist();
+    persist(threadId);
     notify("turn/completed", { reason: "completed" });
     return;
   }
@@ -261,7 +284,7 @@ async function runTurn(params) {
     writeFileSync(join(home, "outputs", "note.txt"), payload);
     notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: `wrote note.txt (${payload.length} bytes)` });
     history.push({ role: "user", text }, { role: "agent", text: `wrote note.txt (${payload.length} bytes)` });
-    persist();
+    persist(threadId);
     notify("turn/completed", { reason: "completed" });
     return;
   }
@@ -280,7 +303,7 @@ async function runTurn(params) {
     notify("item/completed", { itemId, itemType: "commandExecution", exitCode: 0, output });
     notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: `ran ${cmd}` });
     history.push({ role: "user", text }, { role: "agent", text: `ran ${cmd}` });
-    persist();
+    persist(threadId);
     notify("turn/completed", { reason: "completed" });
     return;
   }
@@ -288,7 +311,7 @@ async function runTurn(params) {
   notify("item/started", { itemId: `itm_rsn_${tag}_${nextId++}`, itemType: "reasoning", summary: "thinking about it" });
   notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: response });
   history.push({ role: "user", text }, { role: "agent", text: response });
-  persist();
+  persist(threadId);
   notify("turn/completed", { reason: "completed" });
 }
 

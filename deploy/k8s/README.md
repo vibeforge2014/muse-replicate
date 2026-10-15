@@ -105,3 +105,30 @@ worker `MAS_SANDBOX_PROVIDER=k8s` 时沙箱 = 集群内 Pod（`packages/sandbox/
 - **pause/resume**：K8s 无容器冻结原语 = 删/建 Pod（目录在 PVC 保留）；销毁失败抛错由 worker 记 sandbox_orphans。
 - **egress**：provider 下发 `mas-sandbox-egress-deny` NetworkPolicy（默认拒绝带 `mas-sandbox=true` 标签的 Pod），
   上报 `advisory`（是否强制取决于 CNI，k3s 自带 policy 控制器时生效）——不虚报 enforced（§9.0）。
+
+## 沙箱 CRD 模式（K8sCrdSandboxProvider，`MAS_SANDBOX_PROVIDER=k8s-crd`）
+
+沙箱 = `Sandbox` CR（`agents.x-k8s.io/v1beta1`），由 [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
+控制器调和（v1.0.6 实测）。Pod 模板/工作区/runsc/egress 与 k8s 模式完全一致（provider 继承复用），差异：
+
+- **pause/resume = PATCH `spec.operatingMode: Suspended|Running`**（控制器终止/重建同名 backing Pod，
+  状态保留在 CR——优于 k8s 模式的显式删建）；resume 遇 CR 已删（如误清理）用 `sessions.sandbox_spec` 重建；
+- **destroy = DELETE CR + backing Pod 双确认**（Pod 残留即报错交 sandbox_orphans 反复重试）；
+- RBAC：`56-sandbox-rbac.yaml` 已含 `agents.x-k8s.io/sandboxes` 的 create/get/list/delete/patch。
+
+控制器安装（一次性）：
+
+```bash
+# 官方 manifest（agent-sandbox-system namespace + controller Deployment + CRD）
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.6/agent-sandbox.yaml
+# registry.k8s.io 被墙的节点：在可达外网的机器上经 mirror 拉取再导入（arm64 示例）——
+#   docker pull m.daocloud.io/registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.6
+#   docker save ... | gzip | scp <node>:... && gunzip -c - | k3s ctr images import -
+#   k3s ctr images tag m.daocloud.io/... registry.k8s.io/agent-sandbox/agent-sandbox-controller:v1.0.6
+# 镜像只在某节点时，把控制器钉过去：
+kubectl -n agent-sandbox-system patch deploy agent-sandbox-controller \
+  -p '{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":"<node>"}}}}}'
+kubectl -n agent-sandbox-system rollout status deploy/agent-sandbox-controller
+```
+
+卸载：`kubectl delete -f <manifest>`（CRD 一并删除；已有 Sandbox CR 会被级联清理）。

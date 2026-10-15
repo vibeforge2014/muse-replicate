@@ -20,11 +20,15 @@ import { localStdioSpawn } from "./local-spawn.js";
  *  - thread/resume{threadId,...} 恢复 rollout；thread/inject_items 注入 Responses API 原生 item；
  *  - turn/start{threadId,input:[{type:"text",text}],effort?}；turn/interrupt 需 {threadId,turnId}；
  *  - 通知：turn/started、item/started|completed{item:{type,id,...}}、item/agentMessage/delta、
- *    turn/completed{turn:{status,error}}、error{error,willRetry}；
+ *    turn/completed{turn:{status,error}}、error{error,willRetry}（均带 threadId）；
  *  - server→client 请求：item/commandExecution/requestApproval{itemId} 与
  *    item/fileChange/requestApproval{itemId}（回 {decision}），item/tool/call{callId,tool,arguments}
  *    （回 {contentItems:[{type:"inputText",text}],success}）。
  * CODEX_HOME 放在会话 home 的 .codex/ 下，rollout 随 checkpoint 一起持久化（Level 1 恢复）。
+ *
+ * multiagent lanes（spec §5.6 二期）：每会话一个 app-server 进程（CODEX_HOME 共享），
+ * 每个 lane 一个 thread/句柄；入站通知按 params.threadId 分流到所属 lane 的队列
+ * （审批/动态工具请求同样按 thread 归属；无 threadId 的旧版通知退回单 lane 路由）。
  */
 
 /** 与 @mas/db 的 fakeCodexHome 保持一致：checkpoint sourceDir / 资源挂载 / outputs 都指向这里。 */
@@ -46,7 +50,7 @@ export interface CodexDriverOptions {
 }
 
 interface CodexHandle extends RuntimeHandle {
-  proc: StdioProcess;
+  session: CodexSessionProc;
   events: NormalizedRuntimeEvent[];
   waiters: ((e: NormalizedRuntimeEvent | null) => void)[];
   /** 审批 itemId → server 请求 id（approval_response 按 itemId 回复）。 */
@@ -58,6 +62,16 @@ interface CodexHandle extends RuntimeHandle {
   effort?: string;
   request(method: string, params: Record<string, unknown>): Promise<unknown>;
   reply(id: number | string, result: unknown): void;
+}
+
+/** 同会话共享的 app-server 进程：一个 CODEX_HOME、一套 client→server 请求登记、按 thread 分流。 */
+interface CodexSessionProc {
+  proc: StdioProcess;
+  pending: Map<number | string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>;
+  /** laneId → handle（同 lane 复用 thread；同 lane FIFO 保证不会并发复用）。 */
+  lanes: Map<string, CodexHandle>;
+  /** threadId → handle（入站分流；size>1 时 threadId 缺失的消息无法唯一归属）。 */
+  byThread: Map<string, CodexHandle>;
 }
 
 function itemText(item: Record<string, unknown>, key: string): string {
@@ -78,11 +92,7 @@ function itemText(item: Record<string, unknown>, key: string): string {
 }
 
 /** 把 codex 原生通知/请求映射为 NormalizedRuntimeEvent（返回多个：动态工具一次产生 started + output_request）。 */
-function normalize(
-  method: string,
-  p: Record<string, unknown>,
-  ctx: { pendingApprovals: Map<string, number | string>; pendingToolCalls: Map<string, number | string> },
-): NormalizedRuntimeEvent[] {
+function normalize(method: string, p: Record<string, unknown>): NormalizedRuntimeEvent[] {
   switch (method) {
     case "turn/started":
       return [{ kind: "turn_started", sourceId: String((p.turn as { id?: string })?.id ?? "") }];
@@ -218,6 +228,8 @@ export class CodexDriver implements AgentRuntimeDriver {
   private readonly requestTimeoutMs: number;
   /** 供 worker 写 codex_version_digest（升级后触发 Level 0 语义恢复，spec §8.7）。 */
   readonly versionDigest: string;
+  /** sessionId → 共享 app-server 进程与 lane 表（进程死即清）。 */
+  private sessions = new Map<string, CodexSessionProc>();
 
   constructor(opts: CodexDriverOptions = {}) {
     this.bin = opts.bin ?? process.env.MAS_CODEX_BIN ?? "codex";
@@ -236,132 +248,74 @@ export class CodexDriver implements AgentRuntimeDriver {
   }
 
   async start(input: RuntimeStartInput): Promise<RuntimeHandle> {
-    const home = sessionRuntimeHome(input.sessionId);
-    mkdirSync(home, { recursive: true });
-    // 每会话独立 CODEX_HOME：rollout 落在 home/.codex 下，随 checkpoint 持久化；
-    // 只复制 auth.json（不继承用户的 config.toml/MCP server，保证会话间隔离）
-    const codexHome = join(home, ".codex");
-    mkdirSync(codexHome, { recursive: true });
-    const authSrc = this.authFile;
-    if (authSrc && existsSync(authSrc)) {
-      try {
-        copyFileSync(authSrc, join(codexHome, "auth.json"));
-      } catch {
-        /* 无 auth 时首个 turn 会报错并透出 */
-      }
+    const laneId = input.laneId ?? "main";
+    let entry = this.sessions.get(input.sessionId);
+    if (!entry || entry.proc.exited) {
+      entry = await this.spawnSession(input);
+      this.sessions.set(input.sessionId, entry);
     }
+    const existing = entry.lanes.get(laneId);
+    if (existing) return existing; // requires_action 挂起期间同 lane 再次 start → 复用同线程
 
-    // 沙箱内运行（spec §8.4）：codex app-server 经 exec 在沙箱容器里 spawn；
-    // CODEX_HOME/cwd 换算为容器路径（会话 home 经 PVC 双向可见）
-    const remote = input.remote;
-    const workdir = remote ? remote.toContainerPath(home) : home;
-    const codexHomeArg = remote ? remote.toContainerPath(codexHome) : codexHome;
-    const proc = await (remote
-      ? remote.spawn({
-          command: this.bin,
-          args: ["app-server"],
-          env: { CODEX_HOME: codexHomeArg },
-          cwd: workdir,
-        })
-      : localStdioSpawn({
-          command: this.bin,
-          args: ["app-server"],
-          env: { CODEX_HOME: codexHome },
-          cwd: home,
-        }));
+    const handle = this.makeHandle(entry, input);
+    entry.lanes.set(laneId, handle);
+    await this.openThread(entry, handle, input);
+    entry.byThread.set(handle.threadId, handle);
+    return handle;
+  }
 
-    const requestTimeoutMs = this.requestTimeoutMs;
-    const pending = new Map<number | string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
-
-    const handle = {
+  private makeHandle(entry: CodexSessionProc, input: RuntimeStartInput): CodexHandle {
+    const handle: CodexHandle = {
       sessionId: input.sessionId,
       threadId: "",
-      proc,
-      events: [] as NormalizedRuntimeEvent[],
-      waiters: [] as ((e: NormalizedRuntimeEvent | null) => void)[],
-      pendingApprovals: new Map<string, number | string>(),
-      pendingToolCalls: new Map<string, number | string>(),
+      session: entry,
+      events: [],
+      waiters: [],
+      procExited: () => entry.proc.exited,
+      pendingApprovals: new Map(),
+      pendingToolCalls: new Map(),
       currentTurnId: "",
       effort: /^[a-z]+$/.test(input.model?.effort ?? "") ? input.model?.effort : undefined,
-      reply(id: number | string, result: unknown) {
-        proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+      reply(id, result) {
+        entry.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
       },
-      request(method: string, params: Record<string, unknown>): Promise<unknown> {
+      request(method, params) {
         return new Promise((resolve, reject) => {
           const id = `mas_${randomId()}`;
           const timer = setTimeout(() => {
-            pending.delete(id);
+            entry.pending.delete(id);
             reject(new Error(`codex request timeout: ${method}`));
-          }, requestTimeoutMs);
-          pending.set(id, { resolve, reject, timer });
-          proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+          }, 30_000);
+          entry.pending.set(id, { resolve, reject, timer });
+          entry.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
         });
       },
-    } as CodexHandle;
-
-    const deliver = (events: NormalizedRuntimeEvent[]) => {
-      for (const ev of events) {
-        const waiter = handle.waiters.shift();
-        if (waiter) waiter(ev);
-        else handle.events.push(ev);
-      }
-    };
-
-    // readline：NDJSON 按行解析（避免 data 事件把一行 JSON 撕成两半）
-    const rl = readline.createInterface({ input: proc.stdout });
-    rl.on("line", (line: string) => {
-      if (!line.trim()) return;
-      let msg: {
-        id?: number | string; method?: string; params?: Record<string, unknown>;
-        result?: unknown; error?: { message?: string };
-      };
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        return;
-      }
-      // server→client 请求（审批/动态工具）：登记 id 供 send() 回复
-      if (msg.method !== undefined && msg.id !== undefined) {
-        if (msg.method === "item/commandExecution/requestApproval" || msg.method === "item/fileChange/requestApproval") {
-          handle.pendingApprovals.set(String(msg.params?.itemId ?? ""), msg.id);
-        } else if (msg.method === "item/tool/call") {
-          handle.pendingToolCalls.set(String(msg.params?.callId ?? ""), msg.id);
-        } else {
-          // 平台不支持的 server 请求：按 method-not-found 错误回复，避免 codex 挂起
-          proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `mas: unsupported server request ${msg.method}` } }) + "\n");
-          return;
+      async stop(reason) {
+        void reason;
+        try {
+          if (this.currentTurnId) {
+            await this.request("turn/interrupt", { threadId: this.threadId, turnId: this.currentTurnId });
+          }
+        } catch {
+          /* 尽力而为 */
         }
-        deliver(normalize(msg.method, msg.params ?? {}, handle));
-        return;
-      }
-      if (msg.method !== undefined) {
-        if (msg.method === "turn/started") handle.currentTurnId = String((msg.params?.turn as { id?: string })?.id ?? handle.currentTurnId);
-        deliver(normalize(msg.method, msg.params ?? {}, handle));
-        return;
-      }
-      if (msg.id !== undefined) {
-        const p = pending.get(msg.id);
-        if (p) {
-          pending.delete(msg.id);
-          clearTimeout(p.timer);
-          if (msg.error) p.reject(new Error(msg.error.message ?? "codex error"));
-          else p.resolve(msg.result);
+        // fence 语义保持进程级（spec §14.1：失去租约即视为污染，整进程终止；
+        // 其他 lane 的在途 turn 随租约过期被接管重试）
+        if (!entry.proc.exited) {
+          entry.proc.kill();
+          await new Promise((r) => setTimeout(r, 200));
+          if (!entry.proc.exited) entry.proc.kill();
         }
-      }
-    });
-
-    const failAll = (why: string) => {
-      for (const [, p] of pending) {
-        clearTimeout(p.timer);
-        p.reject(new Error(why));
-      }
-      pending.clear();
-      for (const w of handle.waiters.splice(0)) w(null);
+      },
     };
-    proc.onExit((code) => failAll(`codex app-server exited (code ${code})`));
+    return handle;
+  }
 
-    await handle.request("initialize", { clientInfo: { name: "mas-codex-driver", version: "0.1.0" } });
-
+  /** 每 lane 一个 thread：resume（DB 持久化的 lane thread id）或新建（可注入语义恢复历史）。 */
+  private async openThread(entry: CodexSessionProc, handle: CodexHandle, input: RuntimeStartInput): Promise<void> {
+    const remote = input.remote;
+    const home = sessionRuntimeHome(input.sessionId);
+    const workdir = remote ? remote.toContainerPath(home) : home;
     const threadParams: Record<string, unknown> = {
       cwd: workdir,
       approvalPolicy: input.approvalPolicy === "never" ? "never" : "untrusted",
@@ -388,23 +342,132 @@ export class CodexDriver implements AgentRuntimeDriver {
         });
       }
     }
+  }
 
-    handle.stop = async (reason: string) => {
-      void reason;
+  /** 同会话首 lane：建 CODEX_HOME、spawn 共享 app-server、initialize、按 threadId 分流入站消息。 */
+  private async spawnSession(input: RuntimeStartInput): Promise<CodexSessionProc> {
+    const home = sessionRuntimeHome(input.sessionId);
+    mkdirSync(home, { recursive: true });
+    // 每会话独立 CODEX_HOME：rollout 落在 home/.codex 下，随 checkpoint 持久化；
+    // 只复制 auth.json（不继承用户的 config.toml/MCP server，保证会话间隔离）
+    const codexHome = join(home, ".codex");
+    mkdirSync(codexHome, { recursive: true });
+    const authSrc = this.authFile;
+    if (authSrc && existsSync(authSrc)) {
       try {
-        if (handle.currentTurnId) {
-          await handle.request("turn/interrupt", { threadId: handle.threadId, turnId: handle.currentTurnId });
-        }
+        copyFileSync(authSrc, join(codexHome, "auth.json"));
       } catch {
-        /* 尽力而为 */
+        /* 无 auth 时首个 turn 会报错并透出 */
       }
-      if (!proc.exited) {
-        proc.kill();
-        await new Promise((r) => setTimeout(r, 200));
-        if (!proc.exited) proc.kill();
+    }
+    // 沙箱内运行（spec §8.4）：codex app-server 经 exec 在沙箱容器里 spawn；
+    // CODEX_HOME/cwd 换算为容器路径（会话 home 经 PVC 双向可见）
+    const remote = input.remote;
+    const workdir = remote ? remote.toContainerPath(home) : home;
+    const codexHomeArg = remote ? remote.toContainerPath(codexHome) : codexHome;
+    const proc = await (remote
+      ? remote.spawn({
+          command: this.bin,
+          args: ["app-server"],
+          env: { CODEX_HOME: codexHomeArg },
+          cwd: workdir,
+        })
+      : localStdioSpawn({
+          command: this.bin,
+          args: ["app-server"],
+          env: { CODEX_HOME: codexHome },
+          cwd: home,
+        }));
+
+    const entry: CodexSessionProc = {
+      proc,
+      pending: new Map(),
+      lanes: new Map(),
+      byThread: new Map(),
+    };
+
+    const deliver = (target: CodexHandle, events: NormalizedRuntimeEvent[]) => {
+      for (const ev of events) {
+        const waiter = target.waiters.shift();
+        if (waiter) waiter(ev);
+        else target.events.push(ev);
       }
     };
-    return handle;
+    /** 无 threadId 的旧版通知：仅一个 lane 时可唯一归属，否则投给 main（best effort）。 */
+    const route = (threadId: string): CodexHandle | undefined => {
+      if (threadId) return entry.byThread.get(threadId);
+      if (entry.byThread.size === 1) return entry.byThread.values().next().value;
+      return entry.byThread.get(entry.lanes.get("main")?.threadId ?? "");
+    };
+
+    const rl = readline.createInterface({ input: proc.stdout });
+    rl.on("line", (line: string) => {
+      if (!line.trim()) return;
+      let msg: {
+        id?: number | string; method?: string; params?: Record<string, unknown>;
+        result?: unknown; error?: { message?: string };
+      };
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        return;
+      }
+      // server→client 请求（审批/动态工具）：登记到所属 lane 供 send() 回复
+      if (msg.method !== undefined && msg.id !== undefined) {
+        const target = route(String(msg.params?.threadId ?? ""));
+        if (msg.method === "item/commandExecution/requestApproval" || msg.method === "item/fileChange/requestApproval") {
+          target?.pendingApprovals.set(String(msg.params?.itemId ?? ""), msg.id);
+        } else if (msg.method === "item/tool/call") {
+          target?.pendingToolCalls.set(String(msg.params?.callId ?? ""), msg.id);
+        } else {
+          // 平台不支持的 server 请求：按 method-not-found 错误回复，避免 codex 挂起
+          proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `mas: unsupported server request ${msg.method}` } }) + "\n");
+          return;
+        }
+        if (target) deliver(target, normalize(msg.method, msg.params ?? {}));
+        return;
+      }
+      if (msg.method !== undefined) {
+        const threadId = String(msg.params?.threadId ?? "");
+        const target = route(threadId);
+        if (msg.method === "turn/started" && target) {
+          target.currentTurnId = String((msg.params?.turn as { id?: string })?.id ?? target.currentTurnId);
+        }
+        if (target) deliver(target, normalize(msg.method, msg.params ?? {}));
+        return;
+      }
+      if (msg.id !== undefined) {
+        const p = entry.pending.get(msg.id);
+        if (p) {
+          entry.pending.delete(msg.id);
+          clearTimeout(p.timer);
+          if (msg.error) p.reject(new Error(msg.error.message ?? "codex error"));
+          else p.resolve(msg.result);
+        }
+      }
+    });
+
+    const failAll = (why: string) => {
+      for (const [, p] of entry.pending) {
+        clearTimeout(p.timer);
+        p.reject(new Error(why));
+      }
+      entry.pending.clear();
+      for (const [, h] of entry.lanes) for (const w of h.waiters.splice(0)) w(null);
+      if (this.sessions.get(input.sessionId) === entry) this.sessions.delete(input.sessionId);
+    };
+    proc.onExit((code) => failAll(`codex app-server exited (code ${code})`));
+
+    await new Promise<void>((resolve, reject) => {
+      const id = `mas_${randomId()}`;
+      const timer = setTimeout(() => {
+        entry.pending.delete(id);
+        reject(new Error("codex request timeout: initialize"));
+      }, this.requestTimeoutMs);
+      entry.pending.set(id, { resolve: () => resolve(), reject, timer });
+      proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "initialize", params: { clientInfo: { name: "mas-codex-driver", version: "0.1.0" } } }) + "\n");
+    });
+    return entry;
   }
 
   async send(handle: RuntimeHandle, command: RuntimeCommand): Promise<void> {
@@ -449,7 +512,7 @@ export class CodexDriver implements AgentRuntimeDriver {
     const h = handle as CodexHandle;
     const buffered = h.events.shift();
     if (buffered) return buffered;
-    if (h.proc.exited) return null;
+    if (h.session.proc.exited) return null;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         const i = h.waiters.indexOf(waiter);

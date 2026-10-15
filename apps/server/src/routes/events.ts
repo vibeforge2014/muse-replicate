@@ -67,10 +67,19 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       reply.code(idem.response.status);
       return idem.response.body as Record<string, unknown>;
     }
-    const body = req.body as { events?: unknown[] };
-    if (!Array.isArray(body?.events)) throw errInvalid("body must be {events: [...]}");
+    const body = req.body as { events?: unknown[]; lane_id?: unknown };
+    if (!Array.isArray(body?.events)) throw errInvalid("body must be {events: [...], lane_id?}");
     if (body.events.length < 1 || body.events.length > 10) {
       throw errInvalid("events must contain 1 to 10 events");
+    }
+    // multiagent lanes（spec §5.6 二期）：lane_id=thread_id；缺省 "main"。
+    // 同 lane 严格 FIFO，跨 lane 并发；lane 只影响排队/调度与 thread 归属。
+    let laneId = "main";
+    if (body.lane_id !== undefined) {
+      if (typeof body.lane_id !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(body.lane_id)) {
+        throw errInvalid("lane_id must match ^[a-z0-9][a-z0-9_-]{0,63}$");
+      }
+      laneId = body.lane_id;
     }
     const events = body.events.map((e) => {
       const r = userInputEventSchema.safeParse(e);
@@ -118,6 +127,7 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       workspaceId: ws,
       events: rows,
       traceparent: requestTraceparent(req),
+      laneId,
       executionKind: interruptExecution
         ? "interrupt"
         : kind === "tool_confirmation"

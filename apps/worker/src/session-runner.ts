@@ -12,6 +12,7 @@ import {
   collectOutputs,
   commitCheckpoint,
   FAKE_CODEX_DIGEST,
+  getLaneThreadId,
   reapExhaustedExecutions,
   fakeCodexHome,
   objectStoreFromEnv,
@@ -19,9 +20,11 @@ import {
   listFallbackCheckpoints,
   markCheckpointCorrupt,
   markDelivered,
+  pendingLanes,
   readSkillZip,
   restoreCheckpoint,
   renewExecution,
+  setLaneThreadId,
   settleExecution,
   claimNextExecution,
   upsertMemory,
@@ -55,10 +58,16 @@ const excludeFromCheckpoint = (rel: string): boolean =>
   rel === ".DS_Store" ||
   CODEX_JUNK.some((p) => rel.startsWith(p));
 
-interface HeldRuntime {
+/** 单 lane 持有的 runtime 句柄（multiagent lanes，spec §5.6 二期：lane_id=thread_id）。 */
+interface HeldLane {
   handle: RuntimeHandle;
   /** fake itemId → sevt id（审批与 tool_result 关联）。 */
   toolUseIds: Map<string, string>;
+}
+
+/** 会话级运行时壳：一个沙箱/一套 egress，每 lane 一个 thread 句柄。 */
+interface HeldRuntime {
+  lanes: Map<string, HeldLane>;
   /** egress binding（§10.4 attach 时签发；dispose/失栅时 revoke）。 */
   egress?: { bindingId: string; token: string; expiresAt: string };
 }
@@ -109,21 +118,42 @@ export class SessionRunner {
   /** 模拟 kill -9：中止在途工作并停掉全部 runtime（测试用）。 */
   async dispose(): Promise<void> {
     this.disposed = true;
-    for (const [, held] of this.runtimes) {
-      if (held.egress && this.egress) await revokeEgressBinding(this.egress, held.egress.bindingId);
-      await held.handle.stop("disposed").catch(() => undefined);
+    for (const [, shell] of this.runtimes) {
+      if (shell.egress && this.egress) await revokeEgressBinding(this.egress, shell.egress.bindingId);
+      for (const [, lane] of shell.lanes) {
+        await lane.handle.stop("disposed").catch(() => undefined);
+      }
     }
     this.runtimes.clear();
   }
 
+  /**
+   * 消费一个会话的全部待办（multiagent lanes，spec §5.6 二期）：
+   * 同 lane 严格 FIFO（一个 lane 同时最多一个在途执行），跨 lane 并发推进。
+   * 外层循环直到无待办：处理期间新 admitted 的 lane 也会被同一调用接走
+   * （调用方的 in-flight 去重以会话为粒度，并发性由本次调用内部的 Promise.all 保证）。
+   */
   async processSession(sessionId: string): Promise<void> {
     // 毒任务回收（REC-06）：耗尽且租约过期的执行置 failed 并写 exhausted 事件
     await reapExhaustedExecutions(this.db);
+    for (;;) {
+      const lanes = await pendingLanes(this.db, sessionId);
+      if (lanes.length === 0) return;
+      if (lanes.length === 1) {
+        await this.drainLane(sessionId, lanes[0]!);
+        continue;
+      }
+      await Promise.all(lanes.map((lane) => this.drainLane(sessionId, lane)));
+    }
+  }
+
+  /** 单 lane 的 claim 循环：返回表示租约窗口内可能还有后续工作（lane 内 FIFO）。 */
+  private async drainLane(sessionId: string, laneId: string): Promise<void> {
     for (let i = 0; i < 20 && !this.disposed; i++) {
       const attemptId = `att_${randomUUID().slice(0, 12)}`;
-      const exec = await claimNextExecution(this.db, sessionId, this.workerId, attemptId, LEASE_SECONDS);
+      const exec = await claimNextExecution(this.db, sessionId, this.workerId, attemptId, LEASE_SECONDS, laneId);
       if (!exec) return;
-      const more = await this.runExecution(sessionId, exec, attemptId);
+      const more = await this.runExecution(sessionId, exec, attemptId, laneId);
       if (!more) return;
     }
   }
@@ -136,14 +166,15 @@ export class SessionRunner {
     sessionId: string,
     exec: { id: string; generation: number; kind: string; input_event_ids: string[]; interrupt_requested_at: Date | null; delivered_at: Date | null; traceparent: string | null },
     attemptId: string,
+    laneId: string,
   ): Promise<boolean> {
     const span: Span = startSpan(
       "mas.worker.execution",
-      { worker_id: this.workerId, session_id: sessionId, execution_id: exec.id, kind: exec.kind, attempt: attemptId },
+      { worker_id: this.workerId, session_id: sessionId, execution_id: exec.id, kind: exec.kind, lane: laneId, attempt: attemptId },
       exec.traceparent,
     );
     try {
-      const more = await this.runExecutionInner(sessionId, exec, attemptId, span);
+      const more = await this.runExecutionInner(sessionId, exec, attemptId, span, laneId);
       const row = await this.db
         .selectFrom("session_executions")
         .select("state")
@@ -163,6 +194,7 @@ export class SessionRunner {
     exec: { id: string; generation: number; kind: string; input_event_ids: string[]; interrupt_requested_at: Date | null; delivered_at: Date | null },
     attemptId: string,
     parentSpan: Span,
+    laneId: string,
   ): Promise<boolean> {
     const executionId = exec.id;
     const generation = exec.generation;
@@ -264,8 +296,8 @@ export class SessionRunner {
       return false;
     }
 
-    // 2) runtime（内存缓存；requires_action 期间保留）——按水位线决定 Level 0/1 恢复
-    let held = await this.acquireRuntime(sessionId, session, agent, hasAsk, hasToolset, { executionId, generation, attemptId, append });
+    // 2) runtime（内存缓存；requires_action 期间保留）——按水位线决定 Level 0/1 恢复（lane 维度）
+    const laneHeld = await this.acquireRuntime(sessionId, session, agent, hasAsk, hasToolset, { executionId, generation, attemptId, append }, laneId);
     // 2.1) 挂载 Session File Resource 到沙箱 uploads（只读；每轮重建，卸载即消失）
     await this.materializeResources(sessionId);
     // 3) 按执行类型推进（spec §5.6 kind）
@@ -275,17 +307,17 @@ export class SessionRunner {
       const pendingIds = ((session.stop_reason as { event_ids?: string[] } | null)?.event_ids ?? []).map(String);
       await append("session.status_running", {});
       for (const pendingId of pendingIds) {
-        const fakeItemId = held.toolUseIds.get(pendingId) ?? (await this.lookupSourceEventId(sessionId, pendingId));
+        const fakeItemId = laneHeld.toolUseIds.get(pendingId) ?? (await this.lookupSourceEventId(sessionId, pendingId));
         const target = await this.loadEvent(sessionId, pendingId);
         if (target?.type === "agent.custom_tool_use") {
-          await this.driver.send(held.handle, {
+          await this.driver.send(laneHeld.handle, {
             type: "custom_tool_output",
             sourceEventId: fakeItemId,
             output: "",
             interrupted: true,
           });
         } else {
-          await this.driver.send(held.handle, {
+          await this.driver.send(laneHeld.handle, {
             type: "approval_response",
             sourceEventId: fakeItemId,
             approved: false,
@@ -308,15 +340,15 @@ export class SessionRunner {
       }
       await append("session.status_running", {});
       const text = await this.textOfInput(sessionId, inputEventIds);
-      await this.driver.send(held.handle, { type: "user_message", text });
+      await this.driver.send(laneHeld.handle, { type: "user_message", text });
       await markDelivered(this.db, executionId, generation, attemptId);
     } else if (kind === "tool_confirmation") {
       const conf = await this.loadEvent(sessionId, inputEventIds[0]!);
       const toolUseId = String(conf?.tool_use_id ?? "");
       const approved = conf?.result === "allow";
-      const fakeItemId = held.toolUseIds.get(toolUseId) ?? (await this.lookupSourceEventId(sessionId, toolUseId));
+      const fakeItemId = laneHeld.toolUseIds.get(toolUseId) ?? (await this.lookupSourceEventId(sessionId, toolUseId));
       await append("session.status_running", {});
-      await this.driver.send(held.handle, {
+      await this.driver.send(laneHeld.handle, {
         type: "approval_response",
         sourceEventId: fakeItemId,
         approved,
@@ -328,9 +360,9 @@ export class SessionRunner {
       const res = await this.loadEvent(sessionId, inputEventIds[0]!);
       const toolUseId = String(res?.tool_use_id ?? "");
       const output = String(res?.output ?? "");
-      const fakeItemId = held.toolUseIds.get(toolUseId) ?? (await this.lookupSourceEventId(sessionId, toolUseId));
+      const fakeItemId = laneHeld.toolUseIds.get(toolUseId) ?? (await this.lookupSourceEventId(sessionId, toolUseId));
       await append("session.status_running", {});
-      await this.driver.send(held.handle, { type: "custom_tool_output", sourceEventId: fakeItemId, output });
+      await this.driver.send(laneHeld.handle, { type: "custom_tool_output", sourceEventId: fakeItemId, output });
       await markDelivered(this.db, executionId, generation, attemptId);
     }
 
@@ -343,16 +375,17 @@ export class SessionRunner {
     );
     try {
     for (;;) {
+      const shell = this.runtimes.get(sessionId);
       if (fenceLost) {
-        if (held.egress && this.egress) await revokeEgressBinding(this.egress, held.egress.bindingId);
-        await held.handle.stop("fence lost");
+        if (shell?.egress && this.egress) await revokeEgressBinding(this.egress, shell.egress.bindingId);
+        await laneHeld.handle.stop("fence lost");
         this.runtimes.delete(sessionId);
         loopSpan.end(false, { outcome: "fence_lost" });
         return false;
       }
-      const ev = await this.driver.nextEvent(held.handle, TICK_MS);
+      const ev = await this.driver.nextEvent(laneHeld.handle, TICK_MS);
       if (ev) {
-        const done = await this.onRuntimeEvent(sessionId, executionId, generation, attemptId, held, ev, append);
+        const done = await this.onRuntimeEvent(sessionId, executionId, generation, attemptId, laneHeld, ev, append);
         if (done !== null) {
           await settleExecution(this.db, executionId, generation, attemptId, { state: "completed" });
           loopSpan.end(true, { outcome: done });
@@ -368,7 +401,13 @@ export class SessionRunner {
         }
         continue;
       }
-      // tick：续约 + 中断检查
+      // tick：共享进程退出 → 交还租约（同会话其他 lane 同样受影响，各自退出由接管重试）；
+      // 续约 + 中断检查
+      if (laneHeld.handle.procExited?.()) {
+        this.runtimes.delete(sessionId);
+        loopSpan.end(false, { outcome: "proc_exited" });
+        return false;
+      }
       if (!(await renew())) continue;
       if (!interruptSent) {
         const row = await this.db
@@ -378,7 +417,7 @@ export class SessionRunner {
           .executeTakeFirst();
         if (row?.interrupt_requested_at) {
           interruptSent = true;
-          await this.driver.send(held.handle, { type: "interrupt" });
+          await this.driver.send(laneHeld.handle, { type: "interrupt" });
         }
       }
     }
@@ -397,7 +436,7 @@ export class SessionRunner {
     executionId: string,
     generation: number,
     attemptId: string,
-    held: HeldRuntime,
+    lane: HeldLane,
     ev: NormalizedRuntimeEvent,
     append: (type: string, payload: Record<string, unknown>, opts?: { eventId?: string; sourceEventId?: string | null }) => Promise<SessionEventJson | null>,
   ): Promise<null | "turn_done" | "awaiting_approval"> {
@@ -420,7 +459,7 @@ export class SessionRunner {
         return null;
       case "tool_use_started": {
         const eventId = newId("sevt");
-        held.toolUseIds.set(ev.sourceId, eventId);
+        lane.toolUseIds.set(ev.sourceId, eventId);
         await append(
           "agent.tool_use",
           { name: ev.toolName, input: ev.input, evaluated_permission: ev.evaluatedPermission },
@@ -431,7 +470,7 @@ export class SessionRunner {
       case "custom_tool_use_started": {
         // 自定义工具调用（CT）：业务方声明、平台外执行的工具
         const eventId = newId("sevt");
-        held.toolUseIds.set(ev.sourceId, eventId);
+        lane.toolUseIds.set(ev.sourceId, eventId);
         await append(
           "agent.custom_tool_use",
           { name: ev.toolName, input: ev.input },
@@ -441,14 +480,14 @@ export class SessionRunner {
       }
       case "custom_tool_output_request": {
         // turn 挂起等待业务方输出 → idle(requires_action)，event_ids 指向 agent.custom_tool_use（spec §7.3 例外）
-        const toolUseId = held.toolUseIds.get(ev.toolUseSourceId);
+        const toolUseId = lane.toolUseIds.get(ev.toolUseSourceId);
         await append("session.status_idle", {
           stop_reason: { type: "requires_action", event_ids: toolUseId ? [toolUseId] : [] },
         });
         return "awaiting_approval";
       }
       case "tool_result": {
-        const toolUseId = held.toolUseIds.get(ev.toolUseSourceId) ?? ev.toolUseSourceId;
+        const toolUseId = lane.toolUseIds.get(ev.toolUseSourceId) ?? ev.toolUseSourceId;
         await append(
           "agent.tool_result",
           {
@@ -461,7 +500,7 @@ export class SessionRunner {
         return null;
       }
       case "approval_request": {
-        const toolUseId = held.toolUseIds.get(ev.toolUseSourceId);
+        const toolUseId = lane.toolUseIds.get(ev.toolUseSourceId);
         // 未决审批 → idle(requires_action)，event_ids 指向 agent.tool_use（spec §12.1）
         await append("session.status_idle", {
           stop_reason: { type: "requires_action", event_ids: toolUseId ? [toolUseId] : [] },
@@ -492,12 +531,16 @@ export class SessionRunner {
   }
 
   /**
-   * 获取/恢复 runtime（spec §14.2.1 恢复判定）：
+   * 获取/恢复 runtime（spec §14.2.1 恢复判定 + §5.6 二期 lane 语义）：
    *  - 无历史 → 全新 thread；
    *  - active checkpoint 水位线+digest 与 sessions 行匹配 → Level 1 原生恢复
    *    （restore 文件 + thread/resume）；
    *  - 否则 → Level 0 语义恢复：从事件日志重放 user/agent 消息（绝不重放工具输入），
    *    产出内部事件 runtime.recovered{mode:"semantic",reason}。
+   * lane 维度：main 沿用会话级 thread/checkpoint 判定；非 main lane 恢复自己的
+   * session_lanes.codex_thread_id（丢失或水位线不符 → 全新 thread + 会话级语义重放）。
+   * 热会话（本进程已持有沙箱/进程壳）加 lane：不 restore、不重放，直接 resume 持久化的
+   * lane thread（进程内 CODEX_HOME 是活的，覆盖式 restore 反而会污染运行态）。
    */
   private async acquireRuntime(
     sessionId: string,
@@ -511,9 +554,12 @@ export class SessionRunner {
       attemptId: string;
       append: (type: string, payload: Record<string, unknown>) => Promise<SessionEventJson | null>;
     },
-  ): Promise<HeldRuntime> {
-    const existing = this.runtimes.get(sessionId);
+    laneId: string,
+  ): Promise<HeldLane> {
+    const shell0 = this.runtimes.get(sessionId);
+    const existing = shell0?.lanes.get(laneId);
     if (existing) return existing;
+    const cold = !shell0;
 
     // 真实 driver 提供版本指纹（CLI 升级 → Level 0）；fake 沿用库内常量
     const digest = this.driver.versionDigest ?? session.codex_version_digest ?? FAKE_CODEX_DIGEST;
@@ -522,47 +568,92 @@ export class SessionRunner {
     let replayHistory: { role: "user" | "agent"; text: string }[] | undefined;
     let recovered: { mode: "native" } | { mode: "semantic"; reason: string } | null = null;
 
-    if (session.last_completed_execution_id || active) {
-      if (
-        active &&
-        active.completed_execution_watermark === session.last_completed_execution_id
-      ) {
-        if (active.codex_version_digest === digest) {
-          // Level 1：水位线一致 → 从 checkpoint 恢复文件并原生 resume
-          try {
-            await restoreCheckpoint(this.store, active, fakeCodexHome(sessionId));
-            resumeThreadId = active.thread_id || undefined;
-            recovered = { mode: "native" };
-          } catch {
-            // 校验失败：标记 corrupt、报 session.error，再降级语义恢复（REC-05）
-            await markCheckpointCorrupt(this.db, sessionId, active.checkpoint_id);
+    if (!cold) {
+      // 热 会话加 lane：resume 该 lane 持久化的 thread（没有就全新，首次使用的 lane 无历史可恢复）
+      resumeThreadId =
+        laneId === "main"
+          ? (session.codex_thread_id ?? undefined)
+          : ((await getLaneThreadId(this.db, sessionId, laneId)) ?? undefined);
+    } else if (laneId === "main") {
+      if (session.last_completed_execution_id || active) {
+        if (
+          active &&
+          active.completed_execution_watermark === session.last_completed_execution_id
+        ) {
+          if (active.codex_version_digest === digest) {
+            // Level 1：水位线一致 → 从 checkpoint 恢复文件并原生 resume
+            try {
+              await restoreCheckpoint(this.store, active, fakeCodexHome(sessionId));
+              resumeThreadId = active.thread_id || undefined;
+              recovered = { mode: "native" };
+            } catch {
+              // 校验失败：标记 corrupt、报 session.error，再降级语义恢复（REC-05）
+              await markCheckpointCorrupt(this.db, sessionId, active.checkpoint_id);
+              await fence.append("session.error", {
+                error: {
+                  type: "checkpoint_corrupt",
+                  message: `checkpoint ${active.checkpoint_id} failed integrity verification`,
+                  retry_status: "terminal",
+                },
+              });
+              recovered = { mode: "semantic", reason: "checkpoint_corrupt" };
+            }
+          } else {
+            // 原 digest 已下线（升级/召回）：强制 Level 0 并告知用户（spec §8.7 / REC-10）
             await fence.append("session.error", {
               error: {
-                type: "checkpoint_corrupt",
-                message: `checkpoint ${active.checkpoint_id} failed integrity verification`,
-                retry_status: "terminal",
+                type: "runtime_upgraded",
+                message: "runtime digest changed; falling back to semantic recovery",
+                retry_status: "retrying",
+                details: { checkpoint_digest: active.codex_version_digest, current_digest: digest },
               },
             });
-            recovered = { mode: "semantic", reason: "checkpoint_corrupt" };
+            recovered = { mode: "semantic", reason: "runtime_upgraded" };
           }
         } else {
-          // 原 digest 已下线（升级/召回）：强制 Level 0 并告知用户（spec §8.7 / REC-10）
+          // 水位线不一致（checkpoint 落后/超前或缺失）→ Level 0（REC-03）
+          recovered = { mode: "semantic", reason: "watermark_mismatch" };
+        }
+        if (recovered?.mode === "semantic") {
+          // 尽力恢复最近一个 superseded checkpoint 的文件（workspace 层面少丢一点）
+          for (const fb of await listFallbackCheckpoints(this.db, sessionId)) {
+            try {
+              await restoreCheckpoint(this.store, fb, fakeCodexHome(sessionId));
+              break;
+            } catch {
+              /* 尝试下一个回退候选 */
+            }
+          }
+          replayHistory = await this.buildReplayHistory(sessionId);
+        }
+      }
+    } else {
+      // 冷 非 main lane：先尽力恢复会话文件（与 main Level 1 同判），再 resume lane thread；
+      // 无法原生恢复 → 全新 thread + 会话级语义重放（lane 不丢上下文）
+      const laneThreadId = await getLaneThreadId(this.db, sessionId, laneId);
+      const watermarkOk = !!active && active.completed_execution_watermark === session.last_completed_execution_id;
+      if (laneThreadId && watermarkOk && active && active.codex_version_digest === digest) {
+        try {
+          await restoreCheckpoint(this.store, active, fakeCodexHome(sessionId));
+          resumeThreadId = laneThreadId;
+          recovered = { mode: "native" };
+        } catch {
+          await markCheckpointCorrupt(this.db, sessionId, active.checkpoint_id);
           await fence.append("session.error", {
             error: {
-              type: "runtime_upgraded",
-              message: "runtime digest changed; falling back to semantic recovery",
-              retry_status: "retrying",
-              details: { checkpoint_digest: active.codex_version_digest, current_digest: digest },
+              type: "checkpoint_corrupt",
+              message: `checkpoint ${active.checkpoint_id} failed integrity verification`,
+              retry_status: "terminal",
             },
           });
-          recovered = { mode: "semantic", reason: "runtime_upgraded" };
+          recovered = { mode: "semantic", reason: "checkpoint_corrupt" };
         }
-      } else {
-        // 水位线不一致（checkpoint 落后/超前或缺失）→ Level 0（REC-03）
+      } else if (active && !watermarkOk) {
         recovered = { mode: "semantic", reason: "watermark_mismatch" };
+      } else if (!laneThreadId) {
+        recovered = { mode: "semantic", reason: "lane_thread_missing" };
       }
-      if (recovered.mode === "semantic") {
-        // 尽力恢复最近一个 superseded checkpoint 的文件（workspace 层面少丢一点）
+      if (recovered?.mode === "semantic") {
         for (const fb of await listFallbackCheckpoints(this.db, sessionId)) {
           try {
             await restoreCheckpoint(this.store, fb, fakeCodexHome(sessionId));
@@ -616,6 +707,7 @@ export class SessionRunner {
 
     const handle = await this.driver.start({
       sessionId,
+      laneId,
       system: agent.system,
       model: agent.model,
       approvalPolicy: hasAsk ? "untrusted" : "never",
@@ -624,23 +716,29 @@ export class SessionRunner {
       ...(replayHistory?.length ? { replayHistory } : {}),
       ...(insideSandbox && sandboxId ? { remote: this.provider.exec!(sandboxId) } : {}),
     });
-    const held: HeldRuntime = {
-      handle,
-      toolUseIds: new Map(),
-      ...(sandboxEgress ? { egress: sandboxEgress } : {}),
-    };
-    this.runtimes.set(sessionId, held);
+    const laneHeld: HeldLane = { handle, toolUseIds: new Map() };
+    let shell = this.runtimes.get(sessionId);
+    if (!shell) {
+      shell = { lanes: new Map(), ...(sandboxEgress ? { egress: sandboxEgress } : {}) };
+      this.runtimes.set(sessionId, shell);
+    } else if (sandboxEgress) {
+      shell.egress = sandboxEgress;
+    }
+    shell.lanes.set(laneId, laneHeld);
     // 宿主 runtime 模式：沙箱在 driver 之后建（原顺序，spec §9.3）
     if (!sandboxId) {
       const r = await this.ensureSandbox(sessionId, fence);
       sandboxId = r.sandboxId;
       sandboxSpec = r.spec;
-      if (r.egress) held.egress = r.egress;
+      if (r.egress) shell.egress = r.egress;
     }
+    // lane thread 持久化（spec §5.6 二期）：main 同时维护 sessions.codex_thread_id
+    // （checkpoint watermark / reaper / 兼容旧查询仍以会话主 thread 为准）
+    await setLaneThreadId(this.db, sessionId, laneId, handle.threadId);
     await this.db
       .updateTable("sessions")
       .set({
-        codex_thread_id: handle.threadId,
+        ...(laneId === "main" ? { codex_thread_id: handle.threadId } : {}),
         codex_version_digest: digest,
         sandbox_id: sandboxId,
         // create 路径写入重建提示与状态（spec §9.3 reaper 状态机）
@@ -652,9 +750,10 @@ export class SessionRunner {
       await appendInternalEvent(this.db, sessionId, "runtime.recovered", {
         mode: recovered.mode,
         ...(recovered.mode === "semantic" ? { reason: recovered.reason } : {}),
+        lane: laneId,
       });
     }
-    return held;
+    return laneHeld;
   }
 
   /** 沙箱创建（spec §9.3）+ egress attach（§10.4）。 */
@@ -715,15 +814,17 @@ export class SessionRunner {
 
   /**
    * 释放本进程持有的 warm runtime（reaper 暂停/销毁沙箱前调用）：
-   * stop driver 进程 + 移出 map；下一条消息按 checkpoint 恢复路径重建。
+   * stop 全部 lane 的 driver 进程 + 移出 map；下一条消息按 checkpoint 恢复路径重建。
    * 不在此撤销 egress 绑定——绑定随沙箱生命周期（§10.4：resume 用同一 Pod env；
    * destroy 后由逐请求 fence 校验 + token exp 兜底）。
    */
   async dropRuntime(sessionId: string): Promise<void> {
-    const held = this.runtimes.get(sessionId);
-    if (!held) return;
+    const shell = this.runtimes.get(sessionId);
+    if (!shell) return;
     this.runtimes.delete(sessionId);
-    await held.handle.stop("sandbox pause").catch(() => undefined);
+    for (const [, lane] of shell.lanes) {
+      await lane.handle.stop("sandbox pause").catch(() => undefined);
+    }
   }
 
   /**

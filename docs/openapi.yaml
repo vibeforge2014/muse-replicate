@@ -1537,6 +1537,11 @@ components:
       type: object
       required: [events]
       properties:
+        lane_id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9_-]{0,63}$"
+          default: main
+          description: multiagent lanes（spec §5.6 二期）：lane 即 thread；同 lane 严格 FIFO，跨 lane 并发
         events:
           type: array
           minItems: 1

@@ -88,6 +88,15 @@ export interface SessionEventRow {
   generation: number | null;
   created_at: Generated<Date>;
 }
+/** multiagent lanes（spec §5.6 二期）：per-lane codex thread 持久化。 */
+export interface SessionLaneRow {
+  session_id: string;
+  lane_id: string;
+  codex_thread_id: string | null;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
 export interface ExecutionRow {
   id: string;
   workspace_id: string;
@@ -322,6 +331,7 @@ export interface Database {
   sessions: SessionRow;
   session_events: SessionEventRow;
   session_executions: ExecutionRow;
+  session_lanes: SessionLaneRow;
   files: FileRow;
   vaults: VaultRow;
   credentials: CredentialRow;

@@ -35,6 +35,8 @@ export interface RemoteSpawnContext {
 
 export interface RuntimeStartInput {
   sessionId: string;
+  /** lane 标识（multiagent lanes，spec §5.6 二期）：同 lane 复用同一 thread，缺省 "main"。 */
+  laneId?: string;
   /** agent 配置（system/model/tools 快照）。 */
   system: string | null;
   model: { id: string; effort?: string };
@@ -81,6 +83,8 @@ export interface RuntimeHandle {
   sessionId: string;
   threadId: string;
   stop(reason: string): Promise<void>;
+  /** 共享 runtime 进程是否已退出（lane 共享进程形态下供 worker 交还租约）。 */
+  procExited?(): boolean;
 }
 
 export interface AgentRuntimeDriver {

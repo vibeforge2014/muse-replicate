@@ -37,6 +37,11 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: [networkpolicies]
     verbs: [create, get, patch]
+  # agent-sandbox CRD provider（MAS_SANDBOX_PROVIDER=k8s-crd，roadmap §19）：
+  # Sandbox CR 增删查改（operatingMode 声明 pause/resume，backing Pod 由控制器管理）
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: [sandboxes]
+    verbs: [create, get, list, delete, patch]
 ---
 # RuntimeClass 为 cluster-scoped：只读放行（沙箱能力探测）
 apiVersion: rbac.authorization.k8s.io/v1

@@ -21,6 +21,15 @@ interface FakeHandle extends RuntimeHandle {
   request(method: string, params: Record<string, unknown>): Promise<unknown>;
 }
 
+/** 同会话共享进程（multiagent lanes，spec §5.6 二期：一个沙箱/进程，每 lane 一个 thread）。 */
+interface FakeSessionProc {
+  proc: StdioProcess;
+  /** laneId → handle（同 lane 复用线程；同 lane FIFO 保证不会并发复用）。 */
+  lanes: Map<string, FakeHandle>;
+  /** threadId → handle（事件分流）。 */
+  byThread: Map<string, FakeHandle>;
+}
+
 const here = dirname(fileURLToPath(import.meta.url));
 
 /** 把 fake-codex 的原生通知映射为 NormalizedRuntimeEvent（spec §12.1 的来源侧）。 */
@@ -113,8 +122,88 @@ function normalize(method: string, p: Record<string, unknown>): NormalizedRuntim
 
 export class FakeCodexDriver implements AgentRuntimeDriver {
   readonly kind = "codex_app_server";
+  /** sessionId → 共享进程与 lane 表（fake 单进程多线程形态；进程死即清）。 */
+  private sessions = new Map<string, FakeSessionProc>();
 
   async start(input: RuntimeStartInput): Promise<RuntimeHandle> {
+    const laneId = input.laneId ?? "main";
+    let entry = this.sessions.get(input.sessionId);
+    if (!entry || entry.proc.exited) {
+      entry = await this.spawnSession(input);
+      this.sessions.set(input.sessionId, entry);
+    }
+    const existing = entry.lanes.get(laneId);
+    if (existing) return existing; // 同 lane 线程复用（requires_action 挂起期间等）
+
+    const handle: FakeHandle = {
+      sessionId: input.sessionId,
+      threadId: "",
+      proc: entry.proc,
+      events: [],
+      waiters: [],
+      procExited: () => entry!.proc.exited,
+      notify: (method, params) => entry!.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n"),
+      request: (method, params) =>
+        new Promise((resolve, reject) => {
+          const proc = entry!.proc;
+          const id = randomUUID();
+          const onLine = (buf: Buffer) => {
+            const text = buf.toString();
+            for (const line of text.split("\n")) {
+              if (!line.trim()) continue;
+              try {
+                const msg = JSON.parse(line);
+                if (msg.id === id) {
+                  proc.stdout.off("data", onLine);
+                  if (msg.error) reject(new Error(msg.error.message));
+                  else resolve(msg.result);
+                  return;
+                }
+              } catch {
+                /* 非 JSON 行忽略 */
+              }
+            }
+          };
+          proc.stdout.on("data", onLine);
+          proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+        }),
+      async stop(reason) {
+        // fence 语义保持进程级（spec §14.1：失去租约即视为污染，整进程终止；
+        // 其他 lane 的在途 turn 会随后续租约过期被接管重试）
+        this.notify("turn/interrupt", { threadId: this.threadId });
+        if (!entry!.proc.exited) {
+          entry!.proc.kill();
+          await new Promise((r) => setTimeout(r, 50));
+          if (!entry!.proc.exited) entry!.proc.kill();
+        }
+        void reason;
+      },
+    };
+    entry.lanes.set(laneId, handle);
+
+    // 每 lane 一个 thread：resume（DB 持久化的 lane thread id）或新建（可注入语义恢复历史）
+    if (input.resumeThreadId) {
+      const r = (await handle.request("thread/resume", { threadId: input.resumeThreadId })) as { threadId: string };
+      handle.threadId = r.threadId;
+    } else {
+      const r = (await handle.request("thread/start", {
+        threadIdHint: laneId,
+        capabilities: { bash: input.hasBuiltinToolset !== false },
+      })) as { threadId: string };
+      handle.threadId = r.threadId;
+      if (input.replayHistory?.length) {
+        await handle.request("thread/inject_items", {
+          threadId: handle.threadId,
+          items: input.replayHistory.map((h) => ({ type: "message", role: h.role, text: h.text })),
+        });
+      }
+    }
+    entry.byThread.set(handle.threadId, handle);
+    return handle;
+  }
+
+  /** 同会话首 lane：spawn 共享进程 + initialize + 事件分流（NDJSON → 按 threadId 路由）。 */
+  private async spawnSession(input: RuntimeStartInput): Promise<FakeSessionProc> {
     const codexHome = join(tmpdir(), "mas-fake-codex", input.sessionId);
     mkdirSync(codexHome, { recursive: true });
     const extraEnv = { FAKE_CODEX_HOME: codexHome, MAS_SESSION_ID: input.sessionId };
@@ -136,51 +225,20 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
           args: [join(here, "fake-codex.mjs")],
           env: extraEnv,
         }));
-    const handle: FakeHandle = {
-      sessionId: input.sessionId,
-      threadId: "",
-      proc,
-      events: [],
-      waiters: [],
-      notify(method, params) {
-        proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
-      },
-      request(method, params) {
-        return new Promise((resolve, reject) => {
-          const id = randomUUID();
-          const onLine = (buf: Buffer) => {
-            const text = buf.toString();
-            for (const line of text.split("\n")) {
-              if (!line.trim()) continue;
-              try {
-                const msg = JSON.parse(line);
-                if (msg.id === id) {
-                  proc.stdout.off("data", onLine);
-                  if (msg.error) reject(new Error(msg.error.message));
-                  else resolve(msg.result);
-                  return;
-                }
-              } catch {
-                /* 非 JSON 行忽略 */
-              }
-            }
-          };
-          proc.stdout.on("data", onLine);
-          proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-        });
-      },
-      async stop(reason) {
-        this.notify("turn/interrupt", {});
-        if (!proc.exited) {
-          proc.kill();
-          await new Promise((r) => setTimeout(r, 50));
-          if (!proc.exited) proc.kill();
-        }
-        void reason;
-      },
-    };
 
+    const entry: FakeSessionProc = { proc, lanes: new Map(), byThread: new Map() };
     let textBuf = "";
+    const dispatch = (msg: { method?: string; params?: Record<string, unknown> }) => {
+      if (!msg.method) return;
+      const threadId = String(msg.params?.threadId ?? "");
+      const target = entry.byThread.get(threadId);
+      if (!target) return; // 未知线程（进程复用前残留）——丢弃
+      const ev = normalize(msg.method, msg.params ?? {});
+      if (!ev) return;
+      const waiter = target.waiters.shift();
+      if (waiter) waiter(ev);
+      else target.events.push(ev);
+    };
     proc.stdout.on("data", (buf: Buffer) => {
       // NDJSON 可能一行拆多段：缓存到换行为止
       textBuf += buf.toString();
@@ -188,58 +246,49 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
       textBuf = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
-        let msg: { method?: string; params?: Record<string, unknown> };
         try {
-          msg = JSON.parse(line);
+          dispatch(JSON.parse(line));
         } catch {
-          continue;
-        }
-        if (!msg.method) continue;
-        const ev = normalize(msg.method, msg.params ?? {});
-        if (ev) {
-          const waiter = handle.waiters.shift();
-          if (waiter) waiter(ev);
-          else handle.events.push(ev);
+          /* 非 JSON 行忽略 */
         }
       }
     });
-    const flushOnExit = () => {
+    proc.stdout.on("close", () => {
       if (textBuf.trim()) {
         try {
-          const msg = JSON.parse(textBuf) as { method?: string; params?: Record<string, unknown> };
-          if (msg.method) {
-            const ev = normalize(msg.method, msg.params ?? {});
-            if (ev) {
-              const waiter = handle.waiters.shift();
-              if (waiter) waiter(ev);
-              else handle.events.push(ev);
-            }
-          }
+          dispatch(JSON.parse(textBuf));
         } catch {
           /* 半行残余丢弃 */
         }
       }
       textBuf = "";
-      for (const w of handle.waiters.splice(0)) w(null);
-    };
-    proc.stdout.on("close", flushOnExit);
+      for (const [, h] of entry.lanes) for (const w of h.waiters.splice(0)) w(null);
+      if (this.sessions.get(input.sessionId) === entry) this.sessions.delete(input.sessionId);
+    });
 
-    await handle.request("initialize", { clientInfo: { name: "mas-worker" } });
-    if (input.resumeThreadId) {
-      const r = (await handle.request("thread/resume", { threadId: input.resumeThreadId })) as { threadId: string };
-      handle.threadId = r.threadId;
-    } else {
-      const r = (await handle.request("thread/start", {
-        capabilities: { bash: input.hasBuiltinToolset !== false },
-      })) as { threadId: string };
-      handle.threadId = r.threadId;
-      if (input.replayHistory?.length) {
-        await handle.request("thread/inject_items", {
-          items: input.replayHistory.map((h) => ({ type: "message", role: h.role, text: h.text })),
-        });
-      }
-    }
-    return handle;
+    // initialize 每进程一次（首 lane 建立时）
+    await new Promise<void>((resolve, reject) => {
+      const id = randomUUID();
+      const onLine = (buf: Buffer) => {
+        for (const line of buf.toString().split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (msg.id === id) {
+              proc.stdout.off("data", onLine);
+              if (msg.error) reject(new Error(msg.error.message));
+              else resolve();
+              return;
+            }
+          } catch {
+            /* 忽略 */
+          }
+        }
+      };
+      proc.stdout.on("data", onLine);
+      proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "initialize", params: { clientInfo: { name: "mas-worker" } } }) + "\n");
+    });
+    return entry;
   }
 
   async send(handle: RuntimeHandle, command: RuntimeCommand): Promise<void> {
@@ -247,6 +296,7 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
     switch (command.type) {
       case "user_message":
         await h.request("turn/start", {
+          threadId: h.threadId,
           input: [{ type: "message", content: [{ type: "text", text: command.text }] }],
         });
         return;
@@ -265,7 +315,7 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
         });
         return;
       case "interrupt":
-        await h.request("turn/interrupt", {});
+        await h.request("turn/interrupt", { threadId: h.threadId });
         return;
     }
   }
@@ -274,8 +324,7 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
     const h = handle as FakeHandle;
     const buffered = h.events.shift();
     if (buffered) return buffered;
-    const exited = h.proc.exited;
-    if (exited) return null;
+    if (h.proc.exited) return null;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         const i = h.waiters.indexOf(waiter);
@@ -290,9 +339,10 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
     });
   }
 
-  /** 读回 fake 的对话历史（Level 0 语义恢复的输入）。 */
-  static readHistory(sessionId: string): { role: "user" | "agent"; text: string }[] {
-    const p = join(tmpdir(), "mas-fake-codex", sessionId, "rollout.json");
+  /** 读回 fake 的对话历史（Level 0 语义恢复的输入；lane 维度读指定线程的 rollout）。 */
+  static readHistory(sessionId: string, threadId?: string): { role: "user" | "agent"; text: string }[] {
+    const base = join(tmpdir(), "mas-fake-codex", sessionId);
+    const p = threadId ? join(base, `rollout-${threadId}.json`) : join(base, "rollout.json");
     if (!existsSync(p)) return [];
     try {
       return JSON.parse(readFileSync(p, "utf8"));

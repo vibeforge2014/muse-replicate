@@ -1113,6 +1113,11 @@ export interface components {
             received_at?: components["schemas"]["Timestamp"];
         };
         EventsSend: {
+            /**
+             * @description multiagent lanes（spec §5.6 二期）：lane 即 thread；同 lane 严格 FIFO，跨 lane 并发
+             * @default main
+             */
+            lane_id: string;
             /** @description 整批原子；仅用户事件；requires_action 时只接受 tool_confirmation/interrupt */
             events: ({
                 /** @constant */

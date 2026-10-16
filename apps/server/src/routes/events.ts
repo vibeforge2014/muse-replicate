@@ -121,6 +121,36 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       type: e.type,
       payload: e as Record<string, unknown>,
     }));
+    // 运行中插话分类（参考 §7.4 第 1 条）：running + 纯 user.message + 同 lane 无排队
+    // user_message 执行 + agent 未设 steer_mode=queue → 合成一条 steer 执行（target=活跃 turn）；
+    // 其余（idle/排队保护/interrupt 同批/queue 模式）保持 v0.3 排队语义
+    let steerTargetId: string | undefined;
+    if (kind === "user_message" && session.status === "running") {
+      const steerMode =
+        ((session.agent_snapshot as { metadata?: { steer_mode?: string } } | null)?.metadata?.steer_mode) ?? "auto";
+      if (steerMode !== "queue") {
+        const active = await ctx.db
+          .selectFrom("session_executions")
+          .select(["id", "interrupt_requested_at"])
+          .where("session_id", "=", id)
+          .where("lane_id", "=", laneId)
+          .where("kind", "=", "user_message")
+          .where("state", "in", ["claimed", "delivered"])
+          .orderBy("admitted_at")
+          .orderBy("id")
+          .executeTakeFirst();
+        const hasQueued = await ctx.db
+          .selectFrom("session_executions")
+          .select("id")
+          .where("session_id", "=", id)
+          .where("lane_id", "=", laneId)
+          .where("kind", "=", "user_message")
+          .where("state", "=", "queued")
+          .executeTakeFirst();
+        // FIFO 保护：有更早排队的消息时不允许新消息越过它先被模型看到
+        if (active && !active.interrupt_requested_at && !hasQueued) steerTargetId = active.id;
+      }
+    }
     // 追踪（spec §16）：入口 traceparent 跟随 command 落到 execution，worker 以其为 parent
     const admitted = await admitEvents(ctx.db, {
       sessionId: id,
@@ -128,6 +158,7 @@ export function registerEventRoutes(app: FastifyInstance, ctx: RouteCtx): void {
       events: rows,
       traceparent: requestTraceparent(req),
       laneId,
+      ...(steerTargetId ? { steerTargetId } : {}),
       executionKind: interruptExecution
         ? "interrupt"
         : kind === "tool_confirmation"

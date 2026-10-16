@@ -431,4 +431,14 @@ CREATE TABLE IF NOT EXISTS session_lanes (
 );
 `,
   },
+  {
+    name: "0016_steer",
+    sql: `
+-- 运行中插话（参考 §7.4）：kind='steer' 的执行不参与 lane FIFO，
+-- 由持有 target_execution_id fence 的 worker 在活跃 turn 内处理。
+ALTER TABLE session_executions ADD COLUMN IF NOT EXISTS target_execution_id text;
+CREATE INDEX IF NOT EXISTS execution_steer_ix
+  ON session_executions (session_id, target_execution_id, state) WHERE kind = 'steer';
+`,
+  },
 ];

@@ -9,8 +9,13 @@ import {
   appendEvent,
   appendInternalEvent,
   assignSeqAndProcessedAt,
+  claimNextSteer,
   collectOutputs,
   commitCheckpoint,
+  fallBackSteer,
+  markSteerDelivered,
+  recoverOrphanSteers,
+  unsettledSteers,
   FAKE_CODEX_DIGEST,
   getLaneThreadId,
   reapExhaustedExecutions,
@@ -136,6 +141,8 @@ export class SessionRunner {
   async processSession(sessionId: string): Promise<void> {
     // 毒任务回收（REC-06）：耗尽且租约过期的执行置 failed 并写 exhausted 事件
     await reapExhaustedExecutions(this.db);
+    // 孤儿 steer 兜底（参考 §7.4）：目标 turn 已终态的 steer 回退为排队执行
+    await recoverOrphanSteers(this.db, sessionId);
     for (;;) {
       const lanes = await pendingLanes(this.db, sessionId);
       if (lanes.length === 0) return;
@@ -257,7 +264,9 @@ export class SessionRunner {
     };
 
     if (tookOverDelivered) {
-      // REC-01：接管已投递的执行 → 不重放用户消息，terminal error + idle(end_turn)
+      // REC-01：接管已投递的执行 → 不重放用户消息，terminal error + idle(end_turn)；
+      // 其未完成的 steer 一并回退为排队执行（turn 已死，不重放不 steer，参考 §7.4 第 5 条）
+      await this.settleSteersAtTurnEnd(sessionId, executionId);
       await append("session.error", {
         error: {
           type: "worker_takeover",
@@ -390,6 +399,9 @@ export class SessionRunner {
           await settleExecution(this.db, executionId, generation, attemptId, { state: "completed" });
           loopSpan.end(true, { outcome: done });
           if (done === "turn_done") {
+            // 轮末 steer 收尾（参考 §7.4 第 4 条）：delivered 未确认 → 回退排队（steer_unconsumed）；
+            // 仍未 claimed 的 queued → 同样回退（turn 已结束）
+            await this.settleSteersAtTurnEnd(sessionId, executionId);
             // 轮末持久化：watermark + checkpoint（spec §9.4 / §14.2.1）
             await this.checkpointTurn(sessionId, executionId, generation, attemptId);
             // 轮末产出收集：outputs → manifest → File 登记（spec §5.5 / REC-08）
@@ -420,9 +432,60 @@ export class SessionRunner {
           await this.driver.send(laneHeld.handle, { type: "interrupt" });
         }
       }
+      // steer 插话（参考 §7.4）：同 turn 逐条串行；中断已发/进程已死 → 回退为排队执行
+      await this.applySteers(sessionId, executionId, laneHeld, interruptSent);
     }
     } finally {
       loopSpan.end(); // 兜底收口（正常路径已在上方带 outcome 结束；幂等）
+    }
+  }
+
+  /**
+   * steer 插话投递（参考 §7.4）：当前 turn 的持有者逐条认领同 target 的 steer，
+   * 尽力送进运行中的 runtime；任何拒绝/不支持/turn 已在收尾 → 回退为排队的 user_message
+   * （保留 admitted_at，队头语义不变）。accepted/unknown → delivered：消费确认
+   * （steer_confirmed）或 turn 结算（settleSteersAtTurnEnd）二者必居其一。
+   */
+  private async applySteers(
+    sessionId: string,
+    executionId: string,
+    laneHeld: HeldLane,
+    interruptSent: boolean,
+  ): Promise<void> {
+    for (;;) {
+      const st = await claimNextSteer(this.db, sessionId, executionId, this.workerId, randomUUID(), 30);
+      if (!st) return;
+      if (interruptSent || laneHeld.handle.procExited?.()) {
+        await fallBackSteer(this.db, st.id, "turn_cancelling");
+        continue;
+      }
+      if (!this.driver.steer) {
+        await fallBackSteer(this.db, st.id, "steer_unsupported");
+        continue;
+      }
+      const text = await this.textOfInput(sessionId, st.input_event_ids);
+      const ack = await this.driver.steer(laneHeld.handle, {
+        sourceEventId: st.input_event_ids[0] ?? st.id,
+        text,
+      });
+      if (ack.status === "rejected") {
+        // no_active_turn / turn_mismatch / turn_not_steerable：回退排队，下个 turn 处理
+        await fallBackSteer(this.db, st.id, ack.code);
+        continue;
+      }
+      // accepted：runtime 已接单；unknown（超时类）：绝不重发，等消费确认或 turn 结算兜底
+      await markSteerDelivered(this.db, st.id, st.generation, st.attempt_id ?? "");
+    }
+  }
+
+  /**
+   * turn 结束时结算未消费的 steer（参考 §7.4 第 4/5 条）：正常完成、接管或失败路径
+   * 都调这里——仍未等到消费确认的 delivered steer 说明模型没看到它，回退排队。
+   */
+  private async settleSteersAtTurnEnd(sessionId: string, executionId: string): Promise<void> {
+    const rows = await unsettledSteers(this.db, sessionId, executionId);
+    for (const st of rows) {
+      await fallBackSteer(this.db, st.id, "steer_unconsumed");
     }
   }
 
@@ -506,6 +569,26 @@ export class SessionRunner {
           stop_reason: { type: "requires_action", event_ids: toolUseId ? [toolUseId] : [] },
         });
         return "awaiting_approval";
+      }
+      case "steer_confirmed": {
+        // 定序点=消费确认（参考 §7.4 核心决策）：item/started(userMessage{clientId})
+        // 到达的同一时刻为批内事件定序（processed_at = 模型实际看到它），再 completed；
+        // wire 上此前的事件都在它之前、此后的事件才可能受它影响——§7.3 不变量严格成立
+        const row = await this.db
+          .selectFrom("session_executions")
+          .selectAll()
+          .where("session_id", "=", sessionId)
+          .where("kind", "=", "steer")
+          .where("state", "=", "delivered")
+          .where(sql`input_event_ids[1] = ${ev.sourceId}`)
+          .executeTakeFirst();
+        if (!row) return null; // 不匹配的确认（历史注入等）——忽略
+        await this.db.transaction().execute(async (tx) => {
+          await assignSeqAndProcessedAt(tx, sessionId, row.input_event_ids, "normal");
+        });
+        await this.notifySeq(sessionId);
+        await settleExecution(this.db, row.id, row.generation, row.attempt_id ?? "", { state: "completed" });
+        return null;
       }
       case "turn_completed":
         await append("session.status_idle", {

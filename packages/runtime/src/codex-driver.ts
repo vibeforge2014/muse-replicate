@@ -125,6 +125,11 @@ function normalize(method: string, p: Record<string, unknown>): NormalizedRuntim
         if (type === "dynamicToolCall") {
           return [{ kind: "custom_tool_use_started", sourceId: id, toolName: String(item.tool ?? "custom"), input: item.arguments ?? {} }];
         }
+        if (type === "userMessage") {
+          // steer 消费确认（参考 §7.4）：clientId 即平台侧首事件 id；worker 按 execution 匹配定序
+          const clientId = String(item.clientId ?? "");
+          return clientId ? [{ kind: "steer_confirmed", sourceId: clientId }] : [];
+        }
         if (type === "fileChange") {
           return [
             { kind: "tool_use_started", sourceId: id, toolName: "apply_patch", input: { changes: item.changes ?? [] }, evaluatedPermission: "allow" },
@@ -468,6 +473,29 @@ export class CodexDriver implements AgentRuntimeDriver {
       proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "initialize", params: { clientInfo: { name: "mas-codex-driver", version: "0.1.0" } } }) + "\n");
     });
     return entry;
+  }
+
+  /** steer（参考 §7.4）：turn/steer（clientUserMessageId=平台首事件 id）；超时=unknown 不重发。 */
+  async steer(
+    handle: RuntimeHandle,
+    command: { sourceEventId: string; text: string },
+  ): Promise<{ status: "accepted" } | { status: "unknown" } | { status: "rejected"; code: string }> {
+    const h = handle as CodexHandle;
+    try {
+      await h.request("turn/steer", {
+        threadId: h.threadId,
+        clientUserMessageId: command.sourceEventId,
+        input: [{ type: "text", text: command.text }],
+      });
+      return { status: "accepted" };
+    } catch (e) {
+      const msg = String((e as Error).message ?? "");
+      if (/timeout/i.test(msg)) return { status: "unknown" };
+      if (/no active turn/i.test(msg)) return { status: "rejected", code: "no_active_turn" };
+      if (/mismatch|expected/i.test(msg)) return { status: "rejected", code: "turn_mismatch" };
+      if (/steerable/i.test(msg)) return { status: "rejected", code: "turn_not_steerable" };
+      return { status: "rejected", code: "invalid_input" };
+    }
   }
 
   async send(handle: RuntimeHandle, command: RuntimeCommand): Promise<void> {

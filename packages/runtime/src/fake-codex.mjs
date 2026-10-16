@@ -37,6 +37,10 @@ const pendingCustomTools = new Map(); // itemId -> {resolve, toolName}
 let awaitingInterrupt = null;
 let hasBash = true;
 const emitter = new EventEmitter();
+// steer（参考 §7.4）：threadId -> 活跃 turn 标记；pending steer 按 thread 排队，
+// turn 的下一等待点结束后消费（item/started userMessage{clientId} = 消费确认）
+const activeTurns = new Map(); // threadId -> true
+const pendingSteers = new Map(); // threadId -> [{clientId, text}]
 
 // 每线程独立 rollout（multiagent lanes，spec §5.6 二期）：thread/start 生成 threadId，
 // 历史与持久化按 threadId 分桶；未带 threadId 的调用退回 legacy rollout.json（单线程形态兼容）
@@ -125,6 +129,23 @@ async function handle(msg) {
       reply(id, { ok: true });
       runTurn(params, params.threadId ?? "").catch(() => {});
       return;
+    case "turn/steer": {
+      // 运行中插话（参考 §7.4）：无活跃 turn → no_active_turn（worker 回退为排队执行）
+      const tid = params.threadId ?? "";
+      if (!activeTurns.has(tid)) {
+        send({ jsonrpc: "2.0", id, error: { code: -32000, message: "no active turn" } });
+        return;
+      }
+      const text = (params.input ?? [])
+        .filter((i) => i.type === "text" || i.type === "message")
+        .map((i) => (i.content ?? [{ text: i.text }]).map((b) => b.text ?? "").join("\n"))
+        .join("\n")
+        .trim();
+      if (!pendingSteers.has(tid)) pendingSteers.set(tid, []);
+      pendingSteers.get(tid).push({ clientId: params.clientUserMessageId ?? "", text });
+      reply(id, { turnId: `trn_${tag}_${nextId++}` });
+      return;
+    }
     case "turn/interrupt":
       reply(id, { ok: true });
       if (awaitingInterrupt) awaitingInterrupt();
@@ -176,18 +197,22 @@ function userText(params) {
 }
 
 async function runTurn(params, threadId) {
-  const text = userText(params);
-  const approval = params.approvalPolicy === "untrusted";
-  // 所有通知带 threadId：driver 按 thread 分流到对应 lane 的事件队列（同进程多 lane 并发）
+  // 本轮的所有通知与持久化都归属该 thread（driver 按 threadId 分流到对应 lane）
   const notify = (method, p = {}) => notify0(method, { threadId, ...p });
   const history = historyOf(threadId);
-  notify("turn/started");
+  const approval = params.approvalPolicy === "untrusted";
+  activeTurns.set(threadId, true);
+  try {
+  notify("turn/started", {});
+  const text = userText(params);
   if (text === "crash") {
     process.exit(70);
   }
   if (text.startsWith("sleep")) {
     const secs = Number(text.split(/\s+/)[1] ?? 5);
     await sleep(secs * 1000);
+    // 等待点结束 → 消费 pending steer（item/started userMessage{clientId}=确认）+ 回应
+    await consumeSteers(notify, history, threadId);
     notify("turn/completed", { reason: "interrupted" });
     return;
   }
@@ -312,7 +337,33 @@ async function runTurn(params, threadId) {
   notify("item/completed", { itemId: `itm_msg_${tag}_${nextId++}`, itemType: "agentMessage", text: response });
   history.push({ role: "user", text }, { role: "agent", text: response });
   persist(threadId);
+  // 快速分支也可能收到过 steer（下一个等待点前）：同样消费确认再收轮
+  await consumeSteers(notify, history, threadId);
   notify("turn/completed", { reason: "completed" });
+  } finally {
+    activeTurns.delete(threadId);
+  }
+}
+
+/** 消费 pending steer：确认通知（userMessage+clientId）→ 历史 → agent 回应。 */
+async function consumeSteers(notify, history, threadId) {
+  const steers = pendingSteers.get(threadId) ?? [];
+  pendingSteers.set(threadId, []);
+  for (const s of steers) {
+    notify("item/started", {
+      itemId: `itm_um_${tag}_${nextId++}`,
+      itemType: "userMessage",
+      clientId: s.clientId,
+    });
+    history.push({ role: "user", text: s.text });
+    notify("item/completed", {
+      itemId: `itm_msg_${tag}_${nextId++}`,
+      itemType: "agentMessage",
+      text: `ack steer: ${s.text}`,
+    });
+    history.push({ role: "agent", text: `ack steer: ${s.text}` });
+  }
+  if (steers.length > 0) persist(threadId);
 }
 
 process.on("SIGTERM", () => process.exit(0));

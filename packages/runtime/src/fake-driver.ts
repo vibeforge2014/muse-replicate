@@ -69,6 +69,11 @@ function normalize(method: string, p: Record<string, unknown>): NormalizedRuntim
           input: p.input ?? {},
         };
       }
+      if (itemType === "userMessage") {
+        // steer 消费确认（参考 §7.4）：定序点 = 模型实际看到输入的时刻
+        const clientId = String(p.clientId ?? "");
+        return clientId ? { kind: "steer_confirmed", sourceId: clientId } : null;
+      }
       return null;
     }
     case "item/completed": {
@@ -289,6 +294,27 @@ export class FakeCodexDriver implements AgentRuntimeDriver {
       proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "initialize", params: { clientInfo: { name: "mas-worker" } } }) + "\n");
     });
     return entry;
+  }
+
+  /** steer（参考 §7.4）：无活跃 turn 等被拒情形由 fake 返回 rejected 供 worker 回退。 */
+  async steer(
+    handle: RuntimeHandle,
+    command: { sourceEventId: string; text: string },
+  ): Promise<{ status: "accepted" } | { status: "unknown" } | { status: "rejected"; code: string }> {
+    const h = handle as FakeHandle;
+    try {
+      await h.request("turn/steer", {
+        threadId: h.threadId,
+        clientUserMessageId: command.sourceEventId,
+        input: [{ type: "text", text: command.text }],
+      });
+      return { status: "accepted" };
+    } catch (e) {
+      const msg = String((e as Error).message ?? "");
+      if (/no active turn/i.test(msg)) return { status: "rejected", code: "no_active_turn" };
+      if (/timeout/i.test(msg)) return { status: "unknown" };
+      return { status: "rejected", code: "invalid_input" };
+    }
   }
 
   async send(handle: RuntimeHandle, command: RuntimeCommand): Promise<void> {

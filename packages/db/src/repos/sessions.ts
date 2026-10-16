@@ -125,6 +125,11 @@ export interface AdmitInput {
   traceparent?: string | null;
   /** multiagent lanes（spec §5.6 二期）：lane_id=thread_id；缺省 "main"。 */
   laneId?: string;
+  /**
+   * steer 插话目标（参考 §7.4）：传入时本批 user.message 合成一条 kind=steer 执行，
+   * target=当前活跃 turn execution；不参与 lane FIFO。api 分类后传入。
+   */
+  steerTargetId?: string;
 }
 
 export interface AdmitResult {
@@ -245,7 +250,8 @@ export async function admitEvents(db: Kysely<Database>, input: AdmitInput): Prom
           workspace_id: input.workspaceId,
           session_id: input.sessionId,
           lane_id: laneId,
-          kind: input.executionKind,
+          kind: input.steerTargetId ? "steer" : input.executionKind,
+          ...(input.steerTargetId ? { target_execution_id: input.steerTargetId } : {}),
           input_event_ids: runtimeBoundIds,
           input_fingerprint: fingerprintOf(input.events),
           state: "queued",
@@ -367,6 +373,7 @@ export async function claimNextExecution(
      WHERE e.id = (
        SELECT id FROM session_executions
         WHERE session_id=${sessionId} AND lane_id=${laneId}
+          AND kind <> 'steer'
           AND (state='queued' OR (state IN ('claimed','delivered') AND lease_expires_at < now()))
           AND attempt_count < max_attempts AND deadline_at > now()
         ORDER BY admitted_at, id LIMIT 1
@@ -376,11 +383,117 @@ export async function claimNextExecution(
   return result.rows[0] ?? null;
 }
 
+/**
+ * steer 执行（参考 §7.4）：不参与 lane FIFO，由持有 target_execution_id fence 的 worker
+ * 在活跃 turn 内逐条认领（同 turn 多条按 admitted_at 串行 turn/steer）。
+ */
+export async function claimNextSteer(
+  db: Kysely<Database>,
+  sessionId: string,
+  targetExecutionId: string,
+  ownerId: string,
+  attemptId: string,
+  leaseSeconds = 30,
+): Promise<Selectable<ExecutionRow> | null> {
+  const result = await sql<Selectable<ExecutionRow>>`
+    UPDATE session_executions e
+       SET state='claimed', owner_id=${ownerId}, attempt_id=${attemptId},
+           generation=generation+1, attempt_count=attempt_count+1,
+           claimed_at=now(), lease_expires_at=now() + make_interval(secs => ${leaseSeconds}),
+           revision=revision+1
+     WHERE e.id = (
+       SELECT id FROM session_executions
+        WHERE session_id=${sessionId} AND target_execution_id=${targetExecutionId}
+          AND kind='steer' AND state='queued'
+        ORDER BY admitted_at, id LIMIT 1
+        FOR UPDATE SKIP LOCKED
+     )
+     RETURNING *`.execute(db);
+  return result.rows[0] ?? null;
+}
+
+/** turn/steer 返回后置 delivered（还不定序——定序点在消费确认，参考 §7.4 核心决策）。 */
+export async function markSteerDelivered(
+  db: Kysely<Database>,
+  executionId: string,
+  generation: number,
+  attemptId: string,
+): Promise<boolean> {
+  const result = await db
+    .updateTable("session_executions")
+    .set({ state: "delivered", delivered_at: new Date() })
+    .where("id", "=", executionId)
+    .where("generation", "=", generation)
+    .where("attempt_id", "=", attemptId)
+    .where("state", "=", "claimed")
+    .execute();
+  return result.length > 0;
+}
+
+/**
+ * steer 回退（参考 §7.4 第 3 条）：turn/steer 被拒/turn 消失时改回普通 user_message 执行，
+ * 按原 admitted_at 排入 lane FIFO（下一个 turn 处理）；事件从未定序，客户端看到的就是排队事件。
+ */
+export async function fallBackSteer(db: Kysely<Database>, executionId: string, reason: string): Promise<void> {
+  await db
+    .updateTable("session_executions")
+    .set({
+      kind: "user_message",
+      target_execution_id: null,
+      state: "queued",
+      owner_id: null,
+      attempt_id: null,
+      claimed_at: null,
+      delivered_at: null,
+      lease_expires_at: null,
+      failure: { reason } as never,
+    })
+    .where("id", "=", executionId)
+    .execute();
+}
+
+/** turn 终态后仍未完成的 steer（queued/claimed/delivered）——回退或清点用（参考 §7.4 第 4 条）。 */
+export async function unsettledSteers(
+  db: Kysely<Database>,
+  sessionId: string,
+  targetExecutionId: string,
+): Promise<Selectable<ExecutionRow>[]> {
+  return db
+    .selectFrom("session_executions")
+    .selectAll()
+    .where("session_id", "=", sessionId)
+    .where("target_execution_id", "=", targetExecutionId)
+    .where("kind", "=", "steer")
+    .where("state", "in", ["queued", "claimed", "delivered"])
+    .orderBy("admitted_at")
+    .orderBy("id")
+    .execute();
+}
+
+/**
+ * 孤儿 steer 兜底（参考 §7.4 第 4/5 条的统一形态）：目标 turn 已终态
+ * （分类与插入之间的竞态 / worker 崩溃残留）→ 回退为排队执行，事件不丢。
+ * processSession 每 tick 先跑一次（有部分索引，开销可忽略）。
+ */
+export async function recoverOrphanSteers(db: Kysely<Database>, sessionId: string): Promise<void> {
+  await sql`
+    UPDATE session_executions s
+       SET kind='user_message', target_execution_id=null, state='queued',
+           owner_id=null, attempt_id=null, claimed_at=null, delivered_at=null, lease_expires_at=null,
+           failure=jsonb_build_object('reason','steer_target_gone')::jsonb, revision=revision+1
+     WHERE s.session_id=${sessionId} AND s.kind='steer'
+       AND s.state IN ('queued','claimed','delivered')
+       AND s.target_execution_id IN (
+         SELECT id FROM session_executions WHERE state IN ('completed','failed','cancelled')
+       )`.execute(db);
+}
+
 /** 会话内所有有待处理工作（queued 或租约过期）的 lane（multiagent lanes，spec §5.6 二期）。 */
 export async function pendingLanes(db: Kysely<Database>, sessionId: string): Promise<string[]> {
   const result = await sql<{ lane_id: string }>`
     SELECT DISTINCT lane_id FROM session_executions
      WHERE session_id=${sessionId}
+       AND kind <> 'steer'
        AND (state='queued'
         OR (state IN ('claimed','delivered') AND lease_expires_at < now() AND attempt_count < max_attempts AND deadline_at > now()))`.execute(db);
   return result.rows.map((r) => r.lane_id);

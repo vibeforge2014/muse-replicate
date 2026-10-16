@@ -214,9 +214,19 @@ describe("TOOL", () => {
     expect(iInt).toBeLessThan(iIdle);
   });
 
-  it("ORD-01: queued message during running lands after current turn", async () => {
-    const { agentId, envId } = await makeAgentAndEnv(url, key, TOOLSET_ALLOW);
-    const sid = await createSession(url, key, agentId, envId);
+  it("ORD-01: queued message during running lands after current turn (steer_mode=queue)", async () => {
+    // steer_mode=queue：运行中插话不越位为 steer，保持 v0.3 排队语义（参考 §7.4）
+    const agent = await call(url, key, "POST", "/v1/agents", {
+      name: `t-ord-${Date.now()}`,
+      model: { id: "glm-5.3-flash", effort: "low" },
+      tools: TOOLSET_ALLOW,
+      metadata: { steer_mode: "queue" },
+    });
+    const envR = await call(url, key, "POST", "/v1/environments", {
+      name: `t-env-${Date.now()}`,
+      config: { type: "cloud" },
+    });
+    const sid = await createSession(url, key, agent.json.id, envR.json.id);
     // 第 1 轮：慢任务（用例设计：sleep 后回答，保证 running 窗口足够长）
     await call(url, key, "POST", `/v1/sessions/${sid}/events`, {
       events: [{ type: "user.message", content: [{ type: "text", text: "sleep 3" }] }],

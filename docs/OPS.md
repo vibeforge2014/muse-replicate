@@ -113,6 +113,8 @@ BASE_URL=http://127.0.0.1:18090 MAS_API_KEY=<bootstrap 打印的 key> ./scripts/
 | `capability_unsatisfied` | 环境 `config.isolation` 高于 provider 实际等级——按 §9.0 这是 fail closed，不允许静默降级；要么升级宿主要么显式放宽环境 |
 | SSE 无输出 | 先 `GET events` 确认事件已定序（有 seq）；SSE 默认只推实时 |
 | 响应 409 `idempotency_conflict` | 同一 Idempotency-Key 配了不同 body |
+| running 期间发消息未插话反而排到下个 turn | agent.metadata.steer_mode=queue 显式 opt-out（参考 §7.4）；改为不设或 `"auto"` 恢复插话语义 |
+| running 期间发消息被插话（FIFO 期望被破坏） | 正常——muse 0.4+ 默认行为；若业务需严格 FIFO，给 agent 加 `metadata.steer_mode: "queue"` |
 | deployment run 一直 pending | api 进程调度器未起（`MAS_DEPLOYMENT_TICK_MS`）或环境被归档（看 run 的 `error.type=start_failed`） |
 | webhook 投递 failed | `GET /v1/webhooks/{id}/deliveries` 看 `attempts`/`last_status_code`；6 次退避（2^n 秒）后转 failed，接收端需 2xx；secret 仅创建时可见，丢失需重建 webhook |
 

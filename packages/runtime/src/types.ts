@@ -58,7 +58,16 @@ export type RuntimeCommand =
   | { type: "user_message"; text: string }
   | { type: "approval_response"; sourceEventId: string; approved: boolean; denyMessage?: string }
   | { type: "custom_tool_output"; sourceEventId: string; output: string; interrupted?: boolean }
-  | { type: "interrupt" };
+  | { type: "interrupt" }
+  /** 运行中插话（参考 §7.4）：并入当前 turn；sourceEventId=首事件 id（消费确认的 clientMessageId）。 */
+  | { type: "steer"; sourceEventId: string; text: string };
+
+/** turn/steer 的送达结果（参考 §7.4 第 3 条：rejected → 回退为排队执行）。 */
+export type SteerAck =
+  | { status: "accepted" }
+  /** 超时等结果未知：保持 delivered 不重发（不会重复，参考 §7.4 第 4 条）。 */
+  | { status: "unknown" }
+  | { status: "rejected"; code: string };
 
 /** 归一化 runtime 事件（worker 把它映射为对外事件，spec §12.1）。 */
 export type NormalizedRuntimeEvent =
@@ -76,6 +85,8 @@ export type NormalizedRuntimeEvent =
   | { kind: "approval_request"; sourceId: string; toolUseSourceId: string; toolName: string }
   | { kind: "custom_tool_use_started"; sourceId: string; toolName: string; input: unknown }
   | { kind: "custom_tool_output_request"; sourceId: string; toolUseSourceId: string; toolName: string }
+  /** steer 消费确认（item/started userMessage{clientId}）：sourceId=clientMessageId（=首事件 id）。 */
+  | { kind: "steer_confirmed"; sourceId: string }
   | { kind: "turn_completed"; sourceId: string; reason: "completed" | "interrupted" }
   | { kind: "error"; sourceId: string; message: string; retryable: boolean };
 
@@ -93,6 +104,11 @@ export interface AgentRuntimeDriver {
   readonly versionDigest?: string;
   start(input: RuntimeStartInput): Promise<RuntimeHandle>;
   send(handle: RuntimeHandle, command: RuntimeCommand): Promise<void>;
+  /**
+   * 运行中插话（参考 §7.4）：不支持的 driver（未实现）返回 rejected{code:"unsupported"}，
+   * worker 据此回退为排队执行——fail closed，不静默丢弃。
+   */
+  steer?(handle: RuntimeHandle, command: { sourceEventId: string; text: string }): Promise<SteerAck>;
   /** 事件流（多播到当前订阅者；重复消费由 worker 去重）。 */
   nextEvent(handle: RuntimeHandle, timeoutMs?: number): Promise<NormalizedRuntimeEvent | null>;
 }

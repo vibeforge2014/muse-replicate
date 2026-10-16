@@ -114,6 +114,8 @@ export interface ExecutionRow {
   deadline_at: Date;
   lease_expires_at: Date | null;
   interrupt_requested_at: Date | null;
+  /** steer 专用：被插话的当前 turn execution（参考 §7.4；其余 kind 为 null）。 */
+  target_execution_id: string | null;
   admitted_at: Generated<Date>;
   claimed_at: Date | null;
   delivered_at: Date | null;

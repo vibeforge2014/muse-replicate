@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { sql, type Kysely } from "kysely";
+import { sql, type Kysely, type SqlBool } from "kysely";
 import { newId, memoryPathError, spanTraceparent, startSpan, type SessionEventJson, type Span } from "@mas/core";
 import type { Database } from "@mas/db";
 import {
@@ -580,7 +580,7 @@ export class SessionRunner {
           .where("session_id", "=", sessionId)
           .where("kind", "=", "steer")
           .where("state", "=", "delivered")
-          .where(sql`input_event_ids[1] = ${ev.sourceId}`)
+          .where(sql<SqlBool>`input_event_ids[1] = ${ev.sourceId}`)
           .executeTakeFirst();
         if (!row) return null; // 不匹配的确认（历史注入等）——忽略
         await this.db.transaction().execute(async (tx) => {

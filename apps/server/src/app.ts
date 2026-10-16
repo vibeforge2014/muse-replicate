@@ -1,5 +1,9 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import multipart from "@fastify/multipart";
+import cors from "@fastify/cors";
+import staticPlugin from "@fastify/static";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { ZodError } from "zod";
 import { MasError, configureOtel, errAuth } from "@mas/core";
 import { authenticate, type DbHandle } from "@mas/db";
@@ -47,7 +51,9 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
 
   // 鉴权（Authorization: Bearer 或 x-api-key；spec §11.1）
   app.addHook("preHandler", async (req, reply) => {
-    if (req.routeOptions?.url?.startsWith("/internal/") || req.routeOptions?.url === "/healthz") return;
+    const url = req.routeOptions?.url ?? req.url ?? "";
+    // /console 静态资产由 Fastify static 提供，跳过业务鉴权（前端自行带 API key 调 /v1）
+    if (url.startsWith("/internal/") || url.startsWith("/console/") || url === "/healthz") return;
     const header = req.headers.authorization;
     const secret =
       header?.startsWith("Bearer ") ? header.slice(7) : (req.headers["x-api-key"] as string | undefined);
@@ -60,6 +66,24 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   // 限流后端（spec §13.4 / 偏差 #3）：默认内存（零开销）；MAS_RATELIMIT_BACKEND=pg 时多实例一致
   registerRateLimit(app, process.env.MAS_RATELIMIT_BACKEND === "pg" ? opts.db.db : undefined);
   void app.register(multipart, { limits: { fileSize: Number(process.env.MAS_MAX_FILE_BYTES ?? 500 * 1024 * 1024) } });
+
+  // CORS：仅在 MAS_CONSOLE_CORS=* 时放通（开发用，生产由同源托管）
+  if (process.env.MAS_CONSOLE_CORS) {
+    void app.register(cors, { origin: process.env.MAS_CONSOLE_CORS.split(","), credentials: false });
+  }
+
+  // Console 静态托管：MAS_CONSOLE_DIR 指向 apps/console/dist 时启用（spec §M0-可选）
+  const consoleDir = process.env.MAS_CONSOLE_DIR;
+  const consoleEnabled = !!(consoleDir && existsSync(consoleDir));
+  if (consoleEnabled) {
+    void app.register(staticPlugin, {
+      root: resolve(consoleDir!),
+      prefix: "/console/",
+      wildcard: false,
+      // 需要 decorateReply 才能在 SPA fallback 里 reply.sendFile("index.html")
+      decorateReply: true,
+    });
+  }
 
   // 路由登记表：OpenAPI 规范零漂移校验用（tests/openapi.test.ts 读取 app.masRoutes）
   const masRoutes: { method: string; url: string }[] = [];
@@ -101,6 +125,14 @@ export function buildApp(opts: BuildAppOptions): FastifyInstance {
   });
 
   app.setNotFoundHandler((req, reply) => {
+    // Console 启用时 SPA fallback：未知 GET（非 API 路径）返回 index.html
+    if (consoleEnabled && req.method === "GET") {
+      const url = req.url ?? "";
+      if (!url.startsWith("/v1/") && !url.startsWith("/internal/") && url !== "/healthz") {
+        void reply.sendFile("index.html");
+        return;
+      }
+    }
     sendErrorEnvelope(reply, 404, "not_found_error", `no route for ${req.method} ${req.url}`, req.mas?.requestId ?? "req_unknown");
   });
 

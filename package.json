@@ -11,8 +11,10 @@
   },
   "scripts": {
     "build": "tsc -b packages/core packages/db packages/runtime apps/server apps/worker",
+    "build:console": "pnpm --filter @mas/console build",
     "dev:server": "pnpm --filter @mas/server dev",
     "dev:worker": "pnpm --filter @mas/worker dev",
+    "dev:console": "pnpm --filter @mas/console dev",
     "migrate": "pnpm --filter @mas/db migrate",
     "test": "vitest run",
     "test:watch": "vitest",

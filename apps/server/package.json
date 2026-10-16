@@ -13,7 +13,9 @@
     "test": "vitest run --root ."
   },
   "dependencies": {
+    "@fastify/cors": "^10.0.1",
     "@fastify/multipart": "^10.1.2",
+    "@fastify/static": "^8.0.3",
     "@mas/core": "workspace:*",
     "@mas/db": "workspace:*",
     "@mas/runtime": "workspace:*",
